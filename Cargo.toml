@@ -1,0 +1,13 @@
+[package]
+name = "ccdash"
+version = "0.1.0"
+edition = "2024"
+description = "Live dashboard for running Claude Code sessions"
+authors = ["Tomáš Sandrini <t@tsandrini.sh>"]
+license = "EUPL-1.2"
+repository = "https://github.com/tsandrini/ccdash"
+
+[dependencies]
+
+[profile.release]
+strip = true
