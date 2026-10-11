@@ -2,6 +2,7 @@ mod actions;
 mod agents;
 mod analytics;
 mod api;
+mod channel;
 mod client;
 mod config;
 mod conversation;
@@ -66,6 +67,16 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true)]
         title: Vec<String>,
     },
+    /// Send a message to a session, as if typed into it (needs the ccdash channel).
+    Reply {
+        /// Session id, background short id, or unique id prefix.
+        id: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        text: Vec<String>,
+    },
+    /// MCP server for Claude Code's `--channels`: relays replies and
+    /// permission answers from ccdash into the session.
+    Channel,
     /// Print the web UI address including the access token.
     Url {
         #[arg(long)]
@@ -91,6 +102,8 @@ fn main() -> ExitCode {
         Command::Status { json } => client::status(json),
         Command::Open { id } => client::open(&id),
         Command::Rename { id, title } => client::rename(&id, &title.join(" ")),
+        Command::Reply { id, text } => client::reply(&id, &text.join(" ")),
+        Command::Channel => channel::run(),
         Command::Url {
             config,
             host,

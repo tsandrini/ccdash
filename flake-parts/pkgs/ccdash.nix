@@ -19,6 +19,7 @@ rustPlatform.buildRustPackage {
       (flake-root + "/src")
       (flake-root + "/web")
       (flake-root + "/dms-plugin")
+      (flake-root + "/claude-plugin")
     ];
   };
 
@@ -27,6 +28,9 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     mkdir -p $out/share/ccdash
     cp -r dms-plugin $out/share/ccdash/dms-plugin
+    cp -r claude-plugin $out/share/ccdash/claude-plugin
+    substituteInPlace $out/share/ccdash/claude-plugin/.mcp.json \
+      --replace-fail '"command": "ccdash"' "\"command\": \"$out/bin/ccdash\""
   '';
 
   meta = {

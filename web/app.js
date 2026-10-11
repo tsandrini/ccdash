@@ -7,6 +7,8 @@ const ANALYTICS_RANGE_KEY = "ccdash.range.analytics";
 const STALE_STREAM_MS = 45_000;
 const STRIP_MS = 60 * 60_000;
 const PAGE = 10;
+/** A reply still queued this long while the session idles is likely stuck. */
+const UNDELIVERED_MS = 20_000;
 
 const ACTIVITY = {
   permission: { label: "Needs permission", rank: 0 },
@@ -42,6 +44,8 @@ const state = {
   editingTitle: null,
   /** Activity groups already opened automatically while a turn runs. */
   autoOpened: new Set(),
+  /** Unsent reply text by session id. */
+  drafts: new Map(),
 };
 
 // --- DOM helpers ------------------------------------------------------------
@@ -428,6 +432,7 @@ function scheduleRender() {
       renderDetailHead();
       if (state.detailTab === "details") renderDetailBody();
       else renderLive();
+      renderDetailFoot();
     }
   });
 }
@@ -852,9 +857,16 @@ function openDetail(id) {
     dialog,
     h("div", { class: "detail-head" }),
     h("div", { class: "detail-body" }),
+    h(
+      "div",
+      { class: "detail-foot" },
+      h("div", { class: "foot-ask" }),
+      h("div", { class: "foot-reply" }),
+    ),
   );
   renderDetailHead();
   renderDetailBody();
+  renderDetailFoot();
   if (!dialog.open) dialog.showModal();
   loadConversation("initial");
 }
@@ -1009,6 +1021,205 @@ function renameForm(s) {
     input.select();
   });
   return form;
+}
+
+/** The relayed permission prompt and the reply box, pinned under the sheet.
+ * Both slots re-render only when their content changes, so a half-typed
+ * reply keeps its text and focus through live updates. */
+function renderDetailFoot() {
+  const foot = $("#detail .detail-foot");
+  const s = state.sessions.get(state.detailId);
+  if (!foot || !s) return;
+  foot.hidden =
+    s.activity === "gone" || isAgent(s) || (!s.hooked && !s.channel);
+  const askSlot = foot.querySelector(".foot-ask");
+  const ask = s.permission_ask;
+  if ((askSlot.dataset.request || "") !== (ask?.request_id || "")) {
+    const dialog = $("#detail");
+    const atEnd =
+      dialog.scrollHeight - dialog.scrollTop - dialog.clientHeight < 80;
+    askSlot.dataset.request = ask?.request_id || "";
+    fill(askSlot, ask ? permissionCard(s.id, ask) : null);
+    if (atEnd) scrollToEnd();
+  }
+  const replySlot = foot.querySelector(".foot-reply");
+  const mode = s.channel ? "composer" : "hint";
+  if (replySlot.dataset.mode !== mode) {
+    replySlot.dataset.mode = mode;
+    fill(replySlot, s.channel ? composer(s.id) : channelHint(s));
+  }
+}
+
+/** Allow/Deny for a permission prompt; the terminal dialog closes with it. */
+function permissionCard(id, ask) {
+  const error = h("p", { class: "range-error", role: "alert", hidden: true });
+  const answer = async (behavior) => {
+    const buttons = card.querySelectorAll("button");
+    for (const b of buttons) b.disabled = true;
+    try {
+      const { session } = await postJson(
+        `sessions/${encodeURIComponent(id)}/permission`,
+        { request_id: ask.request_id, behavior },
+      );
+      state.sessions.set(session.id, session);
+      scheduleRender();
+    } catch (e) {
+      if (e instanceof Unauthorized) return askToken();
+      error.textContent = e.message;
+      error.hidden = false;
+      for (const b of buttons) b.disabled = false;
+    }
+  };
+  const card = h(
+    "div",
+    { class: "ask", role: "group", "aria-label": "Permission request" },
+    h(
+      "div",
+      { class: "ask-head" },
+      badge("permission"),
+      h("strong", { class: "mono", text: toolName(ask.tool) }),
+      clock(ask.at),
+    ),
+    ask.description
+      ? h("p", { class: "ask-desc", text: ask.description })
+      : null,
+    askPreview(ask.preview),
+    h(
+      "div",
+      { class: "ask-actions" },
+      h("button", {
+        class: "btn btn-quiet",
+        type: "button",
+        text: "Deny",
+        onclick: () => answer("deny"),
+      }),
+      h("button", {
+        class: "btn",
+        type: "button",
+        text: "Allow",
+        onclick: () => answer("allow"),
+      }),
+    ),
+    error,
+  );
+  return card;
+}
+
+/** The tool's arguments, one row per field when they parse as JSON. */
+function askPreview(preview) {
+  if (!preview) return null;
+  let fields = null;
+  try {
+    const parsed = JSON.parse(preview);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+      fields = Object.entries(parsed);
+  } catch {}
+  if (!fields) return h("pre", { class: "ask-preview", text: preview });
+  return h(
+    "dl",
+    { class: "ask-preview" },
+    fields.map(([key, value]) => [
+      h("dt", { text: key }),
+      h("dd", {
+        text: typeof value === "string" ? value : JSON.stringify(value),
+      }),
+    ]),
+  );
+}
+
+/** Message box sending to the session through its ccdash channel. Enter
+ * sends on desktop; on phones Enter is a newline and the button sends. */
+function composer(id) {
+  const error = h("p", { class: "range-error", role: "alert", hidden: true });
+  const send = h("button", { class: "btn", type: "submit", text: "Send" });
+  const grow = () => {
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
+  };
+  const input = h("textarea", {
+    class: "composer-input",
+    rows: 1,
+    maxlength: 20000,
+    placeholder: "Message Claude…",
+    "aria-label": "Message to Claude",
+    oninput: () => {
+      state.drafts.set(id, input.value);
+      grow();
+    },
+    onkeydown: (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      if (touchLayout() && !event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      form.requestSubmit();
+    },
+  });
+  input.value = state.drafts.get(id) || "";
+  const form = h(
+    "form",
+    {
+      class: "composer",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        const text = input.value.trim();
+        if (!text) return;
+        send.disabled = true;
+        try {
+          const { session } = await postJson(
+            `sessions/${encodeURIComponent(id)}/reply`,
+            { text },
+          );
+          state.sessions.set(session.id, session);
+          state.drafts.delete(id);
+          input.value = "";
+          grow();
+          error.hidden = true;
+          scheduleRender();
+          setTimeout(scheduleRender, UNDELIVERED_MS + 500);
+          requestAnimationFrame(scrollToEnd);
+        } catch (e) {
+          if (e instanceof Unauthorized) return askToken();
+          error.textContent = e.message;
+          error.hidden = false;
+        } finally {
+          send.disabled = false;
+        }
+      },
+    },
+    h("div", { class: "composer-row" }, input, send),
+    error,
+  );
+  requestAnimationFrame(grow);
+  return form;
+}
+
+function channelHint(s) {
+  return h(
+    "p",
+    { class: "composer-hint" },
+    "To reply from here, the session needs the ccdash channel: exit it and run ",
+    h("code", { text: `claude --resume ${s.id}` }),
+    ".",
+  );
+}
+
+/** Replies Claude has not taken yet. */
+function outbox(s) {
+  if (!s.outbox?.length || s.activity === "gone") return null;
+  const busy = s.activity === "working" || s.activity === "permission";
+  return s.outbox.map((m) => {
+    const stuck = !busy && now() - m.at > UNDELIVERED_MS;
+    return h(
+      "div",
+      { class: "msg msg-user msg-pending" },
+      h("div", { class: "bubble", text: m.text }),
+      h("time", {
+        class: stuck ? "stuck" : null,
+        text: stuck
+          ? "Not picked up yet: check the terminal"
+          : "Sent · waiting for Claude",
+      }),
+    );
+  });
 }
 
 /** QR code and link that bring a phone in, token included. */
@@ -1234,7 +1445,7 @@ function conversationTab(s) {
   }
   const lastReply = lastReplyAt(c.exchanges);
   for (const ex of c.exchanges) out.push(exchange(ex, lastReply));
-  out.push(h("div", { id: "live" }, liveBlock(s)));
+  out.push(h("div", { id: "live" }, outbox(s), liveBlock(s)));
   return out;
 }
 
@@ -1256,7 +1467,12 @@ function exchange(ex, lastReply) {
         "div",
         { class: "msg msg-user" },
         h("div", { class: "bubble clamp", text: ex.prompt }),
-        h("time", { text: fmtStamp(ex.at) }),
+        h("time", {
+          text:
+            ex.via === "ccdash"
+              ? `${fmtStamp(ex.at)} · sent from ccdash`
+              : fmtStamp(ex.at),
+        }),
       ),
     );
   }
@@ -1593,7 +1809,7 @@ function renderLive() {
   const s = state.sessions.get(state.detailId);
   if (!live || !s) return;
   const open = live.querySelector("details[open]") !== null;
-  fill(live, ...[liveBlock(s)].filter(Boolean));
+  fill(live, outbox(s), liveBlock(s));
   const details = live.querySelector("details");
   if (details && open) details.open = true;
 }

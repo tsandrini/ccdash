@@ -19,13 +19,16 @@ niri window events ────────────────┘
 
 - Every session reports through Claude Code hooks to a small daemon on the
   same machine. The daemon keeps live state in memory and history in SQLite.
-- The **web UI** is meant for the phone: it reads, and renames sessions.
-  Tapping a session opens it in the Claude app through Remote Control.
+- The **web UI** is meant for the phone: it reads, renames sessions, and
+  (with the channel enabled) sends them messages and answers their
+  permission prompts. "Open in Claude" opens a session in the Claude app
+  through Remote Control.
 - The **DMS plugin** adds a bar indicator, a quick list, and a full dashboard
   tab. Clicking a session focuses its terminal window in niri.
 
 Only public Claude Code interfaces are used (`claude agents --json`, hooks,
-the statusline payload); no internal state files.
+the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference));
+no internal state files.
 
 ## Usage
 
@@ -56,6 +59,7 @@ Then:
 ccdash status             # what every session is doing
 ccdash open <id>          # focus its window, or attach to a background session
 ccdash rename <id> <name> # rename a session (Claude adopts it at the next prompt)
+ccdash reply <id> <text>  # send a message to a session (needs the channel)
 ccdash url --lan --qr     # web address for the phone as a QR code, token included
 ```
 
@@ -94,6 +98,41 @@ new name at once and hands it to Claude Code at the session's next prompt
 (or resume), through the `sessionTitle` output of its own hook, so the
 terminal title and Remote Control pick it up too.
 
+### Replying from the phone
+
+With the channel enabled, the session sheet gets a message box, and a
+permission prompt shows up above it with the tool, its arguments, and
+Allow/Deny. Whichever answer comes first, the terminal's or ccdash's, wins.
+A message sent while Claude works waits for its next turn. Messages reach
+Claude as `<channel source="plugin:ccdash:ccdash">` events (the terminal
+shows `← ccdash: …`), and ccdash marks them "sent from ccdash".
+
+This uses Claude Code
+[channels](https://code.claude.com/docs/en/channels-reference), a research
+preview: `ccdash channel` is an MCP server that every session started with
+the channel flags runs, connected to the daemon. Two pieces turn it on:
+
+```nix
+# Home Manager: a `claude` wrapper that starts interactive sessions with
+# `--channels plugin:ccdash@inline --plugin-dir …`
+services.ccdash.claudeCode.channel.enable = true;
+
+# NixOS: allowlist the plugin in Claude Code's managed settings, which
+# replaces Anthropic's default channel allowlist on this machine
+imports = [ inputs.ccdash.nixosModules.default ];
+programs.ccdash.channel.allow = true;
+```
+
+Without the allowlist entry, `claudeCode.channel.devFlag = true` loads the
+channel with `--dangerously-load-development-channels` instead, and Claude
+Code then asks for confirmation at every launch. Sessions started before
+this (or without the wrapper) show how to restart them. Team and Enterprise
+accounts also need an admin to enable channels for the organization.
+
+Anyone holding the token can now prompt your sessions and approve their
+tool calls, so treat it like an SSH key: keep the port on your LAN or VPN,
+and delete the token file if a device goes missing.
+
 Claude Code reads hooks when a session starts, so sessions that were already
 running when ccdash was installed only show busy/idle until you restart
 them (`claude --resume` keeps the conversation). The conversation is built
@@ -104,8 +143,9 @@ session's process tree (Claude, its MCP servers and running commands) and
 its memory as PSS, so shared pages are not counted twice. Turn it off with
 `procs.enable = false`.
 
-The HTTP API needs the bearer token for everything (it can read sessions and
-rename them) (generated in
+The HTTP API needs the bearer token for everything (it can read sessions,
+rename them and, with the channel, prompt them and answer their permission
+prompts) (generated in
 `~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
 port behind your firewall or VPN.
 

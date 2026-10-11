@@ -1,4 +1,5 @@
-//! HTTP API for the web UI and the phone: reads, plus renaming sessions.
+//! HTTP API for the web UI and the phone: reads, plus renaming sessions,
+//! replying to them and answering their permission prompts.
 //! Every `/api` route needs `Authorization: Bearer <token>`.
 
 use std::{
@@ -31,6 +32,7 @@ use tracing::warn;
 use super::web;
 use crate::{
     analytics::{self, Analytics},
+    channel::Behavior,
     config::Config,
     conversation,
     history::{self, History},
@@ -66,6 +68,8 @@ pub async fn serve(
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
         .route("/sessions/{id}/title", post(rename))
+        .route("/sessions/{id}/reply", post(reply))
+        .route("/sessions/{id}/permission", post(permission))
         .route("/pair", get(pair))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
@@ -204,6 +208,45 @@ async fn rename(
         .rename(&id, &body.title)
         .await?
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Deserialize)]
+struct Reply {
+    text: String,
+}
+
+/// Sends a message to a session through its ccdash channel.
+async fn reply(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Reply>,
+) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .reply(&id, &body.text)
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Deserialize)]
+struct Verdict {
+    request_id: String,
+    behavior: Behavior,
+}
+
+/// Allows or denies the session's open permission prompt.
+async fn permission(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Verdict>,
+) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .answer(&id, &body.request_id, body.behavior)
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))
 }
 

@@ -69,6 +69,13 @@ pub fn rename(id: &str, title: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sends `text` to a session through its ccdash channel.
+pub fn reply(id: &str, text: &str) -> Result<()> {
+    let reply = request(&json!({ "cmd": "reply", "id": id, "text": text }))?;
+    println!("{}", reply["message"].as_str().unwrap_or("ok"));
+    Ok(())
+}
+
 fn attention_rank(activity: Activity) -> u8 {
     match activity {
         Activity::Permission => 0,

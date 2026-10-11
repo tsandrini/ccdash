@@ -120,6 +120,19 @@ pub struct ProcInfo {
     pub started_at: i64,
 }
 
+/// A permission prompt relayed by the session's ccdash channel; answering it
+/// with `request_id` resolves the terminal dialog too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionAsk {
+    pub request_id: String,
+    pub tool: String,
+    /// What the call does, in Claude's words.
+    pub description: String,
+    /// The call's arguments as JSON-shaped text.
+    pub preview: String,
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
     pub id: u64,
@@ -181,6 +194,11 @@ pub struct Session {
     pub hooked: bool,
     /// Renamed in ccdash; Claude Code adopts the title at the next prompt.
     pub renaming: bool,
+    /// The session runs the ccdash channel, so it takes replies.
+    pub channel: bool,
+    pub permission_ask: Option<PermissionAsk>,
+    /// Replies sent through the channel that Claude has not picked up yet.
+    pub outbox: Vec<Stamped>,
     pub resources: Option<Resources>,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,

@@ -11,6 +11,7 @@ let
     elem
     genAttrs
     getExe
+    hiPrio
     literalExpression
     mkDefault
     mkEnableOption
@@ -61,6 +62,27 @@ let
     command = "${exe} emit";
     timeout = 5;
   };
+
+  channel = cfg.claudeCode.channel;
+  # NOTE: `claude <subcommand>` parsers reject the channel flags (`rc` included)
+  claudeWrapper = pkgs.writeShellScriptBin "claude" ''
+    real=${getExe claudeCode.package}
+    case "''${1-}" in
+      agents | attach | auth | auto-mode | doctor | gateway | import | install | logs | mcp | \
+        plugin | plugins | purge | rc | remote-control | respawn | rm | setup-token | stop | \
+        kill | ultrareview | update | upgrade)
+        exec "$real" "$@"
+        ;;
+    esac
+    for arg in "$@"; do
+      case $arg in
+        -p | --print | --bg) exec "$real" "$@" ;;
+      esac
+    done
+    exec "$real" ${
+      if channel.devFlag then "--dangerously-load-development-channels" else "--channels"
+    } plugin:ccdash@inline --plugin-dir ${cfg.package}/share/ccdash/claude-plugin "$@"
+  '';
 in
 {
   options.services.ccdash = {
@@ -110,6 +132,30 @@ in
           Whether to register the ccdash hooks in
           {option}`programs.claude-code.settings`.
         '';
+      };
+
+      channel = {
+        enable = mkEnableOption ''
+          replying to sessions and answering their permission prompts from
+          ccdash, through a Claude Code channel. Puts a `claude` wrapper
+          first in `PATH` that starts interactive sessions with
+          `--channels plugin:ccdash@inline --plugin-dir …`; subcommands,
+          `-p` and `--bg` run unchanged. Claude Code only loads the channel
+          when it is allowlisted (the NixOS module's
+          {option}`programs.ccdash.channel.allow`) or with
+          {option}`devFlag`
+        '';
+
+        devFlag = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Whether to load the channel with
+            `--dangerously-load-development-channels` instead of `--channels`.
+            Needs no allowlist, but Claude Code then shows a warning dialog
+            at every launch.
+          '';
+        };
       };
 
       statusLine = {
@@ -164,6 +210,15 @@ in
       programs.claude-code.settings.hooks = genAttrs hookEvents (event: [
         ({ hooks = [ hook ]; } // optionalAttrs (elem event toolEvents) { matcher = "*"; })
       ]);
+    })
+    (mkIf channel.enable {
+      assertions = [
+        {
+          assertion = claudeCode.enable && claudeCode.package != null;
+          message = "services.ccdash.claudeCode.channel needs programs.claude-code.package to wrap.";
+        }
+      ];
+      home.packages = [ (hiPrio claudeWrapper) ];
     })
     (mkIf cfg.dms.enable {
       xdg.configFile."DankMaterialShell/plugins/ccdash".source = "${cfg.package}/share/ccdash/dms-plugin";

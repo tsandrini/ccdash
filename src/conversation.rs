@@ -27,6 +27,9 @@ pub struct Exchange {
     pub at: i64,
     /// None for events that came before the first prompt in the store.
     pub prompt: Option<String>,
+    /// `"ccdash"` for prompts sent from the dashboard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
     pub omitted: u32,
@@ -41,6 +44,7 @@ impl Exchange {
         Self {
             at,
             prompt,
+            via: None,
             items: Vec::new(),
             omitted: 0,
             last_message: None,
@@ -173,7 +177,9 @@ pub fn conversation(
         let (at, kind, data) = row?;
         let data: Value = serde_json::from_str(&data).unwrap_or_default();
         if kind == "prompt" {
-            exchanges.push(Exchange::new(at, Some(text(&data, "text"))));
+            let mut exchange = Exchange::new(at, Some(text(&data, "text")));
+            exchange.via = data.get("via").and_then(Value::as_str).map(str::to_owned);
+            exchanges.push(exchange);
         } else if let Some(item) = item(at, &kind, &data) {
             if exchanges.is_empty() {
                 exchanges.push(Exchange::new(at, None));

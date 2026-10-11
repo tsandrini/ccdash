@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::{
     model::{
-        Activity, Kind, Limit, ProcInfo, RateLimits, Resources, Session, Snapshot, Stamped,
-        Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
+        Activity, Kind, Limit, PermissionAsk, ProcInfo, RateLimits, Resources, Session, Snapshot,
+        Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
     },
     util::{pid_alive, tail, truncate},
     wire::{Envelope, Source},
@@ -36,6 +36,7 @@ const MAX_STREAMS: usize = 8;
 const PROC_SAMPLE_EVERY_MS: i64 = 60_000;
 /// A session starting this soon after Claude ran `claude --bg` is its child.
 const SPAWN_LINK_MS: i64 = 60_000;
+const MAX_OUTBOX: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -188,6 +189,8 @@ pub struct State {
     focused: Option<u64>,
     /// `(session, ts)` of Bash calls that started a background session.
     spawns: Vec<(String, i64)>,
+    /// Claude processes connected through `ccdash channel`.
+    channel_pids: HashSet<u32>,
 }
 
 impl State {
@@ -202,6 +205,7 @@ impl State {
             windows: HashMap::new(),
             focused: None,
             spawns: Vec::new(),
+            channel_pids: HashSet::new(),
         }
     }
 
@@ -285,6 +289,7 @@ impl State {
         s.last_event_at = ts;
         if let Some(pid) = env.pid {
             s.pid = Some(pid);
+            sync_channel(s, &self.channel_pids);
         }
         if let Some(remote) = &env.remote_id {
             s.remote_url = Some(remote_url(remote));
@@ -340,7 +345,12 @@ impl State {
                 focus_candidate = matches!(source, "startup" | "resume");
             }
             "UserPromptSubmit" => {
-                let text = str_of(p, "prompt").unwrap_or_default();
+                let raw = str_of(p, "prompt").unwrap_or_default();
+                let relayed = channel_text(raw);
+                let text = relayed.as_deref().unwrap_or(raw);
+                if relayed.is_some() {
+                    s.outbox.clear();
+                }
                 s.prompt = Some(Stamped {
                     at: ts,
                     text: truncate(text, PREVIEW_LEN),
@@ -361,7 +371,11 @@ impl State {
                     title_changed = true;
                 }
                 set_activity(s, Activity::Working, ts, store);
-                record(store, ts, id, "prompt", json!({ "text": text }));
+                let data = match relayed {
+                    Some(_) => json!({ "text": text, "via": "ccdash" }),
+                    None => json!({ "text": text }),
+                };
+                record(store, ts, id, "prompt", data);
                 focus_candidate = true;
             }
             "PreToolUse" => {
@@ -645,6 +659,7 @@ impl State {
         s.hooked = true;
         if let Some(pid) = env.pid {
             s.pid = Some(pid);
+            sync_channel(s, &self.channel_pids);
         }
         if let Some(remote) = &env.remote_id {
             s.remote_url = Some(remote_url(remote));
@@ -805,6 +820,64 @@ impl State {
         self.aux.entry(id.to_owned()).or_default().pending_title = Some(title.to_owned());
     }
 
+    /// Marks the session run by `pid` as connected to (or cut off from) its
+    /// ccdash channel.
+    pub fn channel(&mut self, pid: u32, up: bool, fx: &mut Effects) {
+        if up {
+            self.channel_pids.insert(pid);
+        } else {
+            self.channel_pids.remove(&pid);
+        }
+        for s in self.sessions.values_mut().filter(|s| s.pid == Some(pid)) {
+            if sync_channel(s, &self.channel_pids) {
+                fx.touched.insert(s.id.clone());
+            }
+        }
+    }
+
+    /// Shows a permission prompt relayed by the channel of `pid`.
+    pub fn permission_ask(&mut self, pid: u32, ask: PermissionAsk, fx: &mut Effects) {
+        let Some(id) = self.by_pid(pid).map(|s| s.id.clone()) else {
+            return;
+        };
+        let s = self.sessions.get_mut(&id).expect("found above");
+        s.permission_ask = Some(ask);
+        fx.touched.insert(id);
+    }
+
+    /// The live session run by `pid`.
+    pub fn by_pid(&self, pid: u32) -> Option<&Session> {
+        self.sessions
+            .values()
+            .filter(|s| s.activity != Activity::Gone && s.pid == Some(pid))
+            .max_by_key(|s| s.last_event_at)
+    }
+
+    /// Shows a reply sent through the channel until Claude picks it up.
+    pub fn sent_reply(&mut self, id: &str, text: &str, now: i64, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        s.outbox.push(Stamped {
+            at: now,
+            text: truncate(text, PREVIEW_LEN),
+        });
+        let excess = s.outbox.len().saturating_sub(MAX_OUTBOX);
+        s.outbox.drain(..excess);
+        fx.touched.insert(id.to_owned());
+    }
+
+    /// Forgets the permission prompt `request_id` once it is answered.
+    pub fn answered(&mut self, id: &str, request_id: &str, fx: &mut Effects) {
+        if let Some(s) = self.sessions.get_mut(id)
+            && s.permission_ask
+                .take_if(|a| a.request_id == request_id)
+                .is_some()
+        {
+            fx.touched.insert(id.to_owned());
+        }
+    }
+
     /// Live sessions with a known process.
     pub fn pids(&self) -> Vec<(String, u32)> {
         self.sessions
@@ -827,6 +900,7 @@ impl State {
 
             let s = self.sessions.get_mut(id).expect("ensured above");
             s.pid = e.pid.or(s.pid);
+            sync_channel(s, &self.channel_pids);
             let kind = match e.kind.as_deref() {
                 Some("background") => Kind::Background,
                 _ => Kind::Interactive,
@@ -993,6 +1067,9 @@ impl State {
             window: None,
             hooked: false,
             renaming: false,
+            channel: false,
+            permission_ask: None,
+            outbox: Vec::new(),
             resources: None,
             turn: None,
             tasks: Vec::new(),
@@ -1128,6 +1205,37 @@ impl State {
             self.claim(&id, wid, fx);
         }
     }
+}
+
+/// Updates `s.channel` from the connected pids; true if it changed. A lost
+/// channel takes the undelivered replies with it.
+fn sync_channel(s: &mut Session, channel_pids: &HashSet<u32>) -> bool {
+    let up = s.pid.is_some_and(|pid| channel_pids.contains(&pid));
+    if s.channel == up {
+        return false;
+    }
+    s.channel = up;
+    if !up {
+        s.outbox.clear();
+    }
+    true
+}
+
+/// The text of a prompt made only of ccdash channel messages, as Claude Code
+/// wraps them: `<channel source="…ccdash…" …>\ntext\n</channel>`.
+fn channel_text(prompt: &str) -> Option<String> {
+    let mut rest = prompt.trim();
+    let mut parts = Vec::new();
+    while !rest.is_empty() {
+        let (source, after) = rest.strip_prefix("<channel source=\"")?.split_once('"')?;
+        if !source.contains("ccdash") {
+            return None;
+        }
+        let (content, after) = after.split_once('>')?.1.split_once("</channel>")?;
+        parts.push(content.trim_matches('\n'));
+        rest = after.trim_start();
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -1312,6 +1420,9 @@ fn record(store: &mut Vec<StoreMsg>, ts: i64, session: &str, kind: &'static str,
 fn set_activity(s: &mut Session, to: Activity, ts: i64, store: &mut Vec<StoreMsg>) {
     if s.activity == to {
         return;
+    }
+    if to != Activity::Permission {
+        s.permission_ask = None;
     }
     record(
         store,
@@ -2174,6 +2285,100 @@ mod tests {
         assert!(
             !session(&st).renaming,
             "the statusline confirms a lost hand-off"
+        );
+    }
+
+    #[test]
+    fn channel_replies_queue_until_claude_takes_them() {
+        let mut st = state();
+        let pid = std::process::id();
+        let mut fx = Effects::default();
+        st.channel(pid, true, &mut fx);
+        assert!(fx.touched.is_empty(), "no session runs that pid yet");
+        hook(&mut st, 1, "SessionStart", json!({"source": "startup"}));
+        assert!(session(&st).channel, "the pid arrives after the channel");
+
+        st.sent_reply(SID, "from the phone", 2, &mut Effects::default());
+        assert_eq!(session(&st).outbox.len(), 1);
+        hook(&mut st, 3, "UserPromptSubmit", json!({"prompt": "typed"}));
+        assert_eq!(session(&st).outbox.len(), 1, "a typed prompt is not it");
+        let fx = hook(
+            &mut st,
+            4,
+            "UserPromptSubmit",
+            json!({"prompt": "<channel source=\"plugin:ccdash:ccdash\">\nfrom the phone\n</channel>"}),
+        );
+        let s = session(&st);
+        assert!(s.outbox.is_empty());
+        assert_eq!(s.prompt.as_ref().unwrap().text, "from the phone");
+        assert!(fx.store.iter().any(|m| matches!(m,
+            StoreMsg::Event { kind: "prompt", data, .. } if data["via"] == "ccdash")));
+
+        st.sent_reply(SID, "lost", 5, &mut Effects::default());
+        let mut fx = Effects::default();
+        st.channel(pid, false, &mut fx);
+        assert!(fx.touched.contains(SID));
+        let s = session(&st);
+        assert!(!s.channel && s.outbox.is_empty());
+    }
+
+    #[test]
+    fn relayed_permission_asks_end_with_the_prompt() {
+        let mut st = state();
+        let pid = std::process::id();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        let ask = PermissionAsk {
+            request_id: "abcde".into(),
+            tool: "Bash".into(),
+            description: "List files".into(),
+            preview: "{ \"command\": \"ls\" }".into(),
+            at: 2,
+        };
+        st.permission_ask(pid, ask.clone(), &mut Effects::default());
+        hook(
+            &mut st,
+            3,
+            "PermissionRequest",
+            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+        );
+        assert_eq!(session(&st).permission_ask.as_ref(), Some(&ask));
+
+        st.answered(SID, "zzzzz", &mut Effects::default());
+        assert!(session(&st).permission_ask.is_some(), "other ids stay open");
+        hook(
+            &mut st,
+            4,
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+        );
+        assert!(session(&st).permission_ask.is_none());
+
+        st.permission_ask(pid, ask, &mut Effects::default());
+        st.answered(SID, "abcde", &mut Effects::default());
+        assert!(session(&st).permission_ask.is_none());
+    }
+
+    #[test]
+    fn channel_prompts_unwrap_only_when_all_from_ccdash() {
+        assert_eq!(
+            channel_text("<channel source=\"ccdash\" k=\"v\">\nhi\n</channel>").as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            channel_text(
+                "<channel source=\"ccdash\">\na\n</channel>\n<channel source=\"ccdash\">\nb\n</channel>"
+            )
+            .as_deref(),
+            Some("a\n\nb")
+        );
+        assert_eq!(
+            channel_text("<channel source=\"webhook\">\nx\n</channel>"),
+            None
+        );
+        assert_eq!(channel_text("plain prompt"), None);
+        assert_eq!(
+            channel_text("<channel source=\"ccdash\">\nunterminated"),
+            None
         );
     }
 
