@@ -1,0 +1,1217 @@
+//! Session state. Every input is applied here; I/O lives in the callers.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::{
+    model::{Activity, Kind, Limit, RateLimits, Session, Snapshot, Stamped, ToolRun, WindowRef},
+    util::{pid_alive, truncate},
+    wire::{Envelope, Source},
+};
+
+const GONE_RETENTION_MS: i64 = 10 * 60 * 1000;
+/// Hooks are authoritative; `claude agents` only corrects state after this much hook silence.
+const HOOK_QUIET_MS: i64 = 10_000;
+const PENDING_WINDOW_MS: i64 = 30_000;
+const SAMPLE_EVERY_MS: i64 = 60_000;
+const SAMPLE_MIN_GAP_MS: i64 = 5_000;
+const SUMMARY_LEN: usize = 160;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Window {
+    pub id: u64,
+    pub app_id: String,
+    pub title: String,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum NiriEvent {
+    Windows(Vec<Window>),
+    WindowChanged(Window),
+    WindowClosed(u64),
+    Focus(Option<u64>),
+}
+
+/// One entry of `claude agents --json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEntry {
+    pub session_id: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub waiting_for: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoreMsg {
+    Event {
+        ts: i64,
+        session: String,
+        kind: &'static str,
+        data: Value,
+    },
+    Sample {
+        ts: i64,
+        session: String,
+        context_pct: Option<f64>,
+        cost_usd: Option<f64>,
+        five_hour: Option<f64>,
+        seven_day: Option<f64>,
+    },
+    Session {
+        id: String,
+        cwd: String,
+        name: Option<String>,
+        title: Option<String>,
+        kind: Kind,
+        started_at: i64,
+        ended_at: Option<i64>,
+    },
+}
+
+/// What an input changed; the hub turns this into broadcasts and writes.
+#[derive(Debug, Default)]
+pub struct Effects {
+    pub touched: BTreeSet<String>,
+    pub created: Vec<String>,
+    pub removed: Vec<String>,
+    pub store: Vec<StoreMsg>,
+    pub rate_limits: bool,
+}
+
+/// Persisted fields used to refill a session first seen after a daemon restart.
+#[derive(Debug, Default)]
+pub struct Restored {
+    pub prompt: Option<Stamped>,
+    pub reply: Option<Stamped>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct Aux {
+    last_hook_at: i64,
+    kind_known: bool,
+    missing_polls: u8,
+    pending_window: Option<(u64, i64)>,
+    last_sample: Option<(i64, Option<f64>)>,
+}
+
+pub struct State {
+    host: String,
+    terminals: Vec<String>,
+    sessions: HashMap<String, Session>,
+    aux: HashMap<String, Aux>,
+    rate_limits: Option<RateLimits>,
+    windows: HashMap<u64, Window>,
+    focused: Option<u64>,
+}
+
+impl State {
+    pub fn new(host: String, terminals: Vec<String>) -> Self {
+        Self {
+            host,
+            terminals,
+            sessions: HashMap::new(),
+            aux: HashMap::new(),
+            rate_limits: None,
+            windows: HashMap::new(),
+            focused: None,
+        }
+    }
+
+    pub fn session(&self, id: &str) -> Option<&Session> {
+        self.sessions.get(id)
+    }
+
+    pub fn rate_limits(&self) -> Option<&RateLimits> {
+        self.rate_limits.as_ref()
+    }
+
+    pub fn snapshot(&self, now: i64) -> Snapshot {
+        let mut sessions: Vec<Session> = self.sessions.values().cloned().collect();
+        sessions.sort_by_key(|s| s.started_at);
+        Snapshot {
+            host: self.host.clone(),
+            now,
+            sessions,
+            rate_limits: self.rate_limits.clone(),
+        }
+    }
+
+    /// Finds a session by full id, background short id, or unique id prefix.
+    pub fn resolve(&self, key: &str) -> Option<&Session> {
+        if let Some(s) = self.sessions.get(key) {
+            return Some(s);
+        }
+        if let Some(s) = self
+            .sessions
+            .values()
+            .find(|s| s.short_id.as_deref() == Some(key))
+        {
+            return Some(s);
+        }
+        let mut hits = self.sessions.values().filter(|s| s.id.starts_with(key));
+        match (hits.next(), hits.next()) {
+            (Some(s), None) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn restore(&mut self, id: &str, saved: Restored) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.prompt = s.prompt.take().or(saved.prompt);
+            s.reply = s.reply.take().or(saved.reply);
+            s.title = s.title.take().or(saved.title);
+        }
+    }
+
+    pub fn apply(&mut self, env: &Envelope, fx: &mut Effects) {
+        match env.source {
+            Source::Hook => self.hook(env, fx),
+            Source::Statusline => self.statusline(env, fx),
+        }
+    }
+
+    fn hook(&mut self, env: &Envelope, fx: &mut Effects) {
+        let p = &env.payload;
+        let (Some(id), Some(event)) = (str_of(p, "session_id"), str_of(p, "hook_event_name"))
+        else {
+            return;
+        };
+        let ts = env.ts;
+        if event == "SessionEnd" {
+            self.mark_gone(id, ts, str_of(p, "reason").unwrap_or("ended"), fx);
+            return;
+        }
+        self.ensure(id, str_of(p, "cwd"), ts, ts, fx);
+        if let Some(aux) = self.aux.get_mut(id) {
+            aux.last_hook_at = ts;
+        }
+
+        let store = &mut fx.store;
+        let s = self.sessions.get_mut(id).expect("ensured above");
+        s.last_event_at = ts;
+        if let Some(pid) = env.pid {
+            s.pid = Some(pid);
+        }
+        if let Some(remote) = &env.remote_id {
+            s.remote_url = Some(remote_url(remote));
+        }
+        if let Some(cwd) = str_of(p, "cwd") {
+            s.cwd = cwd.to_owned();
+        }
+        if let Some(mode) = str_of(p, "permission_mode") {
+            s.permission_mode = Some(mode.to_owned());
+        }
+        if s.activity == Activity::Gone {
+            set_activity(s, Activity::Idle, ts, store);
+        }
+
+        let tool_name = str_of(p, "tool_name").unwrap_or("?");
+        let tool_input = p.get("tool_input").unwrap_or(&Value::Null);
+        let mut focus_candidate = false;
+        match event {
+            "SessionStart" => {
+                let source = str_of(p, "source").unwrap_or("startup");
+                if s.model.is_none() {
+                    s.model = str_of(p, "model").map(str::to_owned);
+                }
+                record(store, ts, id, "start", json!({ "source": source }));
+                focus_candidate = matches!(source, "startup" | "resume");
+            }
+            "UserPromptSubmit" => {
+                let text = str_of(p, "prompt").unwrap_or_default();
+                s.prompt = Some(Stamped {
+                    at: ts,
+                    text: text.to_owned(),
+                });
+                s.tool = None;
+                s.waiting_for = None;
+                set_activity(s, Activity::Working, ts, store);
+                record(store, ts, id, "prompt", json!({ "text": text }));
+                focus_candidate = true;
+            }
+            "PreToolUse" => {
+                s.tool = Some(ToolRun {
+                    name: tool_name.to_owned(),
+                    summary: tool_summary(tool_name, tool_input, &s.cwd),
+                    started_at: ts,
+                });
+                if s.activity != Activity::Permission {
+                    set_activity(s, Activity::Working, ts, store);
+                }
+            }
+            "PermissionRequest" => {
+                let summary = tool_summary(tool_name, tool_input, &s.cwd);
+                s.waiting_for = Some(if summary.is_empty() {
+                    tool_name.to_owned()
+                } else {
+                    format!("{tool_name}: {summary}")
+                });
+                set_activity(s, Activity::Permission, ts, store);
+                record(
+                    store,
+                    ts,
+                    id,
+                    "permission",
+                    json!({ "tool": tool_name, "summary": summary }),
+                );
+            }
+            "Notification" => {
+                let kind = str_of(p, "notification_type").unwrap_or_default();
+                match kind {
+                    "permission_prompt" if s.activity != Activity::Permission => {
+                        s.waiting_for = str_of(p, "message").map(str::to_owned);
+                        set_activity(s, Activity::Permission, ts, store);
+                    }
+                    "idle_prompt" if s.activity == Activity::Working && s.tool.is_none() => {
+                        set_activity(s, Activity::YourTurn, ts, store);
+                    }
+                    _ => {}
+                }
+                record(
+                    store,
+                    ts,
+                    id,
+                    "notification",
+                    json!({ "type": kind, "message": str_of(p, "message") }),
+                );
+            }
+            "PostToolUse" | "PostToolUseFailure" => {
+                let running = s.tool.take_if(|t| t.name == tool_name);
+                let ms = p
+                    .get("duration_ms")
+                    .and_then(Value::as_i64)
+                    .or_else(|| running.as_ref().map(|t| ts - t.started_at));
+                let summary = running.map_or_else(
+                    || tool_summary(tool_name, tool_input, &s.cwd),
+                    |t| t.summary,
+                );
+                record(
+                    store,
+                    ts,
+                    id,
+                    "tool",
+                    json!({
+                        "name": tool_name,
+                        "summary": summary,
+                        "ms": ms,
+                        "ok": event == "PostToolUse",
+                    }),
+                );
+                if s.activity == Activity::Permission {
+                    s.waiting_for = None;
+                    set_activity(s, Activity::Working, ts, store);
+                }
+            }
+            "PermissionDenied" => {
+                s.tool = None;
+                s.waiting_for = None;
+                set_activity(s, Activity::Working, ts, store);
+            }
+            "Stop" => {
+                let text = str_of(p, "last_assistant_message").unwrap_or_default();
+                if !text.is_empty() {
+                    s.reply = Some(Stamped {
+                        at: ts,
+                        text: text.to_owned(),
+                    });
+                }
+                s.tool = None;
+                s.waiting_for = None;
+                set_activity(s, Activity::YourTurn, ts, store);
+                record(store, ts, id, "reply", json!({ "text": text }));
+            }
+            "StopFailure" => {
+                let error = str_of(p, "error")
+                    .or_else(|| str_of(p, "message"))
+                    .unwrap_or("turn failed");
+                s.tool = None;
+                s.waiting_for = Some(format!("error: {error}"));
+                set_activity(s, Activity::YourTurn, ts, store);
+                record(store, ts, id, "error", json!({ "error": error }));
+            }
+            "PreCompact" => {
+                record(
+                    store,
+                    ts,
+                    id,
+                    "compact",
+                    json!({ "trigger": str_of(p, "trigger") }),
+                );
+            }
+            _ => {}
+        }
+        if focus_candidate {
+            self.note_focus_candidate(id, ts, fx);
+        }
+    }
+
+    fn statusline(&mut self, env: &Envelope, fx: &mut Effects) {
+        let p = &env.payload;
+        let Some(id) = str_of(p, "session_id") else {
+            return;
+        };
+        let ts = env.ts;
+        self.ensure(id, str_of(p, "cwd"), ts, ts, fx);
+
+        let s = self.sessions.get_mut(id).expect("ensured above");
+        if let Some(pid) = env.pid {
+            s.pid = Some(pid);
+        }
+        if let Some(remote) = &env.remote_id {
+            s.remote_url = Some(remote_url(remote));
+        }
+        let title = str_of(p, "session_name")
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+        let title_changed = title.is_some() && title != s.title;
+        if title_changed {
+            s.title = title;
+            fx.store.push(session_row(s, None));
+        }
+        if let Some(model) = p.pointer("/model/display_name").and_then(Value::as_str) {
+            s.model = Some(model.to_owned());
+        }
+        s.context_pct = p
+            .pointer("/context_window/used_percentage")
+            .and_then(Value::as_f64);
+        s.cost_usd = p.pointer("/cost/total_cost_usd").and_then(Value::as_f64);
+        s.lines_added = p.pointer("/cost/total_lines_added").and_then(Value::as_u64);
+        s.lines_removed = p
+            .pointer("/cost/total_lines_removed")
+            .and_then(Value::as_u64);
+        let context_pct = s.context_pct;
+        let cost_usd = s.cost_usd;
+
+        if let Some(limits) = parse_rate_limits(p, ts) {
+            let changed = self.rate_limits.as_ref().is_none_or(|old| {
+                old.five_hour != limits.five_hour || old.seven_day != limits.seven_day
+            });
+            fx.rate_limits |= changed;
+            self.rate_limits = Some(limits);
+        }
+
+        let aux = self.aux.entry(id.to_owned()).or_default();
+        let due = aux.last_sample.is_none_or(|(at, ctx)| {
+            ts - at >= SAMPLE_EVERY_MS || (ctx != context_pct && ts - at >= SAMPLE_MIN_GAP_MS)
+        });
+        if due {
+            aux.last_sample = Some((ts, context_pct));
+            let limits = self.rate_limits.as_ref();
+            fx.store.push(StoreMsg::Sample {
+                ts,
+                session: id.to_owned(),
+                context_pct,
+                cost_usd,
+                five_hour: limits
+                    .and_then(|l| l.five_hour.as_ref())
+                    .map(|l| l.used_pct),
+                seven_day: limits
+                    .and_then(|l| l.seven_day.as_ref())
+                    .map(|l| l.used_pct),
+            });
+        }
+        if title_changed {
+            self.match_titles(fx);
+        }
+    }
+
+    pub fn agents(&mut self, list: &[AgentEntry], now: i64, fx: &mut Effects) {
+        let mut seen = HashSet::new();
+        for e in list {
+            let id = e.session_id.as_str();
+            seen.insert(id);
+            self.ensure(id, e.cwd.as_deref(), e.started_at.unwrap_or(now), now, fx);
+            let aux = self.aux.entry(id.to_owned()).or_default();
+            aux.kind_known = true;
+            aux.missing_polls = 0;
+            let quiet = now - aux.last_hook_at > HOOK_QUIET_MS;
+
+            let s = self.sessions.get_mut(id).expect("ensured above");
+            s.pid = e.pid.or(s.pid);
+            s.kind = match e.kind.as_deref() {
+                Some("background") => Kind::Background,
+                _ => Kind::Interactive,
+            };
+            s.short_id = e.id.clone();
+            if e.name.is_some() {
+                s.name = e.name.clone();
+            }
+            if quiet && let Some(to) = agent_activity(e, s.activity) {
+                if to == Activity::Permission {
+                    s.waiting_for = e.waiting_for.clone();
+                }
+                set_activity(s, to, now, &mut fx.store);
+            }
+        }
+        for e in list {
+            self.resolve_pending(&e.session_id, now, fx);
+        }
+
+        let mut vanished = Vec::new();
+        for (id, s) in &self.sessions {
+            if s.activity == Activity::Gone || seen.contains(id.as_str()) {
+                continue;
+            }
+            let aux = self.aux.entry(id.clone()).or_default();
+            aux.missing_polls = aux.missing_polls.saturating_add(1);
+            if aux.missing_polls >= 2 && !pid_alive(s.pid) {
+                vanished.push(id.clone());
+            }
+        }
+        for id in vanished {
+            self.mark_gone(&id, now, "vanished", fx);
+        }
+    }
+
+    pub fn niri(&mut self, event: NiriEvent, fx: &mut Effects) {
+        match event {
+            NiriEvent::Windows(list) => {
+                self.focused = list.iter().find(|w| w.focused).map(|w| w.id);
+                self.windows = list.into_iter().map(|w| (w.id, w)).collect();
+                for s in self.sessions.values_mut() {
+                    let Some(r) = &mut s.window else { continue };
+                    match self.windows.get(&r.id) {
+                        None => {
+                            s.window = None;
+                            fx.touched.insert(s.id.clone());
+                        }
+                        Some(w) if shown_title(&w.title) != r.title => {
+                            r.title = shown_title(&w.title).to_owned();
+                            fx.touched.insert(s.id.clone());
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            NiriEvent::WindowChanged(w) => {
+                if w.focused {
+                    self.focused = Some(w.id);
+                }
+                let (wid, title) = (w.id, shown_title(&w.title).to_owned());
+                self.windows.insert(w.id, w);
+                if let Some(owner) = self.owner_of(wid)
+                    && let Some(r) = self
+                        .sessions
+                        .get_mut(&owner)
+                        .and_then(|s| s.window.as_mut())
+                    && r.title != title
+                {
+                    r.title = title;
+                    fx.touched.insert(owner);
+                }
+            }
+            NiriEvent::WindowClosed(wid) => {
+                self.windows.remove(&wid);
+                if self.focused == Some(wid) {
+                    self.focused = None;
+                }
+                if let Some(owner) = self.owner_of(wid)
+                    && let Some(s) = self.sessions.get_mut(&owner)
+                {
+                    s.window = None;
+                    fx.touched.insert(owner);
+                }
+                return;
+            }
+            NiriEvent::Focus(id) => {
+                self.focused = id;
+                return;
+            }
+        }
+        self.match_titles(fx);
+    }
+
+    /// Marks sessions whose process died as gone and forgets old gone ones.
+    pub fn tick(&mut self, now: i64, fx: &mut Effects) {
+        let dead: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|s| s.activity != Activity::Gone && s.pid.is_some() && !pid_alive(s.pid))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in dead {
+            self.mark_gone(&id, now, "exited", fx);
+        }
+        let expired: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|s| s.activity == Activity::Gone && now - s.activity_since > GONE_RETENTION_MS)
+            .map(|s| s.id.clone())
+            .collect();
+        for id in expired {
+            self.sessions.remove(&id);
+            self.aux.remove(&id);
+            fx.removed.push(id);
+        }
+        for aux in self.aux.values_mut() {
+            if aux
+                .pending_window
+                .is_some_and(|(_, at)| now - at > PENDING_WINDOW_MS)
+            {
+                aux.pending_window = None;
+            }
+        }
+    }
+
+    fn ensure(&mut self, id: &str, cwd: Option<&str>, started_at: i64, now: i64, fx: &mut Effects) {
+        fx.touched.insert(id.to_owned());
+        if self.sessions.contains_key(id) {
+            return;
+        }
+        let session = Session {
+            host: self.host.clone(),
+            id: id.to_owned(),
+            short_id: None,
+            kind: Kind::Interactive,
+            pid: None,
+            cwd: cwd.unwrap_or_default().to_owned(),
+            name: None,
+            title: None,
+            activity: Activity::Idle,
+            activity_since: now,
+            waiting_for: None,
+            tool: None,
+            prompt: None,
+            reply: None,
+            model: None,
+            permission_mode: None,
+            context_pct: None,
+            cost_usd: None,
+            lines_added: None,
+            lines_removed: None,
+            remote_url: None,
+            window: None,
+            started_at,
+            last_event_at: now,
+        };
+        fx.store.push(session_row(&session, None));
+        fx.created.push(id.to_owned());
+        self.sessions.insert(id.to_owned(), session);
+        self.aux.insert(id.to_owned(), Aux::default());
+    }
+
+    fn mark_gone(&mut self, id: &str, ts: i64, reason: &str, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        if s.activity == Activity::Gone {
+            return;
+        }
+        s.tool = None;
+        s.waiting_for = None;
+        set_activity(s, Activity::Gone, ts, &mut fx.store);
+        record(&mut fx.store, ts, id, "end", json!({ "reason": reason }));
+        fx.store.push(session_row(s, Some(ts)));
+        fx.touched.insert(id.to_owned());
+    }
+
+    fn is_terminal(&self, window: &Window) -> bool {
+        self.terminals.contains(&window.app_id)
+    }
+
+    fn owner_of(&self, wid: u64) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|s| s.window.as_ref().is_some_and(|w| w.id == wid))
+            .map(|s| s.id.clone())
+    }
+
+    /// Remembers the focused terminal as this session's likely window. Claimed
+    /// once `claude agents` confirms the session is interactive and the window
+    /// shows a Claude title.
+    fn note_focus_candidate(&mut self, id: &str, ts: i64, fx: &mut Effects) {
+        let Some(wid) = self.focused else { return };
+        if !self.windows.get(&wid).is_some_and(|w| self.is_terminal(w)) {
+            return;
+        }
+        if let Some(aux) = self.aux.get_mut(id) {
+            aux.pending_window = Some((wid, ts));
+        }
+        self.resolve_pending(id, ts, fx);
+    }
+
+    fn resolve_pending(&mut self, id: &str, now: i64, fx: &mut Effects) {
+        let Some(aux) = self.aux.get_mut(id) else {
+            return;
+        };
+        let Some((wid, at)) = aux.pending_window else {
+            return;
+        };
+        if !aux.kind_known {
+            if now - at > PENDING_WINDOW_MS {
+                aux.pending_window = None;
+            }
+            return;
+        }
+        aux.pending_window = None;
+        let interactive = self
+            .sessions
+            .get(id)
+            .is_some_and(|s| s.kind == Kind::Interactive);
+        let titled = self
+            .windows
+            .get(&wid)
+            .is_some_and(|w| claude_title(&w.title).is_some());
+        if interactive && titled {
+            self.claim(id, wid, fx);
+        }
+    }
+
+    fn claim(&mut self, id: &str, wid: u64, fx: &mut Effects) {
+        let Some(w) = self.windows.get(&wid) else {
+            return;
+        };
+        if !self.is_terminal(w) {
+            return;
+        }
+        let title = shown_title(&w.title).to_owned();
+        let Some(s) = self.sessions.get(id) else {
+            return;
+        };
+        if let (Some(known), Some(shown)) = (&s.title, claude_title(&w.title))
+            && known != shown
+        {
+            return;
+        }
+        if let Some(owner) = self.owner_of(wid) {
+            if owner == id || self.sessions[&owner].activity != Activity::Gone {
+                return;
+            }
+            if let Some(old) = self.sessions.get_mut(&owner) {
+                old.window = None;
+            }
+            fx.touched.insert(owner);
+        }
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.window = Some(WindowRef { id: wid, title });
+            fx.touched.insert(id.to_owned());
+        }
+    }
+
+    /// Pairs live sessions without a window with the one terminal whose
+    /// Claude title equals the session title.
+    fn match_titles(&mut self, fx: &mut Effects) {
+        let pairs: Vec<(String, u64)> = self
+            .sessions
+            .values()
+            .filter(|s| s.activity != Activity::Gone && s.window.is_none())
+            .filter_map(|s| {
+                let title = s.title.as_deref()?;
+                let mut hits = self
+                    .windows
+                    .values()
+                    .filter(|w| self.is_terminal(w) && claude_title(&w.title) == Some(title));
+                match (hits.next(), hits.next()) {
+                    (Some(w), None) => Some((s.id.clone(), w.id)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (id, wid) in pairs {
+            self.claim(&id, wid, fx);
+        }
+    }
+}
+
+fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+fn remote_url(remote_id: &str) -> String {
+    format!("https://claude.ai/code/{remote_id}")
+}
+
+fn record(store: &mut Vec<StoreMsg>, ts: i64, session: &str, kind: &'static str, data: Value) {
+    store.push(StoreMsg::Event {
+        ts,
+        session: session.to_owned(),
+        kind,
+        data,
+    });
+}
+
+fn set_activity(s: &mut Session, to: Activity, ts: i64, store: &mut Vec<StoreMsg>) {
+    if s.activity == to {
+        return;
+    }
+    record(
+        store,
+        ts,
+        &s.id,
+        "activity",
+        json!({ "from": s.activity, "to": to }),
+    );
+    s.activity = to;
+    s.activity_since = ts;
+}
+
+fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
+    StoreMsg::Session {
+        id: s.id.clone(),
+        cwd: s.cwd.clone(),
+        name: s.name.clone(),
+        title: s.title.clone(),
+        kind: s.kind,
+        started_at: s.started_at,
+        ended_at,
+    }
+}
+
+fn agent_activity(e: &AgentEntry, current: Activity) -> Option<Activity> {
+    let waiting_permission = e
+        .waiting_for
+        .as_deref()
+        .is_some_and(|w| w.contains("permission"));
+    match e.status.as_deref()? {
+        "busy" => Some(Activity::Working),
+        "waiting" if waiting_permission => Some(Activity::Permission),
+        "waiting" => Some(Activity::YourTurn),
+        "idle" if matches!(current, Activity::Working | Activity::Permission) => {
+            Some(Activity::YourTurn)
+        }
+        _ => None,
+    }
+}
+
+fn parse_rate_limits(p: &Value, ts: i64) -> Option<RateLimits> {
+    let limits = p.get("rate_limits")?;
+    let limit = |key: &str| {
+        let l = limits.get(key)?;
+        Some(Limit {
+            used_pct: l.get("used_percentage")?.as_f64()?,
+            resets_at: l.get("resets_at").and_then(Value::as_i64).unwrap_or(0),
+        })
+    };
+    Some(RateLimits {
+        five_hour: limit("five_hour"),
+        seven_day: limit("seven_day"),
+        updated_at: ts,
+    })
+}
+
+fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {
+    let field = |key: &str| input.get(key).and_then(Value::as_str);
+    let text = match name {
+        "Bash" => field("command").map(|c| c.lines().next().unwrap_or_default().to_owned()),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => field("file_path")
+            .or_else(|| field("notebook_path"))
+            .map(|p| relative(p, cwd)),
+        "Grep" | "Glob" => field("pattern").map(str::to_owned),
+        "WebFetch" => field("url").map(str::to_owned),
+        "WebSearch" => field("query").map(str::to_owned),
+        _ => field("description").map(str::to_owned),
+    };
+    truncate(&text.unwrap_or_default(), SUMMARY_LEN)
+}
+
+fn relative(path: &str, cwd: &str) -> String {
+    path.strip_prefix(cwd)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+/// Claude Code prefixes its terminal title with a status glyph and a space.
+fn claude_title(title: &str) -> Option<&str> {
+    let mut chars = title.chars();
+    let glyph = chars.next()?;
+    if glyph.is_ascii() || glyph.is_alphanumeric() {
+        return None;
+    }
+    chars.as_str().strip_prefix(' ')
+}
+
+fn shown_title(title: &str) -> &str {
+    claude_title(title).unwrap_or(title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::VERSION;
+
+    const SID: &str = "11111111-2222-3333-4444-555555555555";
+    const GHOSTTY: &str = "com.mitchellh.ghostty";
+
+    fn state() -> State {
+        State::new("testhost".into(), vec![GHOSTTY.into()])
+    }
+
+    fn envelope(source: Source, ts: i64, payload: Value) -> Envelope {
+        Envelope {
+            v: VERSION,
+            source,
+            ts,
+            pid: Some(std::process::id()),
+            remote_id: Some("session_remote".into()),
+            payload,
+        }
+    }
+
+    fn hook(st: &mut State, ts: i64, event: &str, extra: Value) -> Effects {
+        let mut payload = json!({
+            "session_id": SID,
+            "cwd": "/work/repo",
+            "hook_event_name": event,
+        });
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut fx = Effects::default();
+        st.apply(&envelope(Source::Hook, ts, payload), &mut fx);
+        fx
+    }
+
+    fn statusline(st: &mut State, ts: i64, title: &str) -> Effects {
+        let mut fx = Effects::default();
+        let payload = json!({
+            "session_id": SID,
+            "cwd": "/work/repo",
+            "session_name": title,
+            "model": {"id": "claude-haiku-5-5", "display_name": "Haiku 5.5"},
+            "cost": {"total_cost_usd": 0.25, "total_lines_added": 3, "total_lines_removed": 1},
+            "context_window": {"used_percentage": 4},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 1, "resets_at": 1791691800},
+                "seven_day": {"used_percentage": 27, "resets_at": 1792026000},
+            },
+        });
+        st.apply(&envelope(Source::Statusline, ts, payload), &mut fx);
+        fx
+    }
+
+    fn agents(st: &mut State, now: i64, kind: &str, status: &str) -> Effects {
+        let mut fx = Effects::default();
+        let entry = AgentEntry {
+            session_id: SID.into(),
+            pid: Some(std::process::id()),
+            id: (kind == "background").then(|| "11111111".into()),
+            kind: Some(kind.into()),
+            name: Some("repo-a1".into()),
+            status: Some(status.into()),
+            ..Default::default()
+        };
+        st.agents(&[entry], now, &mut fx);
+        fx
+    }
+
+    fn window(id: u64, title: &str, focused: bool) -> Window {
+        Window {
+            id,
+            app_id: GHOSTTY.into(),
+            title: title.into(),
+            focused,
+        }
+    }
+
+    fn session(st: &State) -> &Session {
+        st.session(SID).unwrap()
+    }
+
+    fn kinds(fx: &Effects) -> Vec<&'static str> {
+        fx.store
+            .iter()
+            .filter_map(|m| match m {
+                StoreMsg::Event { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_turn() {
+        let mut st = state();
+        let fx = hook(
+            &mut st,
+            1,
+            "SessionStart",
+            json!({"source": "startup", "model": "claude-haiku-5-5"}),
+        );
+        assert_eq!(fx.created, vec![SID]);
+        assert_eq!(session(&st).activity, Activity::Idle);
+
+        hook(
+            &mut st,
+            2,
+            "UserPromptSubmit",
+            json!({"prompt": "do the thing", "permission_mode": "default"}),
+        );
+        assert_eq!(session(&st).activity, Activity::Working);
+        assert_eq!(session(&st).prompt.as_ref().unwrap().text, "do the thing");
+        assert_eq!(
+            session(&st).remote_url.as_deref(),
+            Some("https://claude.ai/code/session_remote")
+        );
+
+        hook(
+            &mut st,
+            3,
+            "PreToolUse",
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/work/repo/src/main.rs"}}),
+        );
+        let tool = session(&st).tool.clone().unwrap();
+        assert_eq!(
+            (tool.name.as_str(), tool.summary.as_str()),
+            ("Read", "src/main.rs")
+        );
+
+        let fx = hook(
+            &mut st,
+            50,
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {}, "duration_ms": 47}),
+        );
+        assert!(session(&st).tool.is_none());
+        let StoreMsg::Event { data, .. } = &fx.store[0] else {
+            panic!()
+        };
+        assert_eq!(data["ms"], 47);
+        assert_eq!(data["summary"], "src/main.rs");
+
+        let fx = hook(
+            &mut st,
+            60,
+            "Stop",
+            json!({"last_assistant_message": "- done"}),
+        );
+        let s = session(&st);
+        assert_eq!((s.activity, s.activity_since), (Activity::YourTurn, 60));
+        assert_eq!(s.reply.as_ref().unwrap().text, "- done");
+        assert_eq!(kinds(&fx), vec!["activity", "reply"]);
+    }
+
+    #[test]
+    fn permission_round_trip() {
+        let mut st = state();
+        hook(
+            &mut st,
+            1,
+            "UserPromptSubmit",
+            json!({"prompt": "touch it"}),
+        );
+        hook(
+            &mut st,
+            2,
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch /tmp/x\necho more"}}),
+        );
+        hook(
+            &mut st,
+            3,
+            "PermissionRequest",
+            json!({"tool_name": "Bash", "tool_input": {"command": "touch /tmp/x"}}),
+        );
+        hook(
+            &mut st,
+            4,
+            "Notification",
+            json!({"notification_type": "permission_prompt", "message": "Claude needs your permission"}),
+        );
+        let s = session(&st);
+        assert_eq!((s.activity, s.activity_since), (Activity::Permission, 3));
+        assert_eq!(s.waiting_for.as_deref(), Some("Bash: touch /tmp/x"));
+
+        hook(&mut st, 9, "PostToolUse", json!({"tool_name": "Bash"}));
+        let s = session(&st);
+        assert_eq!(s.activity, Activity::Working);
+        assert!(s.waiting_for.is_none());
+    }
+
+    #[test]
+    fn session_end_marks_gone_and_tick_expires() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "x"}));
+        let fx = hook(&mut st, 2, "SessionEnd", json!({"reason": "other"}));
+        assert_eq!(session(&st).activity, Activity::Gone);
+        assert!(fx.store.iter().any(|m| matches!(
+            m,
+            StoreMsg::Session {
+                ended_at: Some(2),
+                ..
+            }
+        )));
+
+        let mut fx = Effects::default();
+        st.tick(2 + GONE_RETENTION_MS + 1, &mut fx);
+        assert_eq!(fx.removed, vec![SID]);
+        assert!(st.session(SID).is_none());
+    }
+
+    #[test]
+    fn statusline_sets_stats_and_throttles_samples() {
+        let mut st = state();
+        let fx = statusline(&mut st, 1_000, "Fix the parser");
+        let s = session(&st);
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(s.model.as_deref(), Some("Haiku 5.5"));
+        assert_eq!(
+            (s.context_pct, s.cost_usd, s.lines_added),
+            (Some(4.0), Some(0.25), Some(3))
+        );
+        assert!(fx.rate_limits);
+        assert_eq!(
+            st.rate_limits()
+                .unwrap()
+                .seven_day
+                .as_ref()
+                .unwrap()
+                .used_pct,
+            27.0
+        );
+
+        let fx = statusline(&mut st, 2_000, "Fix the parser");
+        assert!(!fx.rate_limits);
+        assert!(
+            !fx.store
+                .iter()
+                .any(|m| matches!(m, StoreMsg::Sample { .. }))
+        );
+        let fx = statusline(&mut st, 1_000 + SAMPLE_EVERY_MS, "Fix the parser");
+        assert!(
+            fx.store
+                .iter()
+                .any(|m| matches!(m, StoreMsg::Sample { .. }))
+        );
+    }
+
+    #[test]
+    fn agents_create_reconcile_and_vanish() {
+        let mut st = state();
+        let fx = agents(&mut st, 100_000, "background", "busy");
+        assert_eq!(fx.created, vec![SID]);
+        let s = session(&st);
+        assert_eq!((s.kind, s.activity), (Kind::Background, Activity::Working));
+        assert_eq!(s.short_id.as_deref(), Some("11111111"));
+
+        // Fresh hooks win over a lagging poll.
+        hook(
+            &mut st,
+            100_500,
+            "Stop",
+            json!({"last_assistant_message": "ok"}),
+        );
+        agents(&mut st, 101_000, "background", "busy");
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+
+        // Missing twice with a dead pid → gone.
+        st.sessions.get_mut(SID).unwrap().pid = Some(u32::MAX);
+        let mut fx = Effects::default();
+        st.agents(&[], 200_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+        st.agents(&[], 205_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::Gone);
+    }
+
+    #[test]
+    fn focus_claim_waits_for_kind_and_claude_title() {
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.niri(
+            NiriEvent::Windows(vec![window(7, "~/P/repo", true), window(8, "other", false)]),
+            &mut fx,
+        );
+
+        hook(&mut st, 1, "SessionStart", json!({"source": "startup"}));
+        assert!(session(&st).window.is_none());
+
+        // Claude has set its title by the time `claude agents` reports the session.
+        st.niri(
+            NiriEvent::WindowChanged(window(7, "✳ Claude Code", true)),
+            &mut fx,
+        );
+        agents(&mut st, 2, "interactive", "idle");
+        assert_eq!(
+            session(&st).window,
+            Some(WindowRef {
+                id: 7,
+                title: "Claude Code".into()
+            })
+        );
+
+        // Spinner glyph changes don't count as title changes.
+        let mut fx = Effects::default();
+        st.niri(
+            NiriEvent::WindowChanged(window(7, "◐ Claude Code", true)),
+            &mut fx,
+        );
+        assert!(fx.touched.is_empty());
+
+        st.niri(NiriEvent::WindowClosed(7), &mut fx);
+        assert!(session(&st).window.is_none());
+    }
+
+    #[test]
+    fn background_sessions_never_claim_the_focused_terminal() {
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.niri(
+            NiriEvent::Windows(vec![window(7, "✳ Some other chat", true)]),
+            &mut fx,
+        );
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "x"}));
+        agents(&mut st, 2, "background", "busy");
+        assert!(session(&st).window.is_none());
+    }
+
+    #[test]
+    fn title_match_and_mismatch() {
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.niri(
+            NiriEvent::Windows(vec![
+                window(3, "✳ Fix the parser", false),
+                window(4, "✳ Something else", true),
+            ]),
+            &mut fx,
+        );
+        statusline(&mut st, 1, "Fix the parser");
+        assert_eq!(session(&st).window.as_ref().map(|w| w.id), Some(3));
+
+        // A prompt from the phone while another Claude window is focused must not steal it.
+        agents(&mut st, 2, "interactive", "busy");
+        hook(
+            &mut st,
+            3,
+            "UserPromptSubmit",
+            json!({"prompt": "from phone"}),
+        );
+        assert_eq!(session(&st).window.as_ref().map(|w| w.id), Some(3));
+    }
+
+    #[test]
+    fn resolve_by_prefix_and_short_id() {
+        let mut st = state();
+        agents(&mut st, 1, "background", "idle");
+        assert!(st.resolve("11111111").is_some());
+        assert!(st.resolve("11111111-2222").is_some());
+        assert!(st.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn claude_title_detection() {
+        assert_eq!(claude_title("✳ Fix it"), Some("Fix it"));
+        assert_eq!(claude_title("◐ Fix it"), Some("Fix it"));
+        assert_eq!(claude_title("~/P/repo"), None);
+        assert_eq!(claude_title("Čtení"), None);
+    }
+}

@@ -5,7 +5,8 @@ working, which are waiting on you, and which look stuck. On the desktop as a
 [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) plugin,
 on the phone as a web page.
 
-> **Status:** early work in progress. Nothing below works yet.
+> **Status:** work in progress. The collector daemon works; the web UI and
+> the DMS plugin are not built yet.
 
 ## How it works
 
@@ -25,6 +26,39 @@ niri window events ────────────────┘
 
 Only public Claude Code interfaces are used (`claude agents --json`, hooks,
 the statusline payload); no internal state files.
+
+## Usage
+
+With Home Manager (the module also wires the hooks into
+`programs.claude-code`):
+
+```nix
+{
+  imports = [ inputs.ccdash.homeModules.default ];
+
+  services.ccdash = {
+    enable = true;
+    settings.http.listen = [ "[::]:7837" ];
+    # keep your statusline, ccdash reads the stats on its way through
+    claudeCode.statusLine = {
+      enable = true;
+      command = lib.getExe pkgs.ccstatusline;
+    };
+  };
+}
+```
+
+Then:
+
+```sh
+ccdash status          # what every session is doing
+ccdash open <id>       # focus its window, or attach to a background session
+ccdash url --host <ip> # web address for the phone, token included
+```
+
+The HTTP API is read-only and needs the bearer token (generated in
+`~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
+port behind your firewall or VPN.
 
 ## Development
 
