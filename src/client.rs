@@ -62,6 +62,13 @@ pub fn open(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Renames a session; Claude Code adopts the title at its next prompt.
+pub fn rename(id: &str, title: &str) -> Result<()> {
+    let reply = request(&json!({ "cmd": "rename", "id": id, "title": title }))?;
+    println!("{}", reply["message"].as_str().unwrap_or("ok"));
+    Ok(())
+}
+
 fn attention_rank(activity: Activity) -> u8 {
     match activity {
         Activity::Permission => 0,

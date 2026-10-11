@@ -1,6 +1,7 @@
 //! Local API on `api.sock`: newline-delimited JSON, one request per line.
 //!
-//! Requests: `{"cmd":"snapshot"}`, `{"cmd":"subscribe"}`, `{"cmd":"open","id":"…"}`.
+//! Requests: `{"cmd":"snapshot"}`, `{"cmd":"subscribe"}`, `{"cmd":"open","id":"…"}`,
+//! `{"cmd":"rename","id":"…","title":"…"}`.
 //! Replies carry a `type`: `snapshot`, `session`, `removed`, `rate_limits`, `ok`, `error`.
 
 use std::sync::Arc;
@@ -23,6 +24,7 @@ enum Request {
     Snapshot,
     Subscribe,
     Open { id: String },
+    Rename { id: String, title: String },
 }
 
 pub async fn serve(listener: UnixListener, hub: Hub, cfg: Arc<Config>) {
@@ -52,6 +54,13 @@ async fn handle(stream: UnixStream, hub: Hub, cfg: Arc<Config>) -> Result<()> {
             Ok(Request::Open { id }) => match actions::open(&hub, &cfg.attach.command, &id).await {
                 Ok(message) => json!({ "type": "ok", "message": message }),
                 Err(e) => error(format!("{e:#}")),
+            },
+            Ok(Request::Rename { id, title }) => match hub.rename(&id, &title).await? {
+                Ok(_) => json!({
+                    "type": "ok",
+                    "message": "renamed; Claude Code adopts it at the next prompt",
+                }),
+                Err(e) => error(e),
             },
         };
         send(&mut write, &reply).await?;

@@ -27,6 +27,9 @@ pub struct Envelope {
     /// Remote Control session id (`CLAUDE_CODE_BRIDGE_SESSION_ID`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
+    /// A queued title this hook handed to Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_title: Option<String>,
     pub payload: Value,
 }
 
@@ -93,6 +96,7 @@ mod tests {
             ts: 0,
             pid: None,
             remote_id: None,
+            applied_title: None,
             payload,
         }
     }

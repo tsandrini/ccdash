@@ -10,13 +10,18 @@ dash and notifications.
 - **Dash tab** (`dms ipc call dash toggle plugin_ccdash`): sessions by state
   on the left, the selected one on the right (what it waits for or runs,
   Claude's latest text, tasks, subagents, resources). Keys: `↑`/`↓` or
-  `j`/`k` select, `Enter` focuses, `w` opens the conversation in the web UI,
-  `r` opens it in Claude, `[`/`]` switch workspace.
+  `j`/`k` select, `Enter` focuses, `e` (or `F2`) renames, `w` opens the
+  conversation in the web UI, `r` opens it in Claude, `[`/`]` switch
+  workspace. "Connect phone" opens the web UI's QR code for the phone.
 - **Dash card:** the same counts and the 5-hour limit on the overview.
 - **Notifications** when a session starts waiting for you and its window is
   not focused; clicking one focuses the session.
 - **IPC:** `dms ipc call ccdash focusWaiting` focuses the session that has
-  waited longest (permission prompts first); also `open <id>` and `status`.
+  waited longest (permission prompts first); also `open <id>`,
+  `rename <id> <title>` and `status`.
+
+Links to the web UI carry the access token (read with `ccdash url`), so the
+desktop browser never asks for it.
 
 It talks to the ccdash daemon over `$XDG_RUNTIME_DIR/ccdash/api.sock` and
 focuses windows with `ccdash open`, so both must be available. Install it by

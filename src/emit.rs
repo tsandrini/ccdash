@@ -1,6 +1,7 @@
 //! Client side of the ingest socket, run by Claude Code as a hook or statusline.
 //!
-//! Must stay fast and silent: no async runtime, no output, never fails the caller.
+//! Must stay fast and silent: no async runtime, never fails the caller, and
+//! no output except a queued title (see [`apply_pending_title`]).
 
 use std::{
     io::{Read, Write},
@@ -8,7 +9,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     paths,
@@ -43,6 +44,10 @@ fn send(source: Source, input: &[u8]) {
     let Ok(payload) = serde_json::from_slice::<Value>(input) else {
         return;
     };
+    let applied_title = match source {
+        Source::Hook => apply_pending_title(&payload),
+        Source::Statusline => None,
+    };
     let env = Envelope {
         v: wire::VERSION,
         source,
@@ -54,6 +59,7 @@ fn send(source: Source, input: &[u8]) {
         remote_id: std::env::var("CLAUDE_CODE_BRIDGE_SESSION_ID")
             .ok()
             .filter(|id| !id.is_empty()),
+        applied_title,
         payload,
     };
     let Some(bytes) = wire::encode(env) else {
@@ -63,4 +69,25 @@ fn send(source: Source, input: &[u8]) {
         let _ = socket.set_nonblocking(true);
         let _ = socket.send_to(&bytes, paths::ingest_socket());
     }
+}
+
+/// Hands a title queued by `ccdash rename` to Claude Code: UserPromptSubmit
+/// and SessionStart hooks may answer with `hookSpecificOutput.sessionTitle`.
+fn apply_pending_title(payload: &Value) -> Option<String> {
+    let event = payload.get("hook_event_name")?.as_str()?;
+    if !matches!(event, "UserPromptSubmit" | "SessionStart") {
+        return None;
+    }
+    let path = paths::pending_title(payload.get("session_id")?.as_str()?)?;
+    let title = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let title = title.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let output = json!({
+        "hookSpecificOutput": { "hookEventName": event, "sessionTitle": title }
+    });
+    println!("{output}");
+    Some(title.to_owned())
 }

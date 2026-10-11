@@ -22,7 +22,7 @@ mod workspace;
 
 use std::{path::PathBuf, process::ExitCode};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -59,13 +59,26 @@ enum Command {
         /// Session id, background short id, or unique id prefix.
         id: String,
     },
+    /// Rename a session; Claude Code adopts the title at its next prompt.
+    Rename {
+        /// Session id, background short id, or unique id prefix.
+        id: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        title: Vec<String>,
+    },
     /// Print the web UI address including the access token.
     Url {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Host name or address the phone uses to reach this machine.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "lan")]
         host: Option<String>,
+        /// Use this machine's LAN address.
+        #[arg(long)]
+        lan: bool,
+        /// Also print a QR code to scan with the phone.
+        #[arg(long)]
+        qr: bool,
     },
 }
 
@@ -77,7 +90,13 @@ fn main() -> ExitCode {
         Command::Daemon { config } => run_daemon(config),
         Command::Status { json } => client::status(json),
         Command::Open { id } => client::open(&id),
-        Command::Url { config, host } => print_url(config, host),
+        Command::Rename { id, title } => client::rename(&id, &title.join(" ")),
+        Command::Url {
+            config,
+            host,
+            lan,
+            qr,
+        } => print_url(config, host, lan, qr),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -102,11 +121,21 @@ fn run_daemon(config: Option<PathBuf>) -> Result<()> {
     daemon::run(Config::load(config)?)
 }
 
-fn print_url(config: Option<PathBuf>, host: Option<String>) -> Result<()> {
+fn print_url(config: Option<PathBuf>, host: Option<String>, lan: bool, qr: bool) -> Result<()> {
     let cfg = Config::load(config)?;
     let token = api::http::load_token(&cfg)?;
     let port = cfg.http.listen.first().map_or(7837, |a| a.port());
-    let host = host.unwrap_or_else(|| cfg.host());
-    println!("http://{host}:{port}/#token={token}");
+    let host = match (host, lan) {
+        (Some(host), _) => host,
+        (None, true) => util::lan_address()
+            .context("no LAN address found; pass --host")?
+            .to_string(),
+        (None, false) => cfg.host(),
+    };
+    let url = util::web_url(&host, port, &token);
+    if qr {
+        println!("{}", util::qr_text(&url)?);
+    }
+    println!("{url}");
     Ok(())
 }

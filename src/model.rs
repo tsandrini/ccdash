@@ -179,6 +179,8 @@ pub struct Session {
     /// Hooks or the statusline have reported; false for sessions started
     /// before ccdash was installed, which only the agents poll sees.
     pub hooked: bool,
+    /// Renamed in ccdash; Claude Code adopts the title at the next prompt.
+    pub renaming: bool,
     pub resources: Option<Resources>,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,

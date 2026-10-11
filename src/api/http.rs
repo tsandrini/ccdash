@@ -1,5 +1,5 @@
-//! Read-only HTTP API for the web UI and the phone. Every `/api` route needs
-//! `Authorization: Bearer <token>`.
+//! HTTP API for the web UI and the phone: reads, plus renaming sessions.
+//! Every `/api` route needs `Authorization: Bearer <token>`.
 
 use std::{
     convert::Infallible,
@@ -20,7 +20,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,7 +38,7 @@ use crate::{
     model::{Activity, Snapshot},
     paths,
     store::Store,
-    util::now_ms,
+    util::{self, now_ms},
     workspace::{Scope, Workspaces},
 };
 
@@ -50,6 +50,8 @@ struct App {
     hub: Hub,
     store: Store,
     workspaces: Arc<Workspaces>,
+    token: Arc<String>,
+    port: u16,
 }
 
 pub async fn serve(
@@ -59,13 +61,16 @@ pub async fn serve(
     token: Arc<String>,
     workspaces: Workspaces,
 ) {
+    let port = listener.local_addr().map_or(7837, |a| a.port());
     let api = Router::new()
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
+        .route("/sessions/{id}/title", post(rename))
+        .route("/pair", get(pair))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/stream", get(stream))
-        .layer(middleware::from_fn_with_state(token, auth));
+        .layer(middleware::from_fn_with_state(token.clone(), auth));
     let app = Router::new()
         .route("/", get(web::index))
         .route("/{asset}", get(web::asset))
@@ -74,6 +79,8 @@ pub async fn serve(
             hub,
             store,
             workspaces: Arc::new(workspaces),
+            token,
+            port,
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -179,6 +186,36 @@ async fn session(
         "stats": stats,
         "resources": resources,
     })))
+}
+
+#[derive(Deserialize)]
+struct Rename {
+    title: String,
+}
+
+/// Renames a session; Claude Code adopts the title at its next prompt.
+async fn rename(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Rename>,
+) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .rename(&id, &body.title)
+        .await?
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// The address a phone on the LAN opens, token included, and its QR code.
+async fn pair(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    let lan = util::lan_address();
+    let host = lan.map_or_else(util::hostname, |ip| ip.to_string());
+    let url = util::web_url(&host, app.port, &app.token);
+    let svg = util::qr_svg(&url)?;
+    Ok(Json(
+        json!({ "url": url, "svg": svg, "lan": lan.is_some() }),
+    ))
 }
 
 /// Time range and workspace of a history or analytics request.

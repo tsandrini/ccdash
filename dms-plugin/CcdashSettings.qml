@@ -68,8 +68,8 @@ PluginSettings {
 
     StringSetting {
         settingKey: "webUrl"
-        label: "Web UI"
-        description: "Opened by Conversation and Web UI"
+        label: "Web UI address (optional)"
+        description: "Leave empty to use the daemon's own address. The access token is added automatically."
         placeholder: "http://127.0.0.1:7837/"
         defaultValue: ""
     }

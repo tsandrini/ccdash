@@ -18,7 +18,8 @@ PluginComponent {
 
     readonly property string socketPath: (pluginData.socketPath || "").trim() || Quickshell.env("XDG_RUNTIME_DIR") + "/ccdash/api.sock"
     readonly property string command: (pluginData.command || "").trim() || "ccdash"
-    readonly property string webUrl: (pluginData.webUrl || "").trim() || "http://127.0.0.1:7837/"
+    // NOTE: anything but an http(s) address (say, a pasted token) is ignored
+    readonly property string webUrl: Cc.isWebLink((pluginData.webUrl || "").trim()) ? pluginData.webUrl.trim().split("#")[0] : ""
     readonly property var notifyPrefs: ({
             permission: pluginData.notifyPermission ?? true,
             yourTurn: pluginData.notifyYourTurn ?? true,
@@ -149,9 +150,32 @@ PluginComponent {
         }, 0);
     }
 
+    /** Opens the web UI with the access token (from `ccdash url`) and `fragment`. */
+    function openWebWith(fragment) {
+        Proc.runCommand("ccdash.url", [command, "url", "--host", "127.0.0.1"], (out, code) => {
+            const token = code === 0 ? (/#token=(\S+)/.exec(out) || [])[1] : "";
+            const base = webUrl || (code === 0 ? out.trim().split("#")[0] : "http://127.0.0.1:7837/");
+            const parts = [token ? "token=" + token : "", fragment].filter(p => p);
+            Qt.openUrlExternally(base + (parts.length ? "#" + parts.join("&") : ""));
+        }, 0);
+    }
+
     function openWeb(id) {
-        const base = webUrl.endsWith("/") ? webUrl : webUrl + "/";
-        Qt.openUrlExternally(id ? base + "#session=" + encodeURIComponent(id) : base);
+        openWebWith(id ? "session=" + encodeURIComponent(id) : "");
+    }
+
+    function openPair() {
+        openWebWith("pair");
+    }
+
+    /** Renames a session; Claude Code adopts the title at its next prompt. */
+    function rename(id, title) {
+        Proc.runCommand("ccdash.rename." + id, [command, "rename", id, title], (out, code) => {
+            if (code === 0)
+                ToastService.showInfo("Renamed", "Claude Code adopts the name at the session's next prompt");
+            else
+                ToastService.showWarning("ccdash", "Could not rename the session");
+        }, 0);
     }
 
     function openRemote(session) {
@@ -177,6 +201,11 @@ PluginComponent {
         function open(id: string): string {
             root.open(id);
             return "opening " + id;
+        }
+
+        function rename(id: string, title: string): string {
+            root.rename(id, title);
+            return "renaming " + id;
         }
 
         function status(): string {

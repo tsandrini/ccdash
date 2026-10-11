@@ -150,6 +150,8 @@ struct Aux {
     task_forms: HashMap<String, String>,
     /// Text of assistant messages still streaming, by `message_id`.
     streams: HashMap<String, String>,
+    /// Title from `ccdash rename` that Claude Code has not adopted yet.
+    pending_title: Option<String>,
     proc_window: Option<ProcWindow>,
 }
 
@@ -299,6 +301,16 @@ impl State {
         if let Some(effort) = p.get("effort").and_then(effort_of) {
             s.effort = Some(effort);
         }
+        let mut title_changed = false;
+        if let Some(applied) = &env.applied_title {
+            aux.pending_title = None;
+            s.renaming = false;
+            if s.title.as_ref() != Some(applied) {
+                s.title = Some(applied.clone());
+                store.push(session_row(s, None));
+                title_changed = true;
+            }
+        }
         if s.activity == Activity::Gone {
             set_activity(s, Activity::Idle, ts, store);
         }
@@ -308,7 +320,6 @@ impl State {
         // Only set inside a subagent (and on Subagent* events, as the subagent's own id).
         let agent_id = str_of(p, "agent_id");
         let mut focus_candidate = false;
-        let mut title_changed = false;
         match event {
             "SessionStart" => {
                 let source = str_of(p, "source").unwrap_or("startup");
@@ -342,6 +353,7 @@ impl State {
                     ..Turn::default()
                 });
                 if let Some(title) = str_of(p, "session_title").filter(|t| !t.is_empty())
+                    && aux.pending_title.is_none()
                     && s.title.as_deref() != Some(title)
                 {
                     s.title = Some(title.to_owned());
@@ -629,6 +641,7 @@ impl State {
         self.ensure(id, str_of(p, "cwd"), ts, ts, fx);
 
         let s = self.sessions.get_mut(id).expect("ensured above");
+        let aux = self.aux.entry(id.to_owned()).or_default();
         s.hooked = true;
         if let Some(pid) = env.pid {
             s.pid = Some(pid);
@@ -636,9 +649,19 @@ impl State {
         if let Some(remote) = &env.remote_id {
             s.remote_url = Some(remote_url(remote));
         }
-        let title = str_of(p, "session_name")
+        let mut title = str_of(p, "session_name")
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
+        if let Some(pending) = &aux.pending_title {
+            // NOTE: Claude reports its old title until a hook hands it the new one
+            if title.as_ref() == Some(pending) {
+                aux.pending_title = None;
+                s.renaming = false;
+                fx.touched.insert(id.to_owned());
+            } else {
+                title = None;
+            }
+        }
         let title_changed = title.is_some() && title != s.title;
         if title_changed {
             s.title = title;
@@ -755,6 +778,31 @@ impl State {
                 fx.touched.insert(s.id.clone());
             }
         }
+    }
+
+    /// Shows `title` at once and remembers it until Claude Code adopts it
+    /// (the caller queues it for the session's next prompt). Returns the
+    /// session id.
+    pub fn rename(&mut self, key: &str, title: &str, fx: &mut Effects) -> Result<String, String> {
+        let id = match self.resolve(key) {
+            Some(s) if s.activity == Activity::Gone => return Err("the session has ended".into()),
+            Some(s) => s.id.clone(),
+            None => return Err(format!("no session matches {key:?}")),
+        };
+        self.mark_pending(&id, title, fx);
+        Ok(id)
+    }
+
+    /// Marks `title` as waiting for Claude Code to adopt it.
+    pub fn mark_pending(&mut self, id: &str, title: &str, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        s.title = Some(title.to_owned());
+        s.renaming = true;
+        fx.store.push(session_row(s, None));
+        fx.touched.insert(id.to_owned());
+        self.aux.entry(id.to_owned()).or_default().pending_title = Some(title.to_owned());
     }
 
     /// Live sessions with a known process.
@@ -944,6 +992,7 @@ impl State {
             remote_url: None,
             window: None,
             hooked: false,
+            renaming: false,
             resources: None,
             turn: None,
             tasks: Vec::new(),
@@ -1385,6 +1434,7 @@ mod tests {
             ts,
             pid: Some(std::process::id()),
             remote_id: Some("session_remote".into()),
+            applied_title: None,
             payload,
         }
     }
@@ -2079,6 +2129,52 @@ mod tests {
         assert_eq!(st.session("child").unwrap().parent.as_deref(), Some(SID));
         assert!(starts_background_session("/nix/store/x/bin/claude --bg hi"));
         assert!(!starts_background_session("claude agents --json"));
+    }
+
+    #[test]
+    fn renames_show_at_once_and_end_when_claude_adopts_them() {
+        let mut st = state();
+        statusline(&mut st, 1, "Old title");
+        let mut fx = Effects::default();
+        assert_eq!(
+            st.rename(&SID[..8], "New title", &mut fx),
+            Ok(SID.to_owned())
+        );
+        assert!(fx.touched.contains(SID));
+        let s = session(&st);
+        assert_eq!((s.title.as_deref(), s.renaming), (Some("New title"), true));
+
+        statusline(&mut st, 2, "Old title");
+        hook(
+            &mut st,
+            3,
+            "UserPromptSubmit",
+            json!({"prompt": "x", "session_title": "Old title"}),
+        );
+        assert_eq!(
+            session(&st).title.as_deref(),
+            Some("New title"),
+            "stale titles are ignored"
+        );
+
+        let mut env = envelope(
+            Source::Hook,
+            4,
+            json!({"session_id": SID, "hook_event_name": "UserPromptSubmit", "prompt": "y"}),
+        );
+        env.applied_title = Some("New title".into());
+        st.apply(&env, &mut Effects::default());
+        assert!(!session(&st).renaming);
+        statusline(&mut st, 5, "Renamed in Claude");
+        assert_eq!(session(&st).title.as_deref(), Some("Renamed in Claude"));
+
+        let mut fx = Effects::default();
+        st.rename(SID, "Again", &mut fx).unwrap();
+        statusline(&mut st, 6, "Again");
+        assert!(
+            !session(&st).renaming,
+            "the statusline confirms a lost hand-off"
+        );
     }
 
     #[test]

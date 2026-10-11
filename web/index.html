@@ -46,6 +46,15 @@
       </div>
       <button
         class="icon-btn"
+        id="pair-btn"
+        type="button"
+        aria-label="Connect a phone"
+        title="Connect a phone"
+      >
+        ▦
+      </button>
+      <button
+        class="icon-btn"
         id="theme"
         type="button"
         aria-label="Switch theme"
@@ -89,12 +98,17 @@
 
     <dialog id="range-dialog" aria-label="Time range"></dialog>
 
+    <dialog id="pair" aria-labelledby="pair-title"></dialog>
+
     <dialog id="login" aria-labelledby="login-title">
       <form class="login" method="dialog" id="login-form">
         <h2 id="login-title">Access token</h2>
         <p class="muted">
-          Run <code>ccdash url</code> on the host and open the printed address,
-          or paste the token here.
+          Run <code>ccdash url --lan --qr</code> on the host and scan the code,
+          or paste the token or the printed link here.
+        </p>
+        <p class="range-error" id="login-error" role="alert" hidden>
+          That token was not accepted.
         </p>
         <input
           id="login-token"

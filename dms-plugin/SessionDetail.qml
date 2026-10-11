@@ -15,6 +15,19 @@ Column {
     signal focusRequested
     signal webRequested
     signal remoteRequested
+    signal renameRequested(string title)
+
+    property bool editing: false
+
+    function startRename() {
+        if (!session || session.activity === "gone")
+            return;
+        editing = true;
+        titleField.text = Cc.label(session);
+        titleField.forceActiveFocus();
+    }
+
+    onSessionChanged: if (!session) editing = false
 
     readonly property var s: session || ({})
     readonly property string activity: session ? Cc.shown(session) : "idle"
@@ -46,15 +59,64 @@ Column {
             }
         }
 
+        Item {
+            width: parent.width
+            height: root.editing ? titleField.height : title.height
+            visible: !root.editing
+
+            StyledText {
+                id: title
+                width: Math.min(implicitWidth, parent.width - pencil.width - Theme.spacingS)
+                text: root.session ? Cc.label(root.session) : ""
+                font.pixelSize: Theme.fontSizeXLarge
+                font.weight: Font.DemiBold
+                color: Theme.surfaceText
+                wrapMode: Text.WordWrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+            }
+
+            DankIcon {
+                id: pencil
+                anchors.left: title.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.verticalCenter: title.verticalCenter
+                visible: root.s.activity !== "gone"
+                name: "edit"
+                size: Theme.iconSizeSmall
+                color: pencilMouse.containsMouse ? Theme.primary : Theme.surfaceVariantText
+
+                MouseArea {
+                    id: pencilMouse
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.startRename()
+                }
+            }
+        }
+
+        DankTextField {
+            id: titleField
+            width: parent.width
+            visible: root.editing
+            maximumLength: 100
+            placeholderText: "Session title"
+            onAccepted: {
+                root.editing = false;
+                root.renameRequested(text);
+            }
+            Keys.onEscapePressed: root.editing = false
+        }
+
         StyledText {
             width: parent.width
-            text: root.session ? Cc.label(root.session) : ""
-            font.pixelSize: Theme.fontSizeXLarge
-            font.weight: Font.DemiBold
-            color: Theme.surfaceText
+            visible: !!root.s.renaming
+            text: "Renamed here; Claude Code adopts the name at the session's next prompt."
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
             wrapMode: Text.WordWrap
-            maximumLineCount: 2
-            elide: Text.ElideRight
         }
 
         StyledText {

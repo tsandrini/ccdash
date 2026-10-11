@@ -19,8 +19,8 @@ niri window events ────────────────┘
 
 - Every session reports through Claude Code hooks to a small daemon on the
   same machine. The daemon keeps live state in memory and history in SQLite.
-- The **web UI** is read-only and meant for the phone. Tapping a session opens
-  it in the Claude app through Remote Control.
+- The **web UI** is meant for the phone: it reads, and renames sessions.
+  Tapping a session opens it in the Claude app through Remote Control.
 - The **DMS plugin** adds a bar indicator, a quick list, and a full dashboard
   tab. Clicking a session focuses its terminal window in niri.
 
@@ -53,9 +53,10 @@ With Home Manager (the module also wires the hooks into
 Then:
 
 ```sh
-ccdash status          # what every session is doing
-ccdash open <id>       # focus its window, or attach to a background session
-ccdash url --host <ip> # web address for the phone, token included
+ccdash status             # what every session is doing
+ccdash open <id>          # focus its window, or attach to a background session
+ccdash rename <id> <name> # rename a session (Claude adopts it at the next prompt)
+ccdash url --lan --qr     # web address for the phone as a QR code, token included
 ```
 
 The web UI lives on the HTTP port:
@@ -81,8 +82,17 @@ from–to, `‹ ›` to step by the range's length, `⊖` to double it, and
 drag across any time chart with a mouse to zoom in. With
 `workspaces.dirs` set, a workspace switch filters every view.
 
-Open the address from `ccdash url` once; the token is kept in the browser
-after that.
+To connect a phone, scan `ccdash url --lan --qr` (or open "Connect a phone"
+in the web UI on the desktop). The address carries the access token; each
+browser keeps it, so it is a one-time step per device. The token lives in
+`~/.local/state/ccdash/token` and survives reboots; delete it and restart
+ccdash to lock every device out. The DMS plugin adds it to the links it
+opens by itself.
+
+Sessions can be renamed from the web UI and the DMS plugin. ccdash shows the
+new name at once and hands it to Claude Code at the session's next prompt
+(or resume), through the `sessionTitle` output of its own hook, so the
+terminal title and Remote Control pick it up too.
 
 Claude Code reads hooks when a session starts, so sessions that were already
 running when ccdash was installed only show busy/idle until you restart
@@ -94,7 +104,8 @@ session's process tree (Claude, its MCP servers and running commands) and
 its memory as PSS, so shared pages are not counted twice. Turn it off with
 `procs.enable = false`.
 
-The HTTP API is read-only and needs the bearer token (generated in
+The HTTP API needs the bearer token for everything (it can read sessions and
+rename them) (generated in
 `~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
 port behind your firewall or VPN.
 

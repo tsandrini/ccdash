@@ -9,8 +9,8 @@ import qs.Modules.DankDash.Overview
 import "Ccdash.js" as Cc
 
 // The dash tab: sessions on the left, the selected one on the right.
-// Keys: ↑/↓ or j/k select, Enter focuses its window, w opens it in the web
-// UI, r opens it in Claude, [ and ] switch workspace.
+// Keys: ↑/↓ or j/k select, Enter focuses its window, e (or F2) renames it,
+// w opens it in the web UI, r opens it in Claude, [ and ] switch workspace.
 DashTabComponent {
     id: root
 
@@ -29,6 +29,7 @@ DashTabComponent {
     readonly property var rows: grouped(list)
     readonly property var selected: list.find(s => s.id === selectedId) || list[0] || null
     property string selectedId: ""
+    readonly property bool editingTitle: detailColumn.editing
     property real now: Date.now()
 
     implicitHeight: Math.max(DashMetrics.tabMinHeight, DashMetrics.heightForRows(Math.min(Math.max(rowBudget, 4), 7)))
@@ -83,8 +84,10 @@ DashTabComponent {
         sessionList.forceActiveFocus(Qt.OtherFocusReason);
     }
 
+    blocksTabNavigation: detailColumn.editing
+
     function handleKeyEvent(event) {
-        if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier))
+        if (detailColumn.editing || event.modifiers & (Qt.ControlModifier | Qt.AltModifier))
             return false;
         switch (event.key) {
         case Qt.Key_Down:
@@ -104,6 +107,10 @@ DashTabComponent {
         case Qt.Key_Return:
         case Qt.Key_Enter:
             activate(selected);
+            return true;
+        case Qt.Key_E:
+        case Qt.Key_F2:
+            detailColumn.startRename();
             return true;
         case Qt.Key_W:
             root.daemon?.openWeb(selected ? selected.id : "");
@@ -129,10 +136,9 @@ DashTabComponent {
         Row {
             width: parent.width
             spacing: Theme.spacingS
-            visible: (root.st.workspaces || []).length > 0
 
             Repeater {
-                model: [""].concat(root.st.workspaces || [])
+                model: (root.st.workspaces || []).length ? [""].concat(root.st.workspaces) : []
 
                 StyledRect {
                     required property string modelData
@@ -159,6 +165,15 @@ DashTabComponent {
                         onClicked: root.setWorkspace(parent.modelData)
                     }
                 }
+            }
+
+            DankButton {
+                text: "Connect phone"
+                iconName: "qr_code_2"
+                buttonHeight: Theme.buttonHeightXS ?? 28
+                backgroundColor: Theme.secondaryContainer
+                textColor: Theme.onSecondaryContainer
+                onClicked: root.daemon?.openPair()
             }
         }
     }
@@ -243,6 +258,10 @@ DashTabComponent {
                     now: root.now
                     onFocusRequested: root.activate(root.selected)
                     onWebRequested: root.daemon?.openWeb(root.selected.id)
+                    onRenameRequested: title => {
+                        root.daemon?.rename(root.selected.id, title);
+                        root.restoreFocus();
+                    }
                     onRemoteRequested: root.daemon?.openRemote(root.selected)
                 }
             }

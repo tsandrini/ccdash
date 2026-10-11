@@ -677,6 +677,93 @@ dialog::backdrop {
   font-size: 19px;
 }
 
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-right: 32px;
+}
+
+.title-row h2 {
+  min-width: 0;
+  padding-right: 0;
+}
+
+.rename-btn {
+  flex: none;
+  font-size: 16px;
+  opacity: 0.6;
+}
+
+.rename-btn:hover,
+.rename-btn:focus-visible {
+  opacity: 1;
+}
+
+.rename-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-right: 32px;
+}
+
+.rename-input {
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--axis);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font: 600 17px var(--font);
+}
+
+.rename-note {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.pair {
+  position: relative;
+  padding: 20px;
+}
+
+.pair h2 {
+  margin: 0 0 8px;
+  font-size: 19px;
+}
+
+.pair-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.pair-body p {
+  margin: 0;
+}
+
+.pair-qr {
+  width: min(260px, 70vw);
+  height: auto;
+  padding: 10px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.pair-url {
+  max-width: 100%;
+  font: 12px var(--mono);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+#pair {
+  width: min(460px, 100vw - 32px);
+}
+
 .detail-close {
   position: absolute;
   top: 10px;
@@ -1800,6 +1887,10 @@ dialog::backdrop {
   }
 
   .scope-label {
+    display: none;
+  }
+
+  #pair-btn {
     display: none;
   }
 

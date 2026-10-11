@@ -18,6 +18,17 @@ pub fn api_socket() -> PathBuf {
     runtime_dir().join("api.sock")
 }
 
+/// Where `ccdash rename` queues a title until the session's next prompt.
+/// `None` for ids that are not plain session ids.
+pub fn pending_title(session: &str) -> Option<PathBuf> {
+    let plain = !session.is_empty()
+        && session.len() <= 64
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    plain.then(|| runtime_dir().join("titles").join(session))
+}
+
 pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("ccdash")
 }

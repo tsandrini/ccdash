@@ -37,6 +37,9 @@ const state = {
   workspace: localStorage.getItem(WORKSPACE_KEY),
   /** Session to open from `#session=…` once the snapshot has it. */
   pendingSession: null,
+  pendingPair: false,
+  /** Session whose title is being edited in the sheet. */
+  editingTitle: null,
   /** Activity groups already opened automatically while a turn runs. */
   autoOpened: new Set(),
 };
@@ -78,6 +81,12 @@ function append(el, children) {
 }
 
 const $ = (sel) => document.querySelector(sel);
+
+/** `el.replaceChildren`, skipping null/false like `h` does. */
+function fill(el, ...children) {
+  el.replaceChildren();
+  append(el, children);
+}
 
 const joined = (items) =>
   items
@@ -215,11 +224,19 @@ const token = () => localStorage.getItem(TOKEN_KEY) || "";
 function takeHash() {
   const token = location.hash.match(/token=([^&]+)/);
   const session = location.hash.match(/session=([^&]+)/);
-  if (!token && !session) return;
+  if (!token && !session && !/(^#|&)pair(&|$)/.test(location.hash)) return;
   if (token) localStorage.setItem(TOKEN_KEY, decodeURIComponent(token[1]));
   if (session) state.pendingSession = decodeURIComponent(session[1]);
+  if (/(^#|&)pair(&|$)/.test(location.hash)) state.pendingPair = true;
   history.replaceState(null, "", location.pathname + location.search);
   openPendingSession();
+  openPendingPair();
+}
+
+function openPendingPair() {
+  if (!state.pendingPair || !token()) return;
+  state.pendingPair = false;
+  openPair();
 }
 
 function openPendingSession() {
@@ -232,19 +249,42 @@ function openPendingSession() {
 async function api(path, init = {}) {
   const res = await fetch(`api/v1/${path}`, {
     ...init,
-    headers: { Authorization: `Bearer ${token()}` },
+    headers: { ...init.headers, Authorization: `Bearer ${token()}` },
   });
   if (res.status === 401) throw new Unauthorized();
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const text = await res.text();
+    let message = text;
+    try {
+      message = JSON.parse(text).error || text;
+    } catch {}
+    throw new Error(message);
+  }
   return res;
 }
+
+const postJson = async (path, body) =>
+  (
+    await api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  ).json();
 
 const getJson = async (path) => (await api(path)).json();
 
 function askToken() {
   setConn("offline", "token needed");
+  $("#login-error").hidden = !token();
   const dialog = $("#login");
   if (!dialog.open) dialog.showModal();
+}
+
+/** A bare token, or the token from a pasted `ccdash url` link. */
+function tokenFrom(text) {
+  const match = text.match(/token=([^&\s#]+)/);
+  return (match ? decodeURIComponent(match[1]) : text).trim();
 }
 
 // --- live stream ------------------------------------------------------------
@@ -340,6 +380,7 @@ function applySnapshot(snapshot) {
   loadRecent();
   if (state.detailId) scheduleDetailRefresh();
   openPendingSession();
+  openPendingPair();
 }
 
 function applyUpdate(update) {
@@ -426,7 +467,8 @@ function renderSessions() {
   $("#hero-sub").className = "hero-sub muted";
 
   const busyAgents = agents.filter((s) => s.activity === "working").length;
-  $("#tiles").replaceChildren(
+  fill(
+    $("#tiles"),
     countTile("Working", working.length),
     countTile("Idle", idle.length),
     countTile(
@@ -470,7 +512,7 @@ function renderSessions() {
     );
   }
   if (gone.length) groups.push(group("Ended", gone, true));
-  $("#groups").replaceChildren(...groups);
+  fill($("#groups"), ...groups);
 }
 
 const legendChip = (activity) =>
@@ -806,7 +848,8 @@ function openDetail(id) {
   };
   state.autoOpened = new Set();
   const dialog = $("#detail");
-  dialog.replaceChildren(
+  fill(
+    dialog,
     h("div", { class: "detail-head" }),
     h("div", { class: "detail-body" }),
   );
@@ -828,6 +871,8 @@ function renderDetailHead() {
   const s = state.sessions.get(state.detailId);
   const head = $("#detail .detail-head");
   if (!s || !head) return;
+  // NOTE: re-rendering would reset the title input
+  if (state.editingTitle === s.id && head.querySelector(".rename-form")) return;
   const actions = [];
   if (s.remote_url) {
     actions.push(
@@ -840,7 +885,8 @@ function renderDetailHead() {
       }),
     );
   }
-  head.replaceChildren(
+  fill(
+    head,
     h("button", {
       class: "icon-btn detail-close",
       type: "button",
@@ -854,7 +900,13 @@ function renderDetailHead() {
       badge(shown(s)),
       clock(s.activity_since),
     ),
-    h("h2", { id: "detail-title", text: label(s) }),
+    titleBlock(s),
+    s.renaming
+      ? h("div", {
+          class: "rename-note",
+          text: "Renamed here; Claude Code adopts the name at the session's next prompt.",
+        })
+      : null,
     h("div", { class: "session-where", title: s.cwd, text: s.cwd }),
     isAgent(s) ? parentLink(s) : null,
     h(
@@ -878,6 +930,151 @@ function renderDetailHead() {
       ),
       actions,
     ),
+  );
+}
+
+function titleBlock(s) {
+  if (state.editingTitle === s.id) return renameForm(s);
+  return h(
+    "div",
+    { class: "title-row" },
+    h("h2", { id: "detail-title", text: label(s) }),
+    s.activity === "gone"
+      ? null
+      : h("button", {
+          class: "icon-btn rename-btn",
+          type: "button",
+          "aria-label": "Rename session",
+          title: "Rename",
+          text: "✎",
+          onclick: () => {
+            state.editingTitle = s.id;
+            renderDetailHead();
+          },
+        }),
+  );
+}
+
+function renameForm(s) {
+  const stop = () => {
+    state.editingTitle = null;
+    renderDetailHead();
+  };
+  const input = h("input", {
+    class: "rename-input",
+    value: label(s),
+    maxlength: 100,
+    "aria-label": "Session title",
+    onkeydown: (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      stop();
+    },
+  });
+  const error = h("p", { class: "range-error", role: "alert", hidden: true });
+  const form = h(
+    "form",
+    {
+      class: "rename-form",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        try {
+          const { session } = await postJson(
+            `sessions/${encodeURIComponent(s.id)}/title`,
+            { title: input.value },
+          );
+          state.sessions.set(session.id, session);
+          stop();
+          scheduleRender();
+        } catch (e) {
+          if (e instanceof Unauthorized) return askToken();
+          error.textContent = e.message;
+          error.hidden = false;
+        }
+      },
+    },
+    input,
+    h("button", { class: "btn", type: "submit", text: "Save" }),
+    h("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Cancel",
+      onclick: stop,
+    }),
+    error,
+  );
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  });
+  return form;
+}
+
+/** QR code and link that bring a phone in, token included. */
+async function openPair() {
+  const dialog = $("#pair");
+  const body = h(
+    "div",
+    { class: "pair-body" },
+    h("p", { class: "muted", text: "Loading…" }),
+  );
+  fill(
+    dialog,
+    h(
+      "div",
+      { class: "pair" },
+      h("button", {
+        class: "icon-btn detail-close",
+        type: "button",
+        "aria-label": "Close",
+        text: "✕",
+        onclick: () => dialog.close(),
+      }),
+      h("h2", { id: "pair-title", text: "Connect a phone" }),
+      body,
+    ),
+  );
+  if (!dialog.open) dialog.showModal();
+  let pair;
+  try {
+    pair = await getJson("pair");
+  } catch (e) {
+    if (e instanceof Unauthorized) return askToken();
+    fill(body, h("p", { text: e.message }));
+    return;
+  }
+  const copy = h("button", {
+    class: "btn btn-quiet",
+    type: "button",
+    text: "Copy link",
+    onclick: async () => {
+      await navigator.clipboard?.writeText(pair.url);
+      copy.textContent = "Copied";
+    },
+  });
+  fill(
+    body,
+    h("p", {
+      text: "Scan this with the phone's camera while it is on the same network or VPN. The link carries the access token and the phone keeps it, so this is a one-time step per device.",
+    }),
+    h("img", {
+      class: "pair-qr",
+      alt: "QR code of the link below",
+      src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(pair.svg)}`,
+    }),
+    h("code", { class: "pair-url", text: pair.url }),
+    copy,
+    pair.lan
+      ? null
+      : h("p", {
+          class: "muted",
+          text: "No LAN address was found, so the link uses the host name.",
+        }),
+    h("p", {
+      class: "muted",
+      text: "The token survives reboots. To lock every device out, delete ~/.local/state/ccdash/token and restart ccdash.",
+    }),
   );
 }
 
@@ -941,9 +1138,9 @@ function renderDetailBody() {
     ),
   );
   if (state.detailTab === "details") {
-    body.replaceChildren(...detailsTab(s, state.convo?.stats));
+    fill(body, ...detailsTab(s, state.convo?.stats));
   } else {
-    body.replaceChildren(...conversationTab(s));
+    fill(body, ...conversationTab(s));
     clampReplies(body);
     openRunningSteps(body, s);
   }
@@ -1396,7 +1593,7 @@ function renderLive() {
   const s = state.sessions.get(state.detailId);
   if (!live || !s) return;
   const open = live.querySelector("details[open]") !== null;
-  live.replaceChildren(...[liveBlock(s)].filter(Boolean));
+  fill(live, ...[liveBlock(s)].filter(Boolean));
   const details = live.querySelector("details");
   if (details && open) details.open = true;
 }
@@ -1908,7 +2105,8 @@ function openRangeForm(anchor, value, quick, onapply) {
     ),
   );
   dialog.className = touch ? "range-sheet" : "range-popover";
-  dialog.replaceChildren(
+  fill(
+    dialog,
     h(
       "div",
       { class: "range-form" },
@@ -1997,7 +2195,8 @@ function renderScopebar() {
   if (!names.length) return;
   if (state.workspace && !names.includes(state.workspace))
     state.workspace = null;
-  bar.replaceChildren(
+  fill(
+    bar,
     h("span", { class: "scope-label", text: "Workspace" }),
     ...[null, ...names].map((name) =>
       h("button", {
@@ -2069,7 +2268,8 @@ function setHistoryRange(range) {
 }
 
 function renderHistoryToolbar() {
-  $("#history-toolbar").replaceChildren(
+  fill(
+    $("#history-toolbar"),
     rangePicker(state.range, HISTORY_QUICK, setHistoryRange),
   );
 }
@@ -2119,7 +2319,8 @@ function renderHistory() {
       "from statusline totals",
     ),
   );
-  $("#history").replaceChildren(
+  fill(
+    $("#history"),
     tiles,
     timelineChart(data),
     projectsChart(data),
@@ -2182,7 +2383,8 @@ function tooltipFor(figure) {
   figure.append(tip);
   return {
     show(event, value, ...lines) {
-      tip.replaceChildren(
+      fill(
+        tip,
         h("strong", { text: value }),
         ...lines
           .filter(Boolean)
@@ -3039,7 +3241,8 @@ function setAnalyticsRange(range) {
 }
 
 function renderAnalyticsToolbar() {
-  $("#analytics-toolbar").replaceChildren(
+  fill(
+    $("#analytics-toolbar"),
     rangePicker(state.aRange, ANALYTICS_QUICK, setAnalyticsRange),
   );
 }
@@ -3109,7 +3312,8 @@ function renderAnalytics() {
       "all sessions at once",
     ),
   );
-  $("#analytics").replaceChildren(
+  fill(
+    $("#analytics"),
     tiles,
     dailyActivityChart(data, width),
     heatmapChart(data.heatmap, width),
@@ -3445,9 +3649,11 @@ function start() {
     if (event.target === event.currentTarget) event.currentTarget.close();
   });
   $("#login-form").addEventListener("submit", () => {
-    localStorage.setItem(TOKEN_KEY, $("#login-token").value.trim());
+    localStorage.setItem(TOKEN_KEY, tokenFrom($("#login-token").value));
     runStream();
+    openPendingPair();
   });
+  $("#pair-btn").addEventListener("click", openPair);
 
   let resizeTimer = null;
   new ResizeObserver(() => {
