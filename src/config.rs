@@ -14,6 +14,7 @@ pub struct Config {
     pub agents: Agents,
     pub niri: Niri,
     pub procs: Procs,
+    pub workspaces: Workspaces,
     pub attach: Attach,
     pub store: Store,
 }
@@ -39,6 +40,14 @@ pub struct Niri {
     pub enable: bool,
     /// Window `app_id`s that count as terminals hosting Claude Code.
     pub terminals: Vec<String>,
+}
+
+/// Top-level directories the UI can filter by, named by their last
+/// component; `~/` is the user's home.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Workspaces {
+    pub dirs: Vec<String>,
 }
 
 /// CPU and memory of each session's process tree, from `/proc`.

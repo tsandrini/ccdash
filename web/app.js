@@ -1,6 +1,9 @@
 const TOKEN_KEY = "ccdash.token";
 const THEME_KEY = "ccdash.theme";
 const VIEW_KEY = "ccdash.view";
+const WORKSPACE_KEY = "ccdash.workspace";
+const HISTORY_RANGE_KEY = "ccdash.range.history";
+const ANALYTICS_RANGE_KEY = "ccdash.range.analytics";
 const STALE_STREAM_MS = 45_000;
 const STRIP_MS = 60 * 60_000;
 const PAGE = 10;
@@ -26,10 +29,12 @@ const state = {
   detailTab: "conversation",
   /** Loaded conversation of the open session. */
   convo: null,
-  range: "today",
+  range: { kind: "days", days: 1 },
   history: null,
-  aRange: "7d",
+  aRange: { kind: "days", days: 7 },
   analytics: null,
+  workspaces: [],
+  workspace: localStorage.getItem(WORKSPACE_KEY),
   /** Activity groups already opened automatically while a turn runs. */
   autoOpened: new Set(),
 };
@@ -315,6 +320,9 @@ function applySnapshot(snapshot) {
   state.skew = snapshot.now - Date.now();
   state.sessions = new Map(snapshot.sessions.map((s) => [s.id, s]));
   state.rateLimits = snapshot.rate_limits;
+  const known = state.workspaces.join();
+  state.workspaces = snapshot.workspaces || [];
+  if (state.workspaces.join() !== known) renderScopebar();
   scheduleRender();
   loadRecent();
   if (state.detailId) scheduleDetailRefresh();
@@ -379,7 +387,7 @@ function byAttention(a, b) {
 function renderSessions() {
   $("#host").textContent = state.host;
   const all = [...state.sessions.values()]
-    .filter((s) => !stub(s))
+    .filter((s) => !stub(s) && inWorkspace(s))
     .sort(byAttention);
   const mine = all.filter((s) => !isAgent(s));
   const agents = all.filter(isAgent);
@@ -1645,15 +1653,411 @@ function facts(s) {
   ]);
 }
 
+// --- time ranges ------------------------------------------------------------
+// After BITE's date-time range picker: a range is the last N minutes, the
+// last N calendar days (from local midnight), or a fixed from–to; ‹ › move it
+// by its own length, ⊖ doubles it, the form takes quick ranges or exact times.
+
+const MINUTE = 60_000;
+/** Retention is 30 days; the API serves 31. */
+const MAX_RANGE_MINUTES = 31 * 1440;
+
+function resolveRange(range, t = now()) {
+  if (range.kind === "relative")
+    return { from: t - range.minutes * MINUTE, to: t };
+  if (range.kind === "days") {
+    const start = new Date(t);
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - range.days + 1);
+    return { from: start.getTime(), to: t };
+  }
+  return { from: range.from, to: range.to };
+}
+
+/** New data can still arrive in the range. */
+const reachesNow = (range, t = now()) =>
+  range.kind !== "absolute" || range.to >= t - MINUTE;
+
+/** Moves a range by its own length; forward never passes now (null then). */
+function shiftRange(range, direction, t = now()) {
+  const { from, to } = resolveRange(range, t);
+  const span = to - from;
+  if (direction === 1) {
+    if (to >= t - MINUTE) return null;
+    const end = Math.min(t, to + span);
+    return { kind: "absolute", from: end - span, to: end };
+  }
+  return { kind: "absolute", from: from - span, to: to - span };
+}
+
+/** Twice the span around the same middle, never past now or retention. */
+function zoomOut(range, t = now()) {
+  const { from, to } = resolveRange(range, t);
+  const span = Math.min((to - from) * 2, MAX_RANGE_MINUTES * MINUTE);
+  const end = Math.min(t, (from + to) / 2 + span / 2);
+  return { kind: "absolute", from: end - span, to: end };
+}
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** A moment as `<input type="datetime-local">` text, local time. */
+function toInputValue(time) {
+  const d = new Date(time);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** The moment a `datetime-local` value names; null when it names none. */
+function fromInputValue(text) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})$/.exec(text.trim());
+  if (!m) return null;
+  const [year, month, day, hour, minute] = m.slice(1).map(Number);
+  const time = new Date(year, month - 1, day, hour, minute).getTime();
+  // NOTE: Date rolls 31 February over instead of refusing it
+  return toInputValue(time).startsWith(`${m[1]}-${m[2]}-${m[3]}`) ? time : null;
+}
+
+function rangeProblem(from, to, t = now()) {
+  if (from === null || to === null) return "incomplete";
+  if (from >= to) return "backwards";
+  if (from > t) return "future";
+  if (from < t - MAX_RANGE_MINUTES * MINUTE) return "too_old";
+  return null;
+}
+
+const PROBLEM_TEXT = {
+  incomplete: "Fill in both times.",
+  backwards: "The start has to be before the end.",
+  future: "The range starts in the future.",
+  too_old: "ccdash keeps 30 days of history.",
+};
+
+function spanText(from, to) {
+  const start = toInputValue(from).replace("T", " ");
+  const end = toInputValue(to).replace("T", " ");
+  return start.slice(0, 10) === end.slice(0, 10)
+    ? `${start} – ${end.slice(11)}`
+    : `${start} – ${end}`;
+}
+
+function quickLabel(range) {
+  if (range.kind === "days")
+    return range.days === 1 ? "Today" : `Last ${range.days} days`;
+  const m = range.minutes;
+  if (m % 1440 === 0)
+    return m === 1440 ? "Last 24 hours" : `Last ${m / 1440} days`;
+  if (m % 60 === 0) return m === 60 ? "Last hour" : `Last ${m / 60} hours`;
+  return `Last ${m} minutes`;
+}
+
+const rangeLabel = (range) =>
+  range.kind === "absolute"
+    ? spanText(range.from, range.to)
+    : quickLabel(range);
+
+const sameRange = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** `since=…[&until=…]`; ranges that reach now leave `until` to the server. */
+function rangeParams(range) {
+  const { from, to } = resolveRange(range);
+  const params = `since=${Math.round(from)}`;
+  return reachesNow(range) ? params : `${params}&until=${Math.round(to)}`;
+}
+
+/** `‹ [label] › ⊖` on one line; the label opens the form. */
+function rangePicker(value, quick, onchange) {
+  const forward = shiftRange(value, 1);
+  const shift = (direction) => {
+    const next = shiftRange(value, direction);
+    if (next) onchange(next);
+  };
+  const trigger = h(
+    "button",
+    {
+      class: "range-trigger",
+      type: "button",
+      "aria-haspopup": "dialog",
+      title: "Choose time range",
+      onclick: () => openRangeForm(trigger, value, quick, onchange),
+    },
+    h("span", { class: "range-icon", "aria-hidden": "true", text: "◷" }),
+    h("span", { text: rangeLabel(value) }),
+  );
+  return h(
+    "div",
+    { class: "range-picker" },
+    h("button", {
+      class: "range-step",
+      type: "button",
+      "aria-label": "Previous period",
+      title: "Previous period",
+      text: "‹",
+      onclick: () => shift(-1),
+    }),
+    trigger,
+    h("button", {
+      class: "range-step",
+      type: "button",
+      "aria-label": "Next period",
+      title: "Next period",
+      text: "›",
+      disabled: forward === null,
+      onclick: () => shift(1),
+    }),
+    h("button", {
+      class: "range-step",
+      type: "button",
+      "aria-label": "Zoom out",
+      title: "Zoom out (twice as long)",
+      text: "⊖",
+      onclick: () => onchange(zoomOut(value)),
+    }),
+  );
+}
+
+const touchLayout = () => matchMedia("(max-width: 640px)").matches;
+
+/** The form in a popover under `anchor`, or a bottom sheet on a phone. */
+function openRangeForm(anchor, value, quick, onapply) {
+  const dialog = $("#range-dialog");
+  const touch = touchLayout();
+  const span = resolveRange(value);
+  const close = () => dialog.close();
+  const apply = (range) => {
+    close();
+    onapply(range);
+  };
+  const error = h("p", { class: "range-error", role: "alert", hidden: true });
+  const field = (id, text, initial) => {
+    const input = h("input", {
+      id,
+      type: "datetime-local",
+      value: toInputValue(initial),
+      oninput: () => (error.hidden = true),
+    });
+    return [h("label", { for: id, text }), input];
+  };
+  const [fromLabel, fromInput] = field("range-from", "From", span.from);
+  const [toLabel, toInput] = field("range-to", "To", span.to);
+  const submit = (event) => {
+    event.preventDefault();
+    const from = fromInputValue(fromInput.value);
+    const to = fromInputValue(toInput.value);
+    const problem = rangeProblem(from, to);
+    if (problem) {
+      error.textContent = PROBLEM_TEXT[problem];
+      error.hidden = false;
+      return;
+    }
+    apply({ kind: "absolute", from, to });
+  };
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const absolute = h(
+    "form",
+    { class: "range-absolute", onsubmit: submit },
+    h("h3", { text: "Absolute range" }),
+    fromLabel,
+    fromInput,
+    toLabel,
+    toInput,
+    h("p", { class: "range-zone", text: `Local time (${zone})` }),
+    error,
+    h(
+      "div",
+      { class: "range-actions" },
+      h("button", {
+        class: "btn btn-quiet",
+        type: "button",
+        text: "Until now",
+        onclick: () => {
+          toInput.value = toInputValue(Math.ceil(now() / MINUTE) * MINUTE);
+          error.hidden = true;
+        },
+      }),
+      h("button", { class: "btn", type: "submit", text: "Apply" }),
+    ),
+  );
+  const presets = h(
+    "div",
+    { class: "range-quick" },
+    h("h3", { text: "Quick ranges" }),
+    h(
+      "div",
+      { class: "range-quick-list" },
+      quick.map((range) =>
+        h("button", {
+          type: "button",
+          "aria-pressed": String(sameRange(range, value)),
+          text: quickLabel(range),
+          onclick: () => apply(range),
+        }),
+      ),
+    ),
+  );
+  dialog.className = touch ? "range-sheet" : "range-popover";
+  dialog.replaceChildren(
+    h(
+      "div",
+      { class: "range-form" },
+      touch ? [presets, absolute] : [absolute, presets],
+    ),
+  );
+  dialog.onclick = (event) => event.target === dialog && close();
+  dialog.showModal();
+  if (!touch) {
+    const box = anchor.getBoundingClientRect();
+    const width = dialog.offsetWidth;
+    dialog.style.top = `${box.bottom + 8}px`;
+    dialog.style.left = `${Math.max(8, Math.min(box.left, innerWidth - width - 8))}px`;
+  } else {
+    dialog.style.top = "";
+    dialog.style.left = "";
+  }
+}
+
+/**
+ * Grafana's brush: press, drag and release over `svg` between `x0` and `x1`
+ * (viewBox units) to pick the span under the pointer. Mouse and pen only, so
+ * a finger still scrolls the page; Esc cancels.
+ */
+function attachBrush(svg, { x0, x1, from, to, snap = (t) => t, onselect }) {
+  const box = s("rect", {
+    class: "brush",
+    y: 0,
+    height: "100%",
+    visibility: "hidden",
+  });
+  svg.append(box);
+  let start = null;
+  const local = (event) => {
+    const rect = svg.getBoundingClientRect();
+    const scale = svg.viewBox.baseVal.width / rect.width;
+    return Math.min(x1, Math.max(x0, (event.clientX - rect.left) * scale));
+  };
+  const timeAt = (x) => snap(from + ((x - x0) / (x1 - x0)) * (to - from));
+  const draw = (x) => {
+    box.setAttribute("x", Math.min(start, x));
+    box.setAttribute("width", Math.max(1, Math.abs(x - start)));
+    box.setAttribute(
+      "visibility",
+      Math.abs(x - start) >= 4 ? "visible" : "hidden",
+    );
+  };
+  const cancel = () => {
+    start = null;
+    box.setAttribute("visibility", "hidden");
+    removeEventListener("keydown", onKey);
+  };
+  const onKey = (event) => event.key === "Escape" && cancel();
+  svg.classList.add("brushable");
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    start = local(event);
+    svg.setPointerCapture(event.pointerId);
+    addEventListener("keydown", onKey);
+  });
+  svg.addEventListener(
+    "pointermove",
+    (event) => start !== null && draw(local(event)),
+  );
+  svg.addEventListener("pointerup", (event) => {
+    if (start === null) return;
+    const x = local(event);
+    const moved = Math.abs(x - start) >= 4;
+    const [a, b] = [timeAt(Math.min(start, x)), timeAt(Math.max(start, x))];
+    cancel();
+    if (moved && b > a) onselect(a, b);
+  });
+  svg.addEventListener("pointercancel", cancel);
+}
+
+// --- workspaces ---------------------------------------------------------------
+
+const inWorkspace = (s) => !state.workspace || s.workspace === state.workspace;
+const workspaceParam = () =>
+  state.workspace ? `&workspace=${encodeURIComponent(state.workspace)}` : "";
+
+function renderScopebar() {
+  const bar = $("#scopebar");
+  const names = state.workspaces;
+  bar.hidden = !names.length;
+  if (!names.length) return;
+  if (state.workspace && !names.includes(state.workspace))
+    state.workspace = null;
+  bar.replaceChildren(
+    h("span", { class: "scope-label", text: "Workspace" }),
+    ...[null, ...names].map((name) =>
+      h("button", {
+        type: "button",
+        role: "radio",
+        "aria-checked": String(state.workspace === name),
+        text: name ?? "All",
+        onclick: () => setWorkspace(name),
+      }),
+    ),
+  );
+}
+
+function setWorkspace(name) {
+  state.workspace = name;
+  if (name) localStorage.setItem(WORKSPACE_KEY, name);
+  else localStorage.removeItem(WORKSPACE_KEY);
+  renderScopebar();
+  scheduleRender();
+  if (!$("#view-history").hidden) loadHistory();
+  if (!$("#view-analytics").hidden) loadAnalytics();
+}
+
 // --- history view -----------------------------------------------------------
 
-function rangeSince(range) {
-  const t = now();
-  if (range === "24h") return t - 86_400_000;
-  if (range === "7d") return t - 7 * 86_400_000;
-  const midnight = new Date(t);
-  midnight.setHours(0, 0, 0, 0);
-  return midnight.getTime();
+const HISTORY_QUICK = [
+  { kind: "relative", minutes: 60 },
+  { kind: "relative", minutes: 180 },
+  { kind: "relative", minutes: 360 },
+  { kind: "relative", minutes: 720 },
+  { kind: "relative", minutes: 1440 },
+  { kind: "days", days: 1 },
+  { kind: "relative", minutes: 2880 },
+  { kind: "days", days: 7 },
+];
+
+const ANALYTICS_QUICK = [
+  { kind: "days", days: 1 },
+  { kind: "relative", minutes: 1440 },
+  { kind: "days", days: 7 },
+  { kind: "days", days: 14 },
+  { kind: "days", days: 30 },
+];
+
+function loadRange(key, fallback) {
+  try {
+    const range = JSON.parse(localStorage.getItem(key));
+    return range && range.kind !== "absolute" ? range : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Relative ranges are remembered; a fixed one belongs to the visit. */
+function saveRange(key, range) {
+  if (range.kind === "absolute") return;
+  localStorage.setItem(key, JSON.stringify(range));
+}
+
+const snapMinute = (t) => Math.round(t / MINUTE) * MINUTE;
+const brushHistory = (from, to) =>
+  setHistoryRange({ kind: "absolute", from, to });
+
+function setHistoryRange(range) {
+  state.range = range;
+  saveRange(HISTORY_RANGE_KEY, range);
+  renderHistoryToolbar();
+  loadHistory();
+}
+
+function renderHistoryToolbar() {
+  $("#history-toolbar").replaceChildren(
+    rangePicker(state.range, HISTORY_QUICK, setHistoryRange),
+  );
 }
 
 async function loadHistory() {
@@ -1661,7 +2065,7 @@ async function loadHistory() {
   container.classList.add("loading");
   try {
     state.history = await getJson(
-      `history?since=${Math.round(rangeSince(state.range))}`,
+      `history?${rangeParams(state.range)}${workspaceParam()}`,
     );
     renderHistory();
   } catch (e) {
@@ -1994,7 +2398,7 @@ function usageChart(data) {
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const x = (t) =>
-    pad.left + ((t - data.since) / (data.now - data.since)) * plotW;
+    pad.left + ((t - data.since) / (data.until - data.since)) * plotW;
   const y = (v) => pad.top + plotH - (Math.min(100, v) / 100) * plotH;
 
   const svg = s("svg", {
@@ -2020,7 +2424,7 @@ function usageChart(data) {
       }),
     );
   }
-  const { ticks, daily } = timeTicks(data.since, data.now, plotW);
+  const { ticks, daily } = timeTicks(data.since, data.until, plotW);
   for (const t of ticks) {
     svg.append(
       s("text", {
@@ -2093,6 +2497,14 @@ function usageChart(data) {
     fill: "transparent",
   });
   svg.append(crosshair, hit);
+  attachBrush(svg, {
+    x0: pad.left,
+    x1: pad.left + plotW,
+    from: data.since,
+    to: data.until,
+    snap: snapMinute,
+    onselect: brushHistory,
+  });
   figure.append(svg);
   const tip = tooltipFor(figure);
   hit.addEventListener("pointermove", (event) => {
@@ -2100,7 +2512,7 @@ function usageChart(data) {
     const t =
       data.since +
       (((event.clientX - box.left) * (width / box.width) - pad.left) / plotW) *
-        (data.now - data.since);
+        (data.until - data.since);
     const p = points.reduce((best, q) =>
       Math.abs(q.ts - t) < Math.abs(best.ts - t) ? q : best,
     );
@@ -2151,7 +2563,8 @@ function timelineChart(data) {
   const plotW = width - pad.left - pad.right;
   const x = (t) =>
     pad.left +
-    ((Math.max(t, data.since) - data.since) / (data.now - data.since)) * plotW;
+    ((Math.max(t, data.since) - data.since) / (data.until - data.since)) *
+      plotW;
 
   const svg = s("svg", {
     viewBox: `0 0 ${width} ${height}`,
@@ -2159,7 +2572,7 @@ function timelineChart(data) {
     role: "img",
     "aria-label": "Session activity timeline",
   });
-  const { ticks, daily } = timeTicks(data.since, data.now, plotW);
+  const { ticks, daily } = timeTicks(data.since, data.until, plotW);
   for (const t of ticks) {
     svg.append(
       s("line", {
@@ -2222,6 +2635,14 @@ function timelineChart(data) {
       svg.append(seg);
     }
   });
+  attachBrush(svg, {
+    x0: pad.left,
+    x1: pad.left + plotW,
+    from: data.since,
+    to: data.until,
+    snap: snapMinute,
+    onselect: brushHistory,
+  });
   figure.append(
     svg,
     tableView(
@@ -2260,7 +2681,17 @@ function niceTicks(lo, hi, count = 4) {
  * One series over time: line + soft area, crosshair tooltip, end label.
  * `points` are `[ts, value]`; long gaps break the line.
  */
-function lineChart({ title, sub, points, since, until, width, fmt, floorMax }) {
+function lineChart({
+  title,
+  sub,
+  points,
+  since,
+  until,
+  width,
+  fmt,
+  floorMax,
+  onbrush,
+}) {
   const figure = chartFigure(title, sub);
   if (points.length < 2) {
     figure.append(h("p", { class: "muted", text: "Not enough data yet." }));
@@ -2361,6 +2792,16 @@ function lineChart({ title, sub, points, since, until, width, fmt, floorMax }) {
     fill: "transparent",
   });
   svg.append(crosshair, hit);
+  if (onbrush) {
+    attachBrush(svg, {
+      x0: pad.left,
+      x1: pad.left + plotW,
+      from: since,
+      to: until,
+      snap: snapMinute,
+      onselect: onbrush,
+    });
+  }
   figure.append(svg);
   const tip = tooltipFor(figure);
   hit.addEventListener("pointermove", (event) => {
@@ -2394,7 +2835,11 @@ function lineChart({ title, sub, points, since, until, width, fmt, floorMax }) {
  * Vertical bars, one per column, stacked from `parts` (`[value, activity]`;
  * activity null = neutral fill). Negative values hang below the baseline.
  */
-function columnChart(figure, cols, { width, fmtY, tip, height = 190 }) {
+function columnChart(
+  figure,
+  cols,
+  { width, fmtY, tip, height = 190, brush = null },
+) {
   const pad = { top: 10, right: 6, bottom: 24, left: 46 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
@@ -2474,6 +2919,7 @@ function columnChart(figure, cols, { width, fmtY, tip, height = 190 }) {
       );
     }
   });
+  if (brush) attachBrush(svg, { x0: pad.left, x1: pad.left + plotW, ...brush });
   figure.append(svg);
 }
 
@@ -2571,12 +3017,17 @@ const shortDay = new Intl.DateTimeFormat(undefined, {
   month: "numeric",
 });
 
-function analyticsSince(range) {
-  const days = { "7d": 7, "14d": 14, "30d": 30 }[range] || 7;
-  const start = new Date(now());
-  start.setHours(0, 0, 0, 0);
-  start.setDate(start.getDate() - days + 1);
-  return start.getTime();
+function setAnalyticsRange(range) {
+  state.aRange = range;
+  saveRange(ANALYTICS_RANGE_KEY, range);
+  renderAnalyticsToolbar();
+  loadAnalytics();
+}
+
+function renderAnalyticsToolbar() {
+  $("#analytics-toolbar").replaceChildren(
+    rangePicker(state.aRange, ANALYTICS_QUICK, setAnalyticsRange),
+  );
 }
 
 async function loadAnalytics() {
@@ -2585,7 +3036,7 @@ async function loadAnalytics() {
   try {
     const tz = -new Date().getTimezoneOffset();
     state.analytics = await getJson(
-      `analytics?since=${analyticsSince(state.aRange)}&tz=${tz}`,
+      `analytics?${rangeParams(state.aRange)}&tz=${tz}${workspaceParam()}`,
     );
     renderAnalytics();
   } catch (e) {
@@ -2595,13 +3046,33 @@ async function loadAnalytics() {
   }
 }
 
+const hourly = (data) => data.bucket_ms < 86_400_000;
+
+/** Brush over bucket columns: snaps to bucket edges, selects a fixed range. */
+function bucketBrush(data) {
+  const edges = [
+    ...data.buckets.map((b) => b.start),
+    data.buckets.at(-1).start + data.bucket_ms,
+  ];
+  return {
+    from: edges[0],
+    to: edges.at(-1),
+    snap: (t) =>
+      edges.reduce((best, e) =>
+        Math.abs(e - t) < Math.abs(best - t) ? e : best,
+      ),
+    onselect: (from, to) =>
+      setAnalyticsRange({ kind: "absolute", from, to: Math.min(to, now()) }),
+  };
+}
+
 function renderAnalytics() {
   const data = state.analytics;
   if (!data) return;
   const width = Math.max(280, ($("#analytics").clientWidth || 600) - 32);
   const half = width > 760 ? (width - 12) / 2 - 32 : width;
-  const sum = (key) => data.days.reduce((n, d) => n + d[key], 0);
-  const peak = Math.max(0, ...data.days.map((d) => d.peak_mem_bytes));
+  const sum = (key) => data.buckets.reduce((n, d) => n + d[key], 0);
+  const peak = Math.max(0, ...data.buckets.map((d) => d.peak_mem_bytes));
   const tiles = h(
     "div",
     { class: "tiles" },
@@ -2658,28 +3129,37 @@ function renderAnalytics() {
         title: "Memory",
         sub: "All session process trees together (PSS), average per bucket",
         since: data.since,
-        until: data.now,
+        until: data.until,
         width: half,
         ...byteSeries(data.memory),
+        onbrush: (from, to) =>
+          setAnalyticsRange({ kind: "absolute", from, to }),
       }),
       cpuChart(data, half),
     ),
   );
 }
 
-const dayLabel = (data, ts) =>
-  data.days.length > 10 ? shortDay.format(ts) : dayFmt.format(ts);
+const bucketLabel = (data, ts) =>
+  hourly(data)
+    ? fmtTime(ts)
+    : data.buckets.length > 10
+      ? shortDay.format(ts)
+      : dayFmt.format(ts);
+
+const bucketName = (data, ts) =>
+  hourly(data) ? `${dayFmt.format(ts)} ${fmtTime(ts)}` : dayFmt.format(ts);
 
 function dailyActivityChart(data, width) {
   const figure = chartFigure(
-    "Daily activity",
-    "Hours each day that sessions were working or waiting on you",
+    hourly(data) ? "Hourly activity" : "Daily activity",
+    `Time each ${hourly(data) ? "hour" : "day"} that sessions were working or waiting on you`,
     stateLegend(STATES),
   );
   columnChart(
     figure,
-    data.days.map((d) => ({
-      label: dayLabel(data, d.start),
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
       day: d,
       parts: [
         [d.working_ms / 3_600_000, "working"],
@@ -2689,18 +3169,20 @@ function dailyActivityChart(data, width) {
     })),
     {
       width,
-      fmtY: (v) => `${v}h`,
+      fmtY: (v) =>
+        v === 0 ? "0" : v >= 1 ? `${v}h` : `${Math.round(v * 60)}m`,
+      brush: bucketBrush(data),
       tip: (col, value, activity) => [
         fmtDuration(value * 3_600_000),
-        `${ACTIVITY[activity].label} · ${dayFmt.format(col.day.start)}`,
+        `${ACTIVITY[activity].label} · ${bucketName(data, col.day.start)}`,
       ],
     },
   );
   figure.append(
     tableView(
       ["Day", "Working", "Needs permission", "Your turn", "Prompts"],
-      data.days.map((d) => [
-        dayFmt.format(d.start),
+      data.buckets.map((d) => [
+        bucketName(data, d.start),
         fmtDuration(d.working_ms),
         fmtDuration(d.permission_ms),
         fmtDuration(d.your_turn_ms),
@@ -2744,13 +3226,13 @@ function histogramChart(title, hist, activity, width) {
 
 function costChart(data, width) {
   const figure = chartFigure(
-    "Cost per day",
+    hourly(data) ? "Cost per hour" : "Cost per day",
     "API-equivalent, from statusline totals",
   );
   columnChart(
     figure,
-    data.days.map((d) => ({
-      label: dayLabel(data, d.start),
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
       day: d,
       parts: [[d.cost_usd, null]],
     })),
@@ -2758,13 +3240,14 @@ function costChart(data, width) {
       width,
       height: 170,
       fmtY: (v) => `$${v}`,
-      tip: (col, value) => [fmtUsd(value), dayFmt.format(col.day.start)],
+      brush: bucketBrush(data),
+      tip: (col, value) => [fmtUsd(value), bucketName(data, col.day.start)],
     },
   );
   figure.append(
     tableView(
       ["Day", "Cost"],
-      data.days.map((d) => [dayFmt.format(d.start), fmtUsd(d.cost_usd)]),
+      data.buckets.map((d) => [bucketName(data, d.start), fmtUsd(d.cost_usd)]),
     ),
   );
   return figure;
@@ -2808,13 +3291,13 @@ function modelChart(data, width) {
 
 function linesChart(data, width) {
   const figure = chartFigure(
-    "Lines changed per day",
+    hourly(data) ? "Lines changed per hour" : "Lines changed per day",
     "Added above the line, removed below",
   );
   columnChart(
     figure,
-    data.days.map((d) => ({
-      label: dayLabel(data, d.start),
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
       day: d,
       parts: [
         [d.lines_added, null],
@@ -2825,17 +3308,18 @@ function linesChart(data, width) {
       width,
       height: 170,
       fmtY: (v) => (v > 0 ? `+${v}` : v < 0 ? `−${-v}` : "0"),
+      brush: bucketBrush(data),
       tip: (col, value) => [
         value > 0 ? `+${value} added` : `−${-value} removed`,
-        dayFmt.format(col.day.start),
+        bucketName(data, col.day.start),
       ],
     },
   );
   figure.append(
     tableView(
       ["Day", "Added", "Removed"],
-      data.days.map((d) => [
-        dayFmt.format(d.start),
+      data.buckets.map((d) => [
+        bucketName(data, d.start),
         d.lines_added,
         d.lines_removed,
       ]),
@@ -2926,25 +3410,6 @@ function showView(view) {
   else loadRecent();
 }
 
-function setRange(range) {
-  state.range = range;
-  for (const button of document.querySelectorAll("[data-range]")) {
-    button.setAttribute("aria-checked", String(button.dataset.range === range));
-  }
-  loadHistory();
-}
-
-function setAnalyticsRange(range) {
-  state.aRange = range;
-  for (const button of document.querySelectorAll("[data-analytics-range]")) {
-    button.setAttribute(
-      "aria-checked",
-      String(button.dataset.analyticsRange === range),
-    );
-  }
-  loadAnalytics();
-}
-
 function start() {
   takeTokenFromHash();
   applyTheme();
@@ -2952,14 +3417,11 @@ function start() {
   for (const tab of document.querySelectorAll("[data-view]")) {
     tab.addEventListener("click", () => showView(tab.dataset.view));
   }
-  for (const button of document.querySelectorAll("[data-range]")) {
-    button.addEventListener("click", () => setRange(button.dataset.range));
-  }
-  for (const button of document.querySelectorAll("[data-analytics-range]")) {
-    button.addEventListener("click", () =>
-      setAnalyticsRange(button.dataset.analyticsRange),
-    );
-  }
+  state.range = loadRange(HISTORY_RANGE_KEY, state.range);
+  state.aRange = loadRange(ANALYTICS_RANGE_KEY, state.aRange);
+  renderHistoryToolbar();
+  renderAnalyticsToolbar();
+  renderScopebar();
   $("#detail").addEventListener("close", () => {
     state.detailId = null;
     state.convo = null;
@@ -2987,10 +3449,14 @@ function start() {
   setInterval(scheduleRender, 15_000);
   setInterval(reconnectIfStale, 10_000);
   setInterval(() => {
-    if (!$("#view-history").hidden) loadHistory();
-    else if ($("#view-analytics").hidden) loadRecent();
+    if (!$("#view-history").hidden) {
+      if (reachesNow(state.range)) loadHistory();
+    } else if ($("#view-analytics").hidden) loadRecent();
   }, 60_000);
-  setInterval(() => !$("#view-analytics").hidden && loadAnalytics(), 300_000);
+  setInterval(() => {
+    if (!$("#view-analytics").hidden && reachesNow(state.aRange))
+      loadAnalytics();
+  }, 300_000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") reconnectIfStale();
   });

@@ -18,6 +18,7 @@ mod state;
 mod store;
 mod util;
 mod wire;
+mod workspace;
 
 use std::{path::PathBuf, process::ExitCode};
 

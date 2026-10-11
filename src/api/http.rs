@@ -39,6 +39,7 @@ use crate::{
     paths,
     store::Store,
     util::now_ms,
+    workspace::{Scope, Workspaces},
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -48,9 +49,16 @@ const HOUR_MS: i64 = 3_600_000;
 struct App {
     hub: Hub,
     store: Store,
+    workspaces: Arc<Workspaces>,
 }
 
-pub async fn serve(listener: TcpListener, hub: Hub, store: Store, token: Arc<String>) {
+pub async fn serve(
+    listener: TcpListener,
+    hub: Hub,
+    store: Store,
+    token: Arc<String>,
+    workspaces: Workspaces,
+) {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
@@ -62,7 +70,11 @@ pub async fn serve(listener: TcpListener, hub: Hub, store: Store, token: Arc<Str
         .route("/", get(web::index))
         .route("/{asset}", get(web::asset))
         .nest("/api/v1", api)
-        .with_state(App { hub, store });
+        .with_state(App {
+            hub,
+            store,
+            workspaces: Arc::new(workspaces),
+        });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
     }
@@ -169,50 +181,73 @@ async fn session(
     })))
 }
 
+/// Time range and workspace of a history or analytics request.
 #[derive(Deserialize)]
-struct HistoryQuery {
+struct RangeQuery {
     since: Option<i64>,
+    /// Defaults to now; never later.
+    until: Option<i64>,
+    /// Workspace name from the snapshot's list.
+    workspace: Option<String>,
+    /// Viewer's offset from UTC in minutes (east positive), for day buckets.
+    tz: Option<i64>,
+}
+
+impl RangeQuery {
+    /// Clamped to the retention window; at least a minute long.
+    fn scope(&self, workspaces: &Workspaces, default_ms: i64) -> Result<Scope, ApiError> {
+        let now = now_ms();
+        let oldest = now - 31 * DAY_MS;
+        let until = self.until.unwrap_or(now).clamp(oldest + 60_000, now);
+        let since = self
+            .since
+            .unwrap_or(until - default_ms)
+            .clamp(oldest, until - 60_000);
+        let dir = match &self.workspace {
+            None => None,
+            Some(name) => Some(
+                workspaces
+                    .dir(name)
+                    .ok_or(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "unknown workspace".into(),
+                    ))?
+                    .to_owned(),
+            ),
+        };
+        Ok(Scope {
+            since,
+            until,
+            now,
+            dir,
+        })
+    }
 }
 
 async fn history(
     State(app): State<App>,
-    Query(query): Query<HistoryQuery>,
+    Query(query): Query<RangeQuery>,
 ) -> Result<Json<History>, ApiError> {
-    let now = now_ms();
-    let since = query
-        .since
-        .unwrap_or(now - DAY_MS)
-        .clamp(now - 31 * DAY_MS, now);
+    let scope = query.scope(&app.workspaces, DAY_MS)?;
     let live = app.hub.snapshot().await?.sessions;
     let store = app.store.clone();
     let history =
-        tokio::task::spawn_blocking(move || history::history(&store.reader()?, since, now, &live))
+        tokio::task::spawn_blocking(move || history::history(&store.reader()?, &scope, &live))
             .await
             .map_err(anyhow::Error::from)??;
     Ok(Json(history))
 }
 
-#[derive(Deserialize)]
-struct AnalyticsQuery {
-    since: Option<i64>,
-    /// Viewer's offset from UTC in minutes (east positive), for day buckets.
-    tz: Option<i64>,
-}
-
 async fn analytics(
     State(app): State<App>,
-    Query(query): Query<AnalyticsQuery>,
+    Query(query): Query<RangeQuery>,
 ) -> Result<Json<Analytics>, ApiError> {
-    let now = now_ms();
-    let since = query
-        .since
-        .unwrap_or(now - 7 * DAY_MS)
-        .clamp(now - 31 * DAY_MS, now);
+    let scope = query.scope(&app.workspaces, 7 * DAY_MS)?;
     let tz = query.tz.unwrap_or(0).clamp(-14 * 60, 14 * 60);
     let live = app.hub.snapshot().await?.sessions;
     let store = app.store.clone();
     let analytics = tokio::task::spawn_blocking(move || {
-        analytics::analytics(&store.reader()?, since, now, tz, &live)
+        analytics::analytics(&store.reader()?, &scope, tz, &live)
     })
     .await
     .map_err(anyhow::Error::from)??;

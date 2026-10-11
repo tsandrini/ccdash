@@ -1447,6 +1447,245 @@ dialog::backdrop {
   text-align: left;
 }
 
+/* --- workspaces & time ranges --- */
+
+.scopebar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: max-content;
+  max-width: 100%;
+  margin-bottom: 16px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow-x: auto;
+}
+
+.scopebar[hidden] {
+  display: none;
+}
+
+.scope-label {
+  padding: 0 8px 0 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.scopebar button {
+  flex: none;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.scopebar button[aria-checked="true"] {
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.range-picker {
+  display: inline-flex;
+  max-width: 100%;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--axis);
+  background: var(--surface-1);
+}
+
+.range-picker button {
+  height: 32px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.range-picker button + button {
+  border-left: 1px solid var(--axis);
+}
+
+.range-picker button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.range-picker button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.range-picker button:focus-visible,
+.scopebar button:focus-visible,
+.range-quick button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.range-step {
+  width: 32px;
+  font-size: 16px;
+}
+
+.range-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 10px;
+  font: 13px var(--mono);
+  white-space: nowrap;
+}
+
+.range-trigger span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.range-icon {
+  color: var(--text-muted);
+}
+
+#range-dialog {
+  width: auto;
+  max-width: calc(100vw - 16px);
+  padding: 12px;
+}
+
+#range-dialog.range-popover {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  width: max-content;
+  margin: 0;
+}
+
+#range-dialog::backdrop {
+  background: transparent;
+}
+
+#range-dialog.range-sheet::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.range-form {
+  display: flex;
+  gap: 16px;
+}
+
+.range-form h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.range-absolute {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 240px;
+}
+
+.range-absolute label {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.range-absolute input {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--axis);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font: 13px var(--mono);
+}
+
+.range-zone {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.range-error {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--critical);
+}
+
+.range-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.range-actions .btn {
+  flex: 1;
+  justify-content: center;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.range-quick {
+  display: flex;
+  flex-direction: column;
+  width: 176px;
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+}
+
+.range-quick-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.range-quick button {
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.range-quick button:hover {
+  background: var(--surface-2);
+}
+
+.range-quick button[aria-pressed="true"] {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
+.chart svg.brushable {
+  cursor: crosshair;
+  user-select: none;
+}
+
+.chart svg .brush {
+  fill: var(--accent);
+  fill-opacity: 0.15;
+  stroke: var(--accent);
+  stroke-opacity: 0.6;
+  pointer-events: none;
+}
+
 /* --- login --- */
 
 .login {
@@ -1508,5 +1747,63 @@ dialog::backdrop {
     height: 100dvh;
     margin: 0;
     border-radius: 0;
+  }
+
+  #range-dialog.range-sheet {
+    top: auto;
+    bottom: 0;
+    width: 100vw;
+    height: auto;
+    max-height: 90dvh;
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+    border-radius: 14px 14px 0 0;
+  }
+
+  .range-sheet .range-form {
+    flex-direction: column;
+  }
+
+  .range-sheet .range-absolute,
+  .range-sheet .range-quick {
+    width: auto;
+    padding: 0;
+    border: 0;
+  }
+
+  .range-sheet .range-quick-list {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .range-sheet .range-quick button {
+    height: 44px;
+    border: 1px solid var(--axis);
+  }
+
+  .range-sheet .range-quick button[aria-pressed="true"] {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .range-sheet .range-absolute input {
+    height: 44px;
+  }
+
+  .range-sheet .range-actions .btn {
+    height: 48px;
+  }
+
+  .range-picker {
+    width: 100%;
+  }
+
+  .scope-label {
+    display: none;
+  }
+
+  .range-trigger {
+    flex: 1;
   }
 }

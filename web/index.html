@@ -55,6 +55,13 @@
     </header>
 
     <main>
+      <div
+        class="scopebar"
+        id="scopebar"
+        role="radiogroup"
+        aria-label="Workspace"
+        hidden
+      ></div>
       <section class="view" id="view-sessions">
         <div class="overview">
           <div class="hero">
@@ -68,47 +75,19 @@
       </section>
 
       <section class="view" id="view-history" hidden>
-        <div
-          class="filters"
-          role="radiogroup"
-          aria-label="Time range"
-          id="range"
-        >
-          <button role="radio" data-range="today" aria-checked="true">
-            Today
-          </button>
-          <button role="radio" data-range="24h" aria-checked="false">
-            24 h
-          </button>
-          <button role="radio" data-range="7d" aria-checked="false">
-            7 days
-          </button>
-        </div>
+        <div class="toolbar" id="history-toolbar"></div>
         <div id="history"></div>
       </section>
 
       <section class="view" id="view-analytics" hidden>
-        <div
-          class="filters"
-          role="radiogroup"
-          aria-label="Analytics range"
-          id="analytics-range"
-        >
-          <button role="radio" data-analytics-range="7d" aria-checked="true">
-            7 days
-          </button>
-          <button role="radio" data-analytics-range="14d" aria-checked="false">
-            14 days
-          </button>
-          <button role="radio" data-analytics-range="30d" aria-checked="false">
-            30 days
-          </button>
-        </div>
+        <div class="toolbar" id="analytics-toolbar"></div>
         <div id="analytics"></div>
       </section>
     </main>
 
     <dialog id="detail" aria-labelledby="detail-title"></dialog>
+
+    <dialog id="range-dialog" aria-label="Time range"></dialog>
 
     <dialog id="login" aria-labelledby="login-title">
       <form class="login" method="dialog" id="login-form">

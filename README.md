@@ -39,6 +39,8 @@ With Home Manager (the module also wires the hooks into
   services.ccdash = {
     enable = true;
     settings.http.listen = [ "[::]:7837" ];
+    # optional: filter the UI by workspace (named by the last path component)
+    settings.workspaces.dirs = [ "~/code/work" "~/code/personal" ];
     # keep your statusline, ccdash reads the stats on its way through
     claudeCode.statusLine = {
       enable = true;
@@ -73,6 +75,11 @@ The web UI lives on the HTTP port:
 - **Analytics:** daily activity, when you prompt (weekday × hour), how long
   Claude works per prompt and how long sessions wait for you, cost per day
   and per model, lines changed, memory and CPU per project.
+
+History and Analytics share a time range picker: quick ranges or an exact
+from–to, `‹ ›` to step by the range's length, `⊖` to double it, and
+drag across any time chart with a mouse to zoom in. With
+`workspaces.dirs` set, a workspace switch filters every view.
 
 Open the address from `ccdash url` once; the token is kept in the browser
 after that.

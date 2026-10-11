@@ -3,14 +3,18 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Activity, Kind, Session};
+use crate::{
+    model::{Activity, Kind, Session},
+    workspace::{IN_SCOPE, Scope},
+};
 
 #[derive(Debug, Serialize)]
 pub struct History {
     pub since: i64,
+    pub until: i64,
     pub now: i64,
     pub bucket_ms: i64,
     pub lanes: Vec<Lane>,
@@ -68,44 +72,56 @@ struct Row {
 /// are left out.
 const TRIVIAL_MS: i64 = 30_000;
 
-pub fn history(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Result<History> {
-    let lanes = lanes(conn, since, now, live)?;
-    let bucket_ms = ((now - since) / 288).max(60_000);
+pub fn history(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<History> {
+    let lanes = lanes(conn, scope, live)?;
+    let bucket_ms = ((scope.until - scope.since) / 288).max(60_000);
     Ok(History {
-        since,
-        now,
+        since: scope.since,
+        until: scope.until,
+        now: scope.now,
         bucket_ms,
         lanes,
-        usage: usage(conn, since, bucket_ms)?,
-        cost_usd: cost(conn, since)?,
+        usage: usage(conn, scope, bucket_ms)?,
+        cost_usd: cost(conn, scope)?,
         prompts: conn.query_row(
-            "SELECT count(*) FROM events WHERE kind = 'prompt' AND ts >= ?1",
-            [since],
+            &format!(
+                "SELECT count(*) FROM events e LEFT JOIN sessions x ON x.id = e.session
+                    WHERE e.kind = 'prompt' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}"
+            ),
+            named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
             |r| r.get(0),
         )?,
-        tools: tools(conn, since)?,
+        tools: tools(conn, scope)?,
     })
 }
 
-/// One lane per session active in `since..now`, ordered by first activity.
-pub fn lanes(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Result<Vec<Lane>> {
+/// One lane per session active in the scope, ordered by first activity.
+pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<Lane>> {
     let live: HashMap<&str, &Session> = live.iter().map(|s| (s.id.as_str(), s)).collect();
-    let mut transitions = transitions_since(conn, since)?;
+    let (since, until) = (scope.since, scope.until);
+    let mut transitions = transitions_in(conn, scope)?;
     let mut lanes = Vec::new();
-    for row in sessions_overlapping(conn, since)? {
+    for row in sessions_overlapping(conn, scope)? {
+        if !scope.contains(&row.cwd) {
+            continue;
+        }
         let current = live.get(row.id.as_str()).copied();
         let events = transitions.remove(&row.id).unwrap_or_default();
         let initial = match events.first() {
             Some((_, first)) => Some(first.from),
             None => match current {
-                Some(s) => Some(s.activity),
-                None => state_before(conn, &row.id, since)?,
+                Some(s) if until >= scope.now => Some(s.activity),
+                _ => match state_before(conn, &row.id, since)? {
+                    Some(state) => Some(state),
+                    None => state_after(conn, &row.id, until)?.or(current.map(|s| s.activity)),
+                },
             },
         };
         let Some(initial) = initial else { continue };
         let end = match (current, row.ended_at) {
-            (Some(_), _) => now,
-            (None, Some(ended)) => ended,
+            (Some(_), _) => scope.now.min(until),
+            (None, Some(ended)) => ended.min(until),
+            (None, None) if state_after(conn, &row.id, until)?.is_some() => until,
             (None, None) => events.last().map_or(row.started_at, |(ts, _)| *ts),
         };
         let trivial = row.started_at >= since
@@ -140,20 +156,25 @@ pub fn lanes(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Resul
     Ok(lanes)
 }
 
-fn tools(conn: &Connection, since: i64) -> Result<Vec<ToolCount>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT json_extract(data, '$.name') AS name, count(*),
-                coalesce(sum(json_extract(data, '$.ok') = 0), 0)
-            FROM events WHERE kind = 'tool' AND ts >= ?1 AND name IS NOT NULL
-            GROUP BY name ORDER BY 2 DESC, name LIMIT 12",
+fn tools(conn: &Connection, scope: &Scope) -> Result<Vec<ToolCount>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT json_extract(e.data, '$.name') AS tool, count(*),
+                coalesce(sum(json_extract(e.data, '$.ok') = 0), 0)
+            FROM events e LEFT JOIN sessions x ON x.id = e.session
+            WHERE e.kind = 'tool' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}
+                AND tool IS NOT NULL
+            GROUP BY tool ORDER BY 2 DESC, tool LIMIT 12"
+    ))?;
+    let rows = stmt.query_map(
+        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        |r| {
+            Ok(ToolCount {
+                name: r.get(0)?,
+                calls: r.get(1)?,
+                failed: r.get(2)?,
+            })
+        },
     )?;
-    let rows = stmt.query_map([since], |r| {
-        Ok(ToolCount {
-            name: r.get(0)?,
-            calls: r.get(1)?,
-            failed: r.get(2)?,
-        })
-    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -195,12 +216,12 @@ fn finished_is_idle(segments: &mut Vec<(i64, i64, Activity)>) {
     *segments = merged;
 }
 
-fn sessions_overlapping(conn: &Connection, since: i64) -> Result<Vec<Row>> {
+fn sessions_overlapping(conn: &Connection, scope: &Scope) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, cwd, name, title, kind, started_at, ended_at FROM sessions
-            WHERE ended_at IS NULL OR ended_at >= ?1",
+            WHERE started_at < ?2 AND (ended_at IS NULL OR ended_at >= ?1)",
     )?;
-    let rows = stmt.query_map([since], |r| {
+    let rows = stmt.query_map(params![scope.since, scope.until], |r| {
         Ok(Row {
             id: r.get(0)?,
             cwd: r.get(1)?,
@@ -214,15 +235,16 @@ fn sessions_overlapping(conn: &Connection, since: i64) -> Result<Vec<Row>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn transitions_since(
+fn transitions_in(
     conn: &Connection,
-    since: i64,
+    scope: &Scope,
 ) -> Result<HashMap<String, Vec<(i64, Transition)>>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT session, ts, data FROM events WHERE kind = 'activity' AND ts >= ?1 ORDER BY ts",
+        "SELECT session, ts, data FROM events
+            WHERE kind = 'activity' AND ts >= ?1 AND ts < ?2 ORDER BY ts",
     )?;
     let mut out: HashMap<String, Vec<(i64, Transition)>> = HashMap::new();
-    let rows = stmt.query_map([since], |r| {
+    let rows = stmt.query_map(params![scope.since, scope.until], |r| {
         Ok((r.get::<_, String>(0)?, r.get(1)?, r.get::<_, String>(2)?))
     })?;
     for row in rows {
@@ -247,13 +269,29 @@ fn state_before(conn: &Connection, session: &str, since: i64) -> Result<Option<A
         .map(|t| t.to))
 }
 
-fn usage(conn: &Connection, since: i64, bucket_ms: i64) -> Result<Vec<UsagePoint>> {
+/// The state a session left at its first transition after `until`, for
+/// sessions that did not change state inside the window.
+fn state_after(conn: &Connection, session: &str, until: i64) -> Result<Option<Activity>> {
+    let data: Option<String> = conn
+        .prepare_cached(
+            "SELECT data FROM events WHERE session = ?1 AND kind = 'activity' AND ts >= ?2
+                ORDER BY ts LIMIT 1",
+        )?
+        .query_row(params![session, until], |r| r.get(0))
+        .optional()?;
+    Ok(data
+        .and_then(|d| serde_json::from_str::<Transition>(&d).ok())
+        .map(|t| t.from))
+}
+
+/// Rate limits are account-wide, so the workspace does not apply.
+fn usage(conn: &Connection, scope: &Scope, bucket_ms: i64) -> Result<Vec<UsagePoint>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT (ts / ?2) * ?2 AS bucket, max(five_hour), max(seven_day) FROM samples
-            WHERE ts >= ?1 AND (five_hour IS NOT NULL OR seven_day IS NOT NULL)
+        "SELECT (ts / ?3) * ?3 AS bucket, max(five_hour), max(seven_day) FROM samples
+            WHERE ts >= ?1 AND ts < ?2 AND (five_hour IS NOT NULL OR seven_day IS NOT NULL)
             GROUP BY bucket ORDER BY bucket",
     )?;
-    let rows = stmt.query_map(params![since, bucket_ms], |r| {
+    let rows = stmt.query_map(params![scope.since, scope.until, bucket_ms], |r| {
         Ok(UsagePoint {
             ts: r.get(0)?,
             five_hour: r.get(1)?,
@@ -263,26 +301,33 @@ fn usage(conn: &Connection, since: i64, bucket_ms: i64) -> Result<Vec<UsagePoint
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// API-equivalent cost accrued since `since`; the statusline reports a
+/// API-equivalent cost accrued in the scope; the statusline reports a
 /// running total per session.
-fn cost(conn: &Connection, since: i64) -> Result<f64> {
-    let mut stmt = conn.prepare_cached(
+fn cost(conn: &Connection, scope: &Scope) -> Result<f64> {
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT min(s.cost_usd), max(s.cost_usd), coalesce(x.started_at, 0)
             FROM samples s LEFT JOIN sessions x ON x.id = s.session
-            WHERE s.ts >= ?1 AND s.cost_usd IS NOT NULL
-            GROUP BY s.session",
+            WHERE s.ts >= :since AND s.ts < :until AND s.cost_usd IS NOT NULL AND {IN_SCOPE}
+            GROUP BY s.session"
+    ))?;
+    let rows = stmt.query_map(
+        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        |r| {
+            Ok((
+                r.get::<_, f64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
     )?;
-    let rows = stmt.query_map([since], |r| {
-        Ok((
-            r.get::<_, f64>(0)?,
-            r.get::<_, f64>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
     let mut total = 0.0;
     for row in rows {
         let (min, max, started_at) = row?;
-        total += if started_at >= since { max } else { max - min };
+        total += if started_at >= scope.since {
+            max
+        } else {
+            max - min
+        };
     }
     Ok(total)
 }
@@ -291,6 +336,15 @@ fn cost(conn: &Connection, since: i64) -> Result<f64> {
 mod tests {
     use super::*;
     use crate::store::SCHEMA;
+
+    fn scope(since: i64, until: i64) -> Scope {
+        Scope {
+            since,
+            until,
+            now: until,
+            dir: None,
+        }
+    }
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -324,7 +378,7 @@ mod tests {
         // Ended before the window starts.
         session(&conn, "old", 0, Some(90));
 
-        let h = history(&conn, 100, 1_000, &[]).unwrap();
+        let h = history(&conn, &scope(100, 1_000), &[]).unwrap();
         assert_eq!(h.lanes.len(), 1);
         assert_eq!(
             h.lanes[0].segments,
@@ -334,6 +388,15 @@ mod tests {
             ]
         );
         assert_eq!(h.lanes[0].label, "title a");
+    }
+
+    #[test]
+    fn quiet_sessions_show_in_past_windows() {
+        let conn = db();
+        session(&conn, "a", 0, None);
+        transition(&conn, "a", 5_000, "idle", "working");
+        let h = history(&conn, &scope(1_000, 2_000), &[]).unwrap();
+        assert_eq!(h.lanes[0].segments, vec![(1_000, 2_000, Activity::Idle)]);
     }
 
     #[test]
@@ -351,7 +414,7 @@ mod tests {
         session(&conn, "stub", 600, Some(1600));
         transition(&conn, "stub", 1600, "idle", "gone");
 
-        let h = history(&conn, 0, 2_000, &[]).unwrap();
+        let h = history(&conn, &scope(0, 2_000), &[]).unwrap();
         assert_eq!(h.lanes.len(), 1);
         assert!(h.lanes[0].background);
         assert_eq!(
@@ -389,7 +452,7 @@ mod tests {
             )
             .unwrap();
         }
-        let h = history(&conn, 100, 100 + 288 * 60_000, &[]).unwrap();
+        let h = history(&conn, &scope(100, 100 + 288 * 60_000), &[]).unwrap();
         assert_eq!(
             h.tools,
             [

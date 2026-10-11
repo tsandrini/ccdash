@@ -151,6 +151,8 @@ pub struct Session {
     pub parent: Option<String>,
     pub pid: Option<u32>,
     pub cwd: String,
+    /// Configured workspace holding `cwd`.
+    pub workspace: Option<String>,
     /// Name from `claude agents`.
     pub name: Option<String>,
     /// Conversation title from the statusline (also the window title).
@@ -189,6 +191,8 @@ pub struct Session {
 pub struct Snapshot {
     pub host: String,
     pub now: i64,
+    /// Configured workspace names, for filtering.
+    pub workspaces: Vec<String>,
     pub sessions: Vec<Session>,
     pub rate_limits: Option<RateLimits>,
 }

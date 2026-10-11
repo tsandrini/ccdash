@@ -24,6 +24,7 @@ use crate::{
     store::Store,
     util::now_ms,
     wire::{self, Envelope},
+    workspace::Workspaces,
 };
 
 const TICK: Duration = Duration::from_secs(15);
@@ -48,10 +49,12 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     }
 
     let host = cfg.host();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let workspaces = Workspaces::new(&cfg.workspaces.dirs, &home);
     let store = Store::open(&cfg.store_path(), host.clone(), cfg.store.retention_days)?;
     let token = Arc::new(http::load_token(&cfg)?);
     let hub = Hub::spawn(
-        State::new(host.clone(), cfg.niri.terminals.clone()),
+        State::new(host.clone(), cfg.niri.terminals.clone(), workspaces.clone()),
         store.clone(),
     );
 
@@ -69,6 +72,7 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
             hub.clone(),
             store.clone(),
             token.clone(),
+            workspaces.clone(),
         ));
     }
 

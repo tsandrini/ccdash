@@ -12,6 +12,7 @@ use crate::{
     },
     util::{pid_alive, tail, truncate},
     wire::{Envelope, Source},
+    workspace::Workspaces,
 };
 
 const GONE_RETENTION_MS: i64 = 10 * 60 * 1000;
@@ -177,6 +178,7 @@ pub struct ProcPoll {
 pub struct State {
     host: String,
     terminals: Vec<String>,
+    workspaces: Workspaces,
     sessions: HashMap<String, Session>,
     aux: HashMap<String, Aux>,
     rate_limits: Option<RateLimits>,
@@ -187,10 +189,11 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(host: String, terminals: Vec<String>) -> Self {
+    pub fn new(host: String, terminals: Vec<String>, workspaces: Workspaces) -> Self {
         Self {
             host,
             terminals,
+            workspaces,
             sessions: HashMap::new(),
             aux: HashMap::new(),
             rate_limits: None,
@@ -214,6 +217,7 @@ impl State {
         Snapshot {
             host: self.host.clone(),
             now,
+            workspaces: self.workspaces.names(),
             sessions,
             rate_limits: self.rate_limits.clone(),
         }
@@ -283,8 +287,11 @@ impl State {
         if let Some(remote) = &env.remote_id {
             s.remote_url = Some(remote_url(remote));
         }
-        if let Some(cwd) = str_of(p, "cwd") {
+        if let Some(cwd) = str_of(p, "cwd")
+            && cwd != s.cwd
+        {
             s.cwd = cwd.to_owned();
+            s.workspace = self.workspaces.of(cwd);
         }
         if let Some(mode) = str_of(p, "permission_mode") {
             s.permission_mode = Some(mode.to_owned());
@@ -917,6 +924,7 @@ impl State {
             parent: None,
             pid: None,
             cwd: cwd.unwrap_or_default().to_owned(),
+            workspace: cwd.and_then(|cwd| self.workspaces.of(cwd)),
             name: None,
             title: None,
             activity: Activity::Idle,
@@ -1363,7 +1371,11 @@ mod tests {
     const GHOSTTY: &str = "com.mitchellh.ghostty";
 
     fn state() -> State {
-        State::new("testhost".into(), vec![GHOSTTY.into()])
+        State::new(
+            "testhost".into(),
+            vec![GHOSTTY.into()],
+            Workspaces::new(&["/work".into()], "/home/u"),
+        )
     }
 
     fn envelope(source: Source, ts: i64, payload: Value) -> Envelope {
