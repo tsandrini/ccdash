@@ -17,7 +17,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{
-        Html, IntoResponse, Response,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
@@ -28,13 +28,19 @@ use tokio::net::TcpListener;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::warn;
 
+use super::web;
 use crate::{
     config::Config,
+    history::{self, History},
     hub::Hub,
+    markdown,
     model::Snapshot,
     paths,
     store::{self, Store},
+    util::now_ms,
 };
+
+const DAY_MS: i64 = 86_400_000;
 
 #[derive(Clone)]
 struct App {
@@ -46,10 +52,12 @@ pub async fn serve(listener: TcpListener, hub: Hub, store: Store, token: Arc<Str
     let api = Router::new()
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
+        .route("/history", get(history))
         .route("/stream", get(stream))
         .layer(middleware::from_fn_with_state(token, auth));
     let app = Router::new()
-        .route("/", get(index))
+        .route("/", get(web::index))
+        .route("/{asset}", get(web::asset))
         .nest("/api/v1", api)
         .with_state(App { hub, store });
     if let Err(e) = axum::serve(listener, app).await {
@@ -106,10 +114,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn index() -> Html<&'static str> {
-    Html("<!doctype html><title>ccdash</title><p>ccdash is running. The web UI is not built yet.")
-}
-
 async fn snapshot(State(app): State<App>) -> Result<Json<Snapshot>, ApiError> {
     Ok(Json(app.hub.snapshot().await?))
 }
@@ -135,7 +139,37 @@ async fn session(
         tokio::task::spawn_blocking(move || store::events(&store.reader()?, &session_id, limit))
             .await
             .map_err(anyhow::Error::from)??;
-    Ok(Json(json!({ "session": session, "events": events })))
+    let prompt_html = session.prompt.as_ref().map(|p| markdown::render(&p.text));
+    let reply_html = session.reply.as_ref().map(|r| markdown::render(&r.text));
+    Ok(Json(json!({
+        "session": session,
+        "events": events,
+        "prompt_html": prompt_html,
+        "reply_html": reply_html,
+    })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    since: Option<i64>,
+}
+
+async fn history(
+    State(app): State<App>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<History>, ApiError> {
+    let now = now_ms();
+    let since = query
+        .since
+        .unwrap_or(now - DAY_MS)
+        .clamp(now - 31 * DAY_MS, now);
+    let live = app.hub.snapshot().await?.sessions;
+    let store = app.store.clone();
+    let history =
+        tokio::task::spawn_blocking(move || history::history(&store.reader()?, since, now, &live))
+            .await
+            .map_err(anyhow::Error::from)??;
+    Ok(Json(history))
 }
 
 async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

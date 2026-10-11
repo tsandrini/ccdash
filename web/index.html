@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="theme-color"
+      content="#f9f9f7"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#0d0d0d"
+      media="(prefers-color-scheme: dark)"
+    />
+    <title>ccdash</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="app.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="icon.svg" alt="" width="20" height="20" />
+        <span>ccdash</span>
+        <span class="muted" id="host"></span>
+      </div>
+      <nav class="tabs" role="tablist" aria-label="Views">
+        <button role="tab" data-view="sessions" aria-selected="true">
+          Sessions
+        </button>
+        <button role="tab" data-view="history" aria-selected="false">
+          History
+        </button>
+      </nav>
+      <div class="conn" id="conn" data-state="connecting" role="status">
+        <span class="conn-dot"></span><span class="conn-label">connecting</span>
+      </div>
+      <button
+        class="icon-btn"
+        id="theme"
+        type="button"
+        aria-label="Switch theme"
+      >
+        ◐
+      </button>
+    </header>
+
+    <main>
+      <section class="view" id="view-sessions">
+        <div class="overview">
+          <div class="hero">
+            <div class="hero-value" id="hero-value">–</div>
+            <div class="hero-label" id="hero-label">need you</div>
+            <div class="hero-sub" id="hero-sub"></div>
+          </div>
+          <div class="tiles" id="tiles"></div>
+        </div>
+        <div id="groups"></div>
+      </section>
+
+      <section class="view" id="view-history" hidden>
+        <div
+          class="filters"
+          role="radiogroup"
+          aria-label="Time range"
+          id="range"
+        >
+          <button role="radio" data-range="today" aria-checked="true">
+            Today
+          </button>
+          <button role="radio" data-range="24h" aria-checked="false">
+            24 h
+          </button>
+          <button role="radio" data-range="7d" aria-checked="false">
+            7 days
+          </button>
+        </div>
+        <div id="history"></div>
+      </section>
+    </main>
+
+    <dialog id="detail" aria-labelledby="detail-title"></dialog>
+
+    <dialog id="login" aria-labelledby="login-title">
+      <form class="login" method="dialog" id="login-form">
+        <h2 id="login-title">Access token</h2>
+        <p class="muted">
+          Run <code>ccdash url</code> on the host and open the printed address,
+          or paste the token here.
+        </p>
+        <input
+          id="login-token"
+          autocomplete="off"
+          spellcheck="false"
+          required
+        />
+        <button class="btn" type="submit">Connect</button>
+      </form>
+    </dialog>
+  </body>
+</html>

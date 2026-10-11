@@ -5,8 +5,8 @@ working, which are waiting on you, and which look stuck. On the desktop as a
 [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) plugin,
 on the phone as a web page.
 
-> **Status:** work in progress. The collector daemon works; the web UI and
-> the DMS plugin are not built yet.
+> **Status:** work in progress. The collector daemon and the web UI work;
+> the DMS plugin is not built yet.
 
 ## How it works
 
@@ -56,6 +56,11 @@ ccdash open <id>       # focus its window, or attach to a background session
 ccdash url --host <ip> # web address for the phone, token included
 ```
 
+The web UI lives on the HTTP port: sessions that need you first, then the
+working and idle ones, a detail view with the last prompt and reply, and a
+history view with usage and a per-session activity timeline. Open the
+address from `ccdash url` once; the token is kept in the browser after that.
+
 The HTTP API is read-only and needs the bearer token (generated in
 `~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
 port behind your firewall or VPN.
@@ -64,9 +69,12 @@ port behind your firewall or VPN.
 
 ```sh
 direnv allow   # or: nix develop
-cargo run
+cargo run -- daemon
 nix build
 ```
+
+`CCDASH_WEB_DIR=web` serves the UI from disk instead of the embedded copy,
+so edits show up on reload.
 
 ## License
 

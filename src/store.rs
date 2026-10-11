@@ -19,7 +19,7 @@ use crate::{
     util::now_ms,
 };
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
     ts INTEGER NOT NULL,
     host TEXT NOT NULL,
@@ -203,7 +203,8 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
     conn.execute("DELETE FROM events WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
     conn.execute(
-        "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+        "DELETE FROM sessions WHERE started_at < ?1
+            AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
         [cutoff],
     )?;
     Ok(())

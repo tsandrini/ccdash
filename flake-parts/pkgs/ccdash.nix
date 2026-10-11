@@ -17,6 +17,7 @@ rustPlatform.buildRustPackage {
       (flake-root + "/Cargo.toml")
       (flake-root + "/Cargo.lock")
       (flake-root + "/src")
+      (flake-root + "/web")
     ];
   };
 

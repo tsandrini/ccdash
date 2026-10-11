@@ -1,0 +1,11 @@
+{
+  "name": "ccdash",
+  "short_name": "ccdash",
+  "description": "Live dashboard for running Claude Code sessions",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0d0d0d",
+  "theme_color": "#0d0d0d",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
