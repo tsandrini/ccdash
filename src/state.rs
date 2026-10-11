@@ -33,6 +33,8 @@ const MESSAGE_TAIL: usize = 800;
 const MESSAGE_MAX: usize = 32 * 1024;
 const MAX_STREAMS: usize = 8;
 const PROC_SAMPLE_EVERY_MS: i64 = 60_000;
+/// A session starting this soon after Claude ran `claude --bg` is its child.
+const SPAWN_LINK_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -168,6 +170,8 @@ pub struct ProcPoll {
     pub mem_bytes: u64,
     pub procs: u32,
     pub top: Vec<ProcInfo>,
+    /// Session id this process was forked from (`--fork-session --resume`).
+    pub forked_from: Option<String>,
 }
 
 pub struct State {
@@ -178,6 +182,8 @@ pub struct State {
     rate_limits: Option<RateLimits>,
     windows: HashMap<u64, Window>,
     focused: Option<u64>,
+    /// `(session, ts)` of Bash calls that started a background session.
+    spawns: Vec<(String, i64)>,
 }
 
 impl State {
@@ -190,6 +196,7 @@ impl State {
             rate_limits: None,
             windows: HashMap::new(),
             focused: None,
+            spawns: Vec::new(),
         }
     }
 
@@ -305,6 +312,12 @@ impl State {
                     s.turn = None;
                     s.tasks.clear();
                 }
+                if s.parent.is_none() && matches!(source, "startup" | "fork") {
+                    self.spawns.retain(|(_, at)| ts - at <= SPAWN_LINK_MS);
+                    if let Some(i) = self.spawns.iter().position(|(parent, _)| parent != id) {
+                        s.parent = Some(self.spawns.remove(i).0);
+                    }
+                }
                 record(store, ts, id, "start", json!({ "source": source }));
                 focus_candidate = matches!(source, "startup" | "resume");
             }
@@ -351,6 +364,11 @@ impl State {
                         sub.tool = Some(run);
                     }
                 } else {
+                    if tool_name == "Bash"
+                        && str_of(tool_input, "command").is_some_and(starts_background_session)
+                    {
+                        self.spawns.push((id.to_owned(), ts));
+                    }
                     if matches!(tool_name, "Agent" | "Task") {
                         aux.pending_agents.push((
                             str_of(tool_input, "subagent_type")
@@ -695,6 +713,13 @@ impl State {
                 s.resources = Some(resources);
                 fx.touched.insert(poll.session.clone());
             }
+            if s.kind == Kind::Background
+                && poll.forked_from.is_some()
+                && s.parent != poll.forked_from
+            {
+                s.parent = poll.forked_from.clone();
+                fx.touched.insert(poll.session.clone());
+            }
             let aux = self.aux.entry(poll.session.clone()).or_default();
             let window = aux.proc_window.get_or_insert(ProcWindow {
                 since: now,
@@ -747,10 +772,17 @@ impl State {
 
             let s = self.sessions.get_mut(id).expect("ensured above");
             s.pid = e.pid.or(s.pid);
-            s.kind = match e.kind.as_deref() {
+            let kind = match e.kind.as_deref() {
                 Some("background") => Kind::Background,
                 _ => Kind::Interactive,
             };
+            if kind != s.kind {
+                s.kind = kind;
+                fx.store.push(session_row(s, None));
+            }
+            if kind == Kind::Interactive {
+                s.parent = None;
+            }
             s.short_id = e.id.clone();
             if e.name.is_some() {
                 s.name = e.name.clone();
@@ -882,6 +914,7 @@ impl State {
             id: id.to_owned(),
             short_id: None,
             kind: Kind::Interactive,
+            parent: None,
             pid: None,
             cwd: cwd.unwrap_or_default().to_owned(),
             name: None,
@@ -1042,6 +1075,12 @@ impl State {
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+/// `claude … --bg …` in a shell command.
+fn starts_background_session(command: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.contains(&"--bg") && words.iter().any(|w| w.rsplit('/').next() == Some("claude"))
 }
 
 fn round_mib(bytes: u64) -> u64 {
@@ -1964,6 +2003,7 @@ mod tests {
             mem_bytes: rss,
             procs: 2,
             top: Vec::new(),
+            forked_from: None,
         };
         let mut fx = Effects::default();
         st.resources(vec![poll(10.2, 300 << 20)], 1_000, &mut fx);
@@ -1985,6 +2025,48 @@ mod tests {
         let mut fx = Effects::default();
         st.resources(Vec::new(), 66_000, &mut fx);
         assert!(session(&st).resources.is_none() && fx.touched.contains(SID));
+    }
+
+    #[test]
+    fn background_sessions_link_to_the_session_that_started_them() {
+        let mut st = state();
+        hook(
+            &mut st,
+            1,
+            "PreToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "cd /tmp/x && claude --bg --model m \"go\""}}),
+        );
+        let start = |st: &mut State, id: &str, ts: i64| {
+            let mut fx = Effects::default();
+            let payload = json!({"session_id": id, "cwd": "/tmp/x", "hook_event_name": "SessionStart", "source": "startup"});
+            st.apply(&envelope(Source::Hook, ts, payload), &mut fx);
+        };
+        start(&mut st, "child", 2_000);
+        assert_eq!(st.session("child").unwrap().parent.as_deref(), Some(SID));
+        start(&mut st, "later", 3_000);
+        assert_eq!(
+            st.session("later").unwrap().parent,
+            None,
+            "a spawn links once"
+        );
+
+        let entry = |id: &str, kind: &str| AgentEntry {
+            session_id: id.into(),
+            kind: Some(kind.into()),
+            status: Some("idle".into()),
+            pid: Some(std::process::id()),
+            ..Default::default()
+        };
+        let mut fx = Effects::default();
+        st.agents(
+            &[entry("child", "background"), entry(SID, "interactive")],
+            4_000,
+            &mut fx,
+        );
+        assert_eq!(st.session("child").unwrap().kind, Kind::Background);
+        assert_eq!(st.session("child").unwrap().parent.as_deref(), Some(SID));
+        assert!(starts_background_session("/nix/store/x/bin/claude --bg hi"));
+        assert!(!starts_background_session("claude agents --json"));
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct Poller {
     procs: HashMap<(u32, u64), u64>,
     /// Memory per process and when it was read.
     mem: HashMap<(u32, u64), (u64, i64)>,
+    /// Parent session of forked session roots, read once per process.
+    forks: HashMap<(u32, u64), Option<String>>,
     trees: HashMap<(u32, u64), u64>,
     last: Option<i64>,
     boot_ms: i64,
@@ -50,6 +52,7 @@ impl Poller {
         Self {
             procs: HashMap::new(),
             mem: HashMap::new(),
+            forks: HashMap::new(),
             trees: HashMap::new(),
             last: None,
             boot_ms,
@@ -73,6 +76,7 @@ impl Poller {
 
         let (mut procs, mut trees, mut out) = (HashMap::new(), HashMap::new(), Vec::new());
         let mut mem = HashMap::new();
+        let mut forks = HashMap::new();
         for (session, root) in roots {
             let Some(root_stat) = table.get(root) else {
                 continue;
@@ -85,6 +89,11 @@ impl Poller {
                 .get(&tree_key)
                 .map_or(0.0, |prev| pct(total.saturating_sub(*prev)));
             trees.insert(tree_key, total);
+            let forked_from = self
+                .forks
+                .remove(&tree_key)
+                .unwrap_or_else(|| fork_parent(&args(*root)));
+            forks.insert(tree_key, forked_from.clone());
 
             let mut mem_total = 0;
             let mut infos: Vec<ProcInfo> = members
@@ -139,10 +148,12 @@ impl Poller {
                 mem_bytes: mem_total,
                 procs: u32::try_from(members.len()).unwrap_or(u32::MAX),
                 top: infos,
+                forked_from,
             });
         }
         self.procs = procs;
         self.mem = mem;
+        self.forks = forks;
         self.trees = trees;
         self.last = Some(now);
         out
@@ -240,6 +251,19 @@ fn args(pid: u32) -> Vec<String> {
         .filter(|arg| !arg.is_empty())
         .map(|arg| String::from_utf8_lossy(arg).into_owned())
         .collect()
+}
+
+/// The session a `claude --fork-session --resume <id or transcript>` process
+/// continues from.
+fn fork_parent(args: &[String]) -> Option<String> {
+    if !args.iter().any(|a| a == "--fork-session") {
+        return None;
+    }
+    let i = args.iter().position(|a| a == "--resume" || a == "-r")?;
+    let value = args.get(i + 1)?;
+    let id = value.rsplit('/').next()?.trim_end_matches(".jsonl");
+    let uuid = id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    uuid.then(|| id.to_owned())
 }
 
 /// A readable program name: the Nix package of the program (or of the
@@ -356,6 +380,23 @@ mod tests {
         );
         assert_eq!(display_name("cargo", &args(&["cargo", "build"])), "cargo");
         assert_eq!(display_name(".foo-wrapped", &[]), "foo");
+    }
+
+    #[test]
+    fn finds_the_forked_session() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            fork_parent(&args(&[
+                ".claude-wrapped",
+                "--session-id",
+                "5175e184-971a-4662-b207-6bf37c73bd66",
+                "--fork-session",
+                "--resume",
+                "/home/u/.claude/projects/x/bd459acf-f32e-4e9b-9a8e-ef2ee7758fca.jsonl",
+            ])),
+            Some("bd459acf-f32e-4e9b-9a8e-ef2ee7758fca".into())
+        );
+        assert_eq!(fork_parent(&args(&["claude", "--resume", "abc"])), None);
     }
 
     #[test]

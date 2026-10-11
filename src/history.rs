@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Activity, Session};
+use crate::model::{Activity, Kind, Session};
 
 #[derive(Debug, Serialize)]
 pub struct History {
@@ -34,6 +34,8 @@ pub struct Lane {
     pub label: String,
     pub cwd: String,
     pub live: bool,
+    /// Started by Claude or `claude --bg`; its finished time is not a wait on you.
+    pub background: bool,
     /// `[from, to, activity]`; time spent gone is not drawn.
     pub segments: Vec<(i64, i64, Activity)>,
 }
@@ -57,9 +59,14 @@ struct Row {
     cwd: String,
     name: Option<String>,
     title: Option<String>,
+    kind: String,
     started_at: i64,
     ended_at: Option<i64>,
 }
+
+/// Sessions shorter than this that never worked (e.g. the `--resume` picker)
+/// are left out.
+const TRIVIAL_MS: i64 = 30_000;
 
 pub fn history(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Result<History> {
     let lanes = lanes(conn, since, now, live)?;
@@ -101,8 +108,18 @@ pub fn lanes(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Resul
             (None, Some(ended)) => ended,
             (None, None) => events.last().map_or(row.started_at, |(ts, _)| *ts),
         };
-        let segments = segments(row.started_at.max(since), end, initial, &events);
-        if segments.is_empty() {
+        let trivial = row.started_at >= since
+            && row
+                .ended_at
+                .is_some_and(|ended| ended - row.started_at < TRIVIAL_MS)
+            && initial != Activity::Working
+            && !events.iter().any(|(_, t)| t.to == Activity::Working);
+        let background = current.map_or(row.kind == "background", |s| s.kind == Kind::Background);
+        let mut segments = segments(row.started_at.max(since), end, initial, &events);
+        if background {
+            finished_is_idle(&mut segments);
+        }
+        if segments.is_empty() || trivial {
             continue;
         }
         let label = current
@@ -115,6 +132,7 @@ pub fn lanes(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Resul
             label,
             cwd: row.cwd,
             live: current.is_some(),
+            background,
             segments,
         });
     }
@@ -161,9 +179,25 @@ pub fn segments(
     out
 }
 
+/// Background sessions wait for their parent, not for you.
+fn finished_is_idle(segments: &mut Vec<(i64, i64, Activity)>) {
+    let mut merged: Vec<(i64, i64, Activity)> = Vec::with_capacity(segments.len());
+    for &(from, to, activity) in segments.iter() {
+        let activity = match activity {
+            Activity::YourTurn => Activity::Idle,
+            other => other,
+        };
+        match merged.last_mut() {
+            Some(last) if last.2 == activity && last.1 == from => last.1 = to,
+            _ => merged.push((from, to, activity)),
+        }
+    }
+    *segments = merged;
+}
+
 fn sessions_overlapping(conn: &Connection, since: i64) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, cwd, name, title, started_at, ended_at FROM sessions
+        "SELECT id, cwd, name, title, kind, started_at, ended_at FROM sessions
             WHERE ended_at IS NULL OR ended_at >= ?1",
     )?;
     let rows = stmt.query_map([since], |r| {
@@ -172,8 +206,9 @@ fn sessions_overlapping(conn: &Connection, since: i64) -> Result<Vec<Row>> {
             cwd: r.get(1)?,
             name: r.get(2)?,
             title: r.get(3)?,
-            started_at: r.get(4)?,
-            ended_at: r.get(5)?,
+            kind: r.get(4)?,
+            started_at: r.get(5)?,
+            ended_at: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -299,6 +334,30 @@ mod tests {
             ]
         );
         assert_eq!(h.lanes[0].label, "title a");
+    }
+
+    #[test]
+    fn background_sessions_never_wait_on_you() {
+        let conn = db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('bg', 'h', '/w', NULL, 't', 'background', 0, 500)",
+            [],
+        )
+        .unwrap();
+        transition(&conn, "bg", 0, "idle", "working");
+        transition(&conn, "bg", 100, "working", "your_turn");
+        transition(&conn, "bg", 500, "your_turn", "gone");
+        // A 1 s session that never worked, like the resume picker.
+        session(&conn, "stub", 600, Some(1600));
+        transition(&conn, "stub", 1600, "idle", "gone");
+
+        let h = history(&conn, 0, 2_000, &[]).unwrap();
+        assert_eq!(h.lanes.len(), 1);
+        assert!(h.lanes[0].background);
+        assert_eq!(
+            h.lanes[0].segments,
+            vec![(0, 100, Activity::Working), (100, 500, Activity::Idle)]
+        );
     }
 
     #[test]

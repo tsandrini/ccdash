@@ -11,6 +11,7 @@ const ACTIVITY = {
   working: { label: "Working", rank: 2 },
   idle: { label: "Idle", rank: 3 },
   gone: { label: "Ended", rank: 4 },
+  finished: { label: "Finished", rank: 5 },
 };
 const STATES = ["working", "permission", "your_turn"];
 
@@ -147,6 +148,25 @@ function place(cwd) {
 }
 
 const label = (s) => s.title || s.name || s.id.slice(0, 8);
+const isAgent = (s) => s.kind === "background";
+
+/** Background sessions answer to their parent, so a done turn is "finished". */
+const shown = (s) =>
+  isAgent(s) && s.activity === "your_turn" ? "finished" : s.activity;
+
+/** State color for bars: finished agents read as idle. */
+const barActivity = (s) => (shown(s) === "finished" ? "idle" : s.activity);
+
+const children = (s) =>
+  [...state.sessions.values()].filter(
+    (c) => c.parent === s.id && isAgent(c) && c.activity !== "gone",
+  );
+
+/** Short-lived sessions that never worked (the `--resume` picker). */
+const stub = (s) =>
+  s.activity === "gone" &&
+  !s.prompt &&
+  s.activity_since - s.started_at < 30_000;
 
 /** Rough plain text of a markdown reply, for one-line previews. */
 function plain(text) {
@@ -358,12 +378,19 @@ function byAttention(a, b) {
 
 function renderSessions() {
   $("#host").textContent = state.host;
-  const all = [...state.sessions.values()].sort(byAttention);
+  const all = [...state.sessions.values()]
+    .filter((s) => !stub(s))
+    .sort(byAttention);
+  const mine = all.filter((s) => !isAgent(s));
+  const agents = all.filter(isAgent);
   const needs = all.filter(
-    (s) => s.activity === "permission" || s.activity === "your_turn",
+    (s) => s.activity === "permission" || shown(s) === "your_turn",
   );
-  const working = all.filter((s) => s.activity === "working");
-  const idle = all.filter((s) => s.activity === "idle");
+  const working = mine.filter((s) => s.activity === "working");
+  const idle = mine.filter((s) => s.activity === "idle");
+  const running = agents.filter(
+    (s) => s.activity !== "gone" && s.activity !== "permission",
+  );
   const gone = all.filter((s) => s.activity === "gone");
 
   $("#hero-value").textContent = needs.length;
@@ -376,9 +403,15 @@ function renderSessions() {
       : "";
   $("#hero-sub").className = "hero-sub muted";
 
+  const busyAgents = agents.filter((s) => s.activity === "working").length;
   $("#tiles").replaceChildren(
     countTile("Working", working.length),
     countTile("Idle", idle.length),
+    countTile(
+      "Background agents",
+      running.length,
+      running.length ? `${busyAgents} working` : null,
+    ),
     limitTile("5-hour limit", state.rateLimits?.five_hour),
     limitTile("7-day limit", state.rateLimits?.seven_day),
   );
@@ -404,6 +437,16 @@ function renderSessions() {
   if (needs.length) groups.push(group("Needs you", needs));
   if (working.length) groups.push(group("Working", working));
   if (idle.length) groups.push(group("Idle", idle));
+  if (running.length) {
+    groups.push(
+      group(
+        "Background agents",
+        running,
+        false,
+        "Started by Claude or with claude --bg; they report to the session that started them.",
+      ),
+    );
+  }
   if (gone.length) groups.push(group("Ended", gone, true));
   $("#groups").replaceChildren(...groups);
 }
@@ -416,12 +459,13 @@ const legendChip = (activity) =>
     ACTIVITY[activity].label,
   );
 
-function countTile(name, value) {
+function countTile(name, value, sub = null) {
   return h(
     "div",
     { class: "tile" },
     h("div", { class: "tile-label", text: name }),
     h("div", { class: "tile-value", text: value }),
+    sub ? h("div", { class: "tile-sub", text: sub }) : null,
   );
 }
 
@@ -472,8 +516,13 @@ function meterFill(pct) {
   return fill;
 }
 
-function group(title, sessions, collapsed = false) {
-  const cards = h("div", { class: "cards" }, sessions.map(card));
+function group(title, sessions, collapsed = false, note = null) {
+  const cards = h(
+    "div",
+    { class: "cards" },
+    note ? h("p", { class: "group-note muted", text: note }) : null,
+    sessions.map(card),
+  );
   if (collapsed) {
     return h(
       "details",
@@ -512,29 +561,28 @@ const clock = (since) =>
   });
 
 function card(s) {
-  const where = [
-    place(s.cwd),
-    s.model,
-    s.kind === "background" ? `bg ${s.short_id}` : null,
-  ]
+  const where = [place(s.cwd), s.model, isAgent(s) ? `bg ${s.short_id}` : null]
     .filter(Boolean)
     .join(" · ");
   return h(
     "button",
     {
-      class: "session",
+      class: isAgent(s) ? "session session-agent" : "session",
       type: "button",
-      "data-activity": s.activity,
+      "data-activity": shown(s),
       onclick: () => openDetail(s.id),
     },
     h(
       "span",
       { class: "session-top" },
-      badge(s.activity),
+      badge(shown(s)),
       clock(s.activity_since),
     ),
     h("span", { class: "session-title", text: label(s) }),
     h("span", { class: "session-where", title: s.cwd, text: where }),
+    isAgent(s)
+      ? h("span", { class: "session-parent", text: parentText(s) })
+      : null,
     s.hooked || s.activity === "gone"
       ? [focusLines(s), taskBar(s.tasks), cardProgress(s), cardMeta(s)]
       : h("span", {
@@ -622,10 +670,18 @@ function turnFacts(s) {
   ];
 }
 
+function parentText(s) {
+  if (!s.parent) return "Background session";
+  const parent = state.sessions.get(s.parent);
+  return `Started by ${parent ? label(parent) : `session ${s.parent.slice(0, 8)}`}`;
+}
+
 function cardProgress(s) {
+  const agents = children(s).length;
   const items = [
     ...(s.activity === "gone" ? [] : turnFacts(s)),
     s.subagents.length ? plural(s.subagents.length, "subagent") : null,
+    agents ? plural(agents, "background agent") : null,
   ].filter(Boolean);
   return items.length
     ? h("span", { class: "session-meta" }, joined(items))
@@ -670,8 +726,8 @@ function strip(s) {
     while (segs.length && segs.at(-1)[0] >= from) segs.pop();
     const last = segs.at(-1);
     if (last) last[1] = Math.min(last[1], from);
-    if (last && last[2] === s.activity) last[1] = t1;
-    else segs.push([from, t1, s.activity]);
+    if (last && last[2] === barActivity(s)) last[1] = t1;
+    else segs.push([from, t1, barActivity(s)]);
   }
   const bar = h("span", { class: "strip", "aria-hidden": "true" });
   for (const [a, b, activity] of segs) {
@@ -773,11 +829,12 @@ function renderDetailHead() {
     h(
       "div",
       { class: "session-top" },
-      badge(s.activity),
+      badge(shown(s)),
       clock(s.activity_since),
     ),
     h("h2", { id: "detail-title", text: label(s) }),
     h("div", { class: "session-where", title: s.cwd, text: s.cwd }),
+    isAgent(s) ? parentLink(s) : null,
     h(
       "div",
       { class: "detail-bar" },
@@ -883,6 +940,44 @@ function openRunningSteps(body, s) {
   if (!last || state.autoOpened.has(last.dataset.key)) return;
   state.autoOpened.add(last.dataset.key);
   last.open = true;
+}
+
+function parentLink(s) {
+  const parent = s.parent && state.sessions.get(s.parent);
+  if (!parent)
+    return h("div", { class: "session-parent", text: parentText(s) });
+  return h(
+    "div",
+    { class: "session-parent" },
+    "Started by ",
+    h("button", {
+      class: "link-btn",
+      type: "button",
+      text: label(parent),
+      onclick: () => openDetail(parent.id),
+    }),
+  );
+}
+
+function agentList(list) {
+  return h(
+    "ul",
+    { class: "agents" },
+    list.map((c) =>
+      h(
+        "li",
+        {},
+        h("button", {
+          class: "link-btn",
+          type: "button",
+          text: label(c),
+          onclick: () => openDetail(c.id),
+        }),
+        badge(shown(c)),
+        clock(c.activity_since),
+      ),
+    ),
+  );
 }
 
 function unhookedNote(s) {
@@ -1386,6 +1481,13 @@ function detailsTab(s, stats) {
         ),
       );
     }
+  }
+  const agents = children(s);
+  if (agents.length) {
+    out.push(
+      h("h3", { text: `Background agents (${agents.length})` }),
+      agentList(agents),
+    );
   }
   if (s.subagents.length) {
     out.push(
@@ -2090,7 +2192,10 @@ function timelineChart(data) {
         class: "lane-label",
         x: pad.left,
         y: top + 13,
-        text: ellipsize(`${lane.label} · ${place(lane.cwd)}`, maxChars),
+        text: ellipsize(
+          `${lane.background ? "bg · " : ""}${lane.label} · ${place(lane.cwd)}`,
+          maxChars,
+        ),
       }),
     );
     for (const [from, to, activity] of lane.segments) {

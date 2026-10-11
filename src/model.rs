@@ -147,6 +147,8 @@ pub struct Session {
     /// Background session id as shown by `claude agents`.
     pub short_id: Option<String>,
     pub kind: Kind,
+    /// Session that started this one (a fork, or `claude --bg` run by Claude).
+    pub parent: Option<String>,
     pub pid: Option<u32>,
     pub cwd: String,
     /// Name from `claude agents`.

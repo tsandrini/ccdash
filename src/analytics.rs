@@ -198,8 +198,9 @@ fn split_days(clock: &Clock, from: i64, to: i64, mut add: impl FnMut(usize, i64)
 /// before a switch back to `working`.
 fn response_times(conn: &Connection, since: i64) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT session, ts, data FROM events WHERE kind = 'activity' AND ts >= ?1
-            ORDER BY ts, rowid",
+        "SELECT e.session, e.ts, e.data FROM events e LEFT JOIN sessions x ON x.id = e.session
+            WHERE e.kind = 'activity' AND e.ts >= ?1 AND coalesce(x.kind, '') != 'background'
+            ORDER BY e.ts, e.rowid",
     )?;
     let rows = stmt.query_map([since], |r| {
         Ok((

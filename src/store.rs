@@ -1,6 +1,8 @@
 //! SQLite history: events, statusline samples, and one row per session.
 
 use std::{
+    fs::{self, OpenOptions, Permissions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
@@ -14,6 +16,7 @@ use tracing::warn;
 
 use crate::{
     model::{Kind, Stamped, Turn},
+    paths,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
     util::{now_ms, truncate},
 };
@@ -104,8 +107,12 @@ impl Store {
     /// Opens (creating if needed) the database and starts the writer thread.
     pub fn open(path: &Path, host: String, retention_days: u32) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            fs::create_dir_all(dir)?;
+            if dir == paths::state_dir() {
+                fs::set_permissions(dir, Permissions::from_mode(0o700))?;
+            }
         }
+        make_private(path)?;
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -245,6 +252,24 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
         [cutoff],
     )?;
+    Ok(())
+}
+
+/// The database holds prompts and replies: owner-only. SQLite gives the
+/// `-wal`/`-shm` files it creates the database file's mode.
+fn make_private(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    for suffix in ["", "-wal", "-shm"] {
+        let file = PathBuf::from(format!("{}{suffix}", path.display()));
+        if file.exists() {
+            fs::set_permissions(&file, Permissions::from_mode(0o600))?;
+        }
+    }
     Ok(())
 }
 
@@ -426,6 +451,8 @@ mod tests {
             });
         }
 
+        let mode = fs::metadata(dir.join("t.db")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         let reader = store.reader().unwrap();
         let mut saved = Restored::default();
         for _ in 0..100 {
