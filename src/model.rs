@@ -95,6 +95,31 @@ pub struct Subagent {
     pub tool: Option<ToolRun>,
 }
 
+/// CPU and memory of a session's process tree (Claude, its MCP servers and
+/// running commands).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Resources {
+    /// Percent of one core since the previous poll.
+    pub cpu_pct: f64,
+    /// Proportional set size of the tree: shared pages are split between the
+    /// processes that map them, so sessions add up.
+    pub mem_bytes: u64,
+    pub procs: u32,
+    /// Busiest processes of the tree, Claude itself included.
+    pub top: Vec<ProcInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub name: String,
+    /// Command line, shortened and with obvious secrets masked.
+    pub cmd: String,
+    pub cpu_pct: f64,
+    pub mem_bytes: u64,
+    pub started_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
     pub id: u64,
@@ -132,8 +157,12 @@ pub struct Session {
     pub activity_since: i64,
     pub waiting_for: Option<String>,
     pub tool: Option<ToolRun>,
+    /// Start of the last prompt; the full text is in the conversation.
     pub prompt: Option<Stamped>,
+    /// Start of Claude's last final reply.
     pub reply: Option<Stamped>,
+    /// End of what Claude is saying in the current turn, as it streams.
+    pub message: Option<Stamped>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
@@ -146,6 +175,7 @@ pub struct Session {
     /// Hooks or the statusline have reported; false for sessions started
     /// before ccdash was installed, which only the agents poll sees.
     pub hooked: bool,
+    pub resources: Option<Resources>,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,
     pub subagents: Vec<Subagent>,

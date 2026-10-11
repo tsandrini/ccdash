@@ -30,6 +30,37 @@ pub struct Exchange {
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
     pub omitted: u32,
+    /// Index and text of the newest `Message`, to drop it when the turn's
+    /// reply repeats it.
+    #[serde(skip)]
+    last_message: Option<(usize, String)>,
+}
+
+impl Exchange {
+    fn new(at: i64, prompt: Option<String>) -> Self {
+        Self {
+            at,
+            prompt,
+            items: Vec::new(),
+            omitted: 0,
+            last_message: None,
+        }
+    }
+
+    fn push(&mut self, kind: &str, data: &Value, item: Item) {
+        match kind {
+            "message" => self.last_message = Some((self.items.len(), text(data, "text"))),
+            "reply" => {
+                if let Some((i, said)) = self.last_message.take()
+                    && same_text(&said, &text(data, "text"))
+                {
+                    self.items.remove(i);
+                }
+            }
+            _ => {}
+        }
+        self.items.push(item);
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -46,6 +77,11 @@ pub enum Item {
         at: i64,
         tool: String,
         summary: String,
+    },
+    /// Text Claude wrote during a turn (between tool calls).
+    Message {
+        at: i64,
+        html: String,
     },
     Reply {
         at: i64,
@@ -137,22 +173,15 @@ pub fn conversation(
         let (at, kind, data) = row?;
         let data: Value = serde_json::from_str(&data).unwrap_or_default();
         if kind == "prompt" {
-            exchanges.push(Exchange {
-                at,
-                prompt: Some(text(&data, "text")),
-                items: Vec::new(),
-                omitted: 0,
-            });
+            exchanges.push(Exchange::new(at, Some(text(&data, "text"))));
         } else if let Some(item) = item(at, &kind, &data) {
             if exchanges.is_empty() {
-                exchanges.push(Exchange {
-                    at,
-                    prompt: None,
-                    items: Vec::new(),
-                    omitted: 0,
-                });
+                exchanges.push(Exchange::new(at, None));
             }
-            exchanges.last_mut().expect("pushed above").items.push(item);
+            exchanges
+                .last_mut()
+                .expect("pushed above")
+                .push(&kind, &data, item);
         }
     }
     for exchange in &mut exchanges {
@@ -174,6 +203,10 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
             at,
             tool: text(data, "tool"),
             summary: text(data, "summary"),
+        },
+        "message" => Item::Message {
+            at,
+            html: markdown::render(&text(data, "text")),
         },
         "reply" => {
             let reply = text(data, "text");
@@ -219,6 +252,10 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
     })
 }
 
+fn same_text(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
 fn text(data: &Value, key: &str) -> String {
     data[key].as_str().unwrap_or_default().to_owned()
 }
@@ -238,6 +275,17 @@ fn cap_tools(exchange: &mut Exchange) {
         }
         true
     });
+}
+
+/// The session's process samples since `since`: `[ts, cpu %, memory bytes]`.
+pub fn resources(conn: &Connection, session: &str, since: i64) -> Result<Vec<(i64, f64, i64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts, cpu_pct, mem_bytes FROM proc_samples WHERE session = ?1 AND ts >= ?2 ORDER BY ts",
+    )?;
+    let rows = stmt.query_map(params![session, since], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Totals over the whole session; time in each activity runs from
@@ -403,6 +451,34 @@ mod tests {
         assert!(!older.more);
         assert_eq!(older.exchanges.len(), 2);
         assert_eq!(older.exchanges[1].prompt.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn messages_between_tools_and_no_duplicate_reply() {
+        use serde_json::json;
+        let conn = db();
+        event(&conn, 1, "prompt", json!({"text": "go"}));
+        event(&conn, 2, "message", json!({"text": "Let me look."}));
+        event(
+            &conn,
+            3,
+            "tool",
+            json!({"name": "Read", "summary": "a", "ok": true}),
+        );
+        event(&conn, 4, "message", json!({"text": "All  done.\n"}));
+        event(&conn, 5, "reply", json!({"text": "All done."}));
+        let c = conversation(&conn, "s", None, 10).unwrap();
+        let kinds: Vec<&str> = c.exchanges[0]
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::Message { .. } => "message",
+                Item::Tool { .. } => "tool",
+                Item::Reply { .. } => "reply",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["message", "tool", "reply"]);
     }
 
     #[test]

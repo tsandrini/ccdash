@@ -30,6 +30,7 @@ use tracing::warn;
 
 use super::web;
 use crate::{
+    analytics::{self, Analytics},
     config::Config,
     conversation,
     history::{self, History},
@@ -41,6 +42,7 @@ use crate::{
 };
 
 const DAY_MS: i64 = 86_400_000;
+const HOUR_MS: i64 = 3_600_000;
 
 #[derive(Clone)]
 struct App {
@@ -53,6 +55,7 @@ pub async fn serve(listener: TcpListener, hub: Hub, store: Store, token: Arc<Str
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
         .route("/history", get(history))
+        .route("/analytics", get(analytics))
         .route("/stream", get(stream))
         .layer(middleware::from_fn_with_state(token, auth));
     let app = Router::new()
@@ -144,14 +147,17 @@ async fn session(
         _ => now_ms(),
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
-    let (conversation, stats) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let (conversation, stats, resources) = tokio::task::spawn_blocking(move || -> Result<_> {
         let conn = store.reader()?;
         let conversation = conversation::conversation(&conn, &session_id, query.before, limit)?;
-        let stats = match query.before {
-            None => Some(conversation::stats(&conn, &session_id, started_at, end)?),
-            Some(_) => None,
+        let (stats, resources) = match query.before {
+            None => (
+                Some(conversation::stats(&conn, &session_id, started_at, end)?),
+                Some(conversation::resources(&conn, &session_id, end - HOUR_MS)?),
+            ),
+            Some(_) => (None, None),
         };
-        Ok((conversation, stats))
+        Ok((conversation, stats, resources))
     })
     .await
     .map_err(anyhow::Error::from)??;
@@ -159,6 +165,7 @@ async fn session(
         "session": session,
         "conversation": conversation,
         "stats": stats,
+        "resources": resources,
     })))
 }
 
@@ -183,6 +190,33 @@ async fn history(
             .await
             .map_err(anyhow::Error::from)??;
     Ok(Json(history))
+}
+
+#[derive(Deserialize)]
+struct AnalyticsQuery {
+    since: Option<i64>,
+    /// Viewer's offset from UTC in minutes (east positive), for day buckets.
+    tz: Option<i64>,
+}
+
+async fn analytics(
+    State(app): State<App>,
+    Query(query): Query<AnalyticsQuery>,
+) -> Result<Json<Analytics>, ApiError> {
+    let now = now_ms();
+    let since = query
+        .since
+        .unwrap_or(now - 7 * DAY_MS)
+        .clamp(now - 31 * DAY_MS, now);
+    let tz = query.tz.unwrap_or(0).clamp(-14 * 60, 14 * 60);
+    let live = app.hub.snapshot().await?.sessions;
+    let store = app.store.clone();
+    let analytics = tokio::task::spawn_blocking(move || {
+        analytics::analytics(&store.reader()?, since, now, tz, &live)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(analytics))
 }
 
 async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {

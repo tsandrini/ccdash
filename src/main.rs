@@ -1,5 +1,6 @@
 mod actions;
 mod agents;
+mod analytics;
 mod api;
 mod client;
 mod config;
@@ -12,6 +13,7 @@ mod markdown;
 mod model;
 mod niri;
 mod paths;
+mod procs;
 mod state;
 mod store;
 mod util;

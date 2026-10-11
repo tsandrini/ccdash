@@ -37,6 +37,9 @@
         <button role="tab" data-view="history" aria-selected="false">
           History
         </button>
+        <button role="tab" data-view="analytics" aria-selected="false">
+          Analytics
+        </button>
       </nav>
       <div class="conn" id="conn" data-state="connecting" role="status">
         <span class="conn-dot"></span><span class="conn-label">connecting</span>
@@ -82,6 +85,26 @@
           </button>
         </div>
         <div id="history"></div>
+      </section>
+
+      <section class="view" id="view-analytics" hidden>
+        <div
+          class="filters"
+          role="radiogroup"
+          aria-label="Analytics range"
+          id="analytics-range"
+        >
+          <button role="radio" data-analytics-range="7d" aria-checked="true">
+            7 days
+          </button>
+          <button role="radio" data-analytics-range="14d" aria-checked="false">
+            14 days
+          </button>
+          <button role="radio" data-analytics-range="30d" aria-checked="false">
+            30 days
+          </button>
+        </div>
+        <div id="analytics"></div>
       </section>
     </main>
 

@@ -62,6 +62,26 @@ struct Row {
 }
 
 pub fn history(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Result<History> {
+    let lanes = lanes(conn, since, now, live)?;
+    let bucket_ms = ((now - since) / 288).max(60_000);
+    Ok(History {
+        since,
+        now,
+        bucket_ms,
+        lanes,
+        usage: usage(conn, since, bucket_ms)?,
+        cost_usd: cost(conn, since)?,
+        prompts: conn.query_row(
+            "SELECT count(*) FROM events WHERE kind = 'prompt' AND ts >= ?1",
+            [since],
+            |r| r.get(0),
+        )?,
+        tools: tools(conn, since)?,
+    })
+}
+
+/// One lane per session active in `since..now`, ordered by first activity.
+pub fn lanes(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Result<Vec<Lane>> {
     let live: HashMap<&str, &Session> = live.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut transitions = transitions_since(conn, since)?;
     let mut lanes = Vec::new();
@@ -99,21 +119,7 @@ pub fn history(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Res
         });
     }
     lanes.sort_by_key(|lane| lane.segments[0].0);
-    let bucket_ms = ((now - since) / 288).max(60_000);
-    Ok(History {
-        since,
-        now,
-        bucket_ms,
-        lanes,
-        usage: usage(conn, since, bucket_ms)?,
-        cost_usd: cost(conn, since)?,
-        prompts: conn.query_row(
-            "SELECT count(*) FROM events WHERE kind = 'prompt' AND ts >= ?1",
-            [since],
-            |r| r.get(0),
-        )?,
-        tools: tools(conn, since)?,
-    })
+    Ok(lanes)
 }
 
 fn tools(conn: &Connection, since: i64) -> Result<Vec<ToolCount>> {
@@ -307,7 +313,8 @@ mod tests {
             (190, "new", 0.4, 13.0),
         ] {
             conn.execute(
-                "INSERT INTO samples VALUES (?1, 'h', ?2, NULL, ?3, ?4, 30.0)",
+                "INSERT INTO samples (ts, host, session, cost_usd, five_hour, seven_day)
+                    VALUES (?1, 'h', ?2, ?3, ?4, 30.0)",
                 params![ts, session, cost, five],
             )
             .unwrap();

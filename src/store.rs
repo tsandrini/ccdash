@@ -14,8 +14,8 @@ use tracing::warn;
 
 use crate::{
     model::{Kind, Stamped, Turn},
-    state::{Restored, StoreMsg, apply_task},
-    util::now_ms,
+    state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
+    util::{now_ms, truncate},
 };
 
 pub(crate) const SCHEMA: &str = "
@@ -35,9 +35,22 @@ CREATE TABLE IF NOT EXISTS samples (
     context_pct REAL,
     cost_usd REAL,
     five_hour REAL,
-    seven_day REAL
+    seven_day REAL,
+    model TEXT,
+    lines_added INTEGER,
+    lines_removed INTEGER
 );
 CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);
+CREATE TABLE IF NOT EXISTS proc_samples (
+    ts INTEGER NOT NULL,
+    host TEXT NOT NULL,
+    session TEXT NOT NULL,
+    cpu_pct REAL NOT NULL,
+    mem_bytes INTEGER NOT NULL,
+    procs INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS proc_samples_ts ON proc_samples (ts);
+CREATE INDEX IF NOT EXISTS proc_samples_session_ts ON proc_samples (session, ts);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     host TEXT NOT NULL,
@@ -51,9 +64,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 ";
 
 const INSERT_SAMPLE: &str = "
-INSERT INTO samples (ts, host, session, context_pct, cost_usd, five_hour, seven_day)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+INSERT INTO samples (ts, host, session, context_pct, cost_usd, five_hour, seven_day, model,
+    lines_added, lines_removed)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ";
+
+const INSERT_PROC_SAMPLE: &str = "
+INSERT INTO proc_samples (ts, host, session, cpu_pct, mem_bytes, procs)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+";
+
+/// Columns added after the first release, appended in this order.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("samples", "model", "TEXT"),
+    ("samples", "lines_added", "INTEGER"),
+    ("samples", "lines_removed", "INTEGER"),
+];
 
 const UPSERT_SESSION: &str = "
 INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at)
@@ -84,6 +110,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         let (tx, rx) = mpsc::channel();
         let retention_ms = i64::from(retention_days) * 86_400_000;
         thread::Builder::new()
@@ -144,8 +171,11 @@ fn write_batch(conn: &mut Connection, host: &str, batch: &[StoreMsg]) -> Result<
             StoreMsg::Sample {
                 ts,
                 session,
+                model,
                 context_pct,
                 cost_usd,
+                lines_added,
+                lines_removed,
                 five_hour,
                 seven_day,
             } => {
@@ -158,8 +188,23 @@ fn write_batch(conn: &mut Connection, host: &str, batch: &[StoreMsg]) -> Result<
                         context_pct,
                         cost_usd,
                         five_hour,
-                        seven_day
+                        seven_day,
+                        model,
+                        lines_added.map(|n| n as i64),
+                        lines_removed.map(|n| n as i64),
                     ],
+                )?;
+            }
+            StoreMsg::ProcSample {
+                ts,
+                session,
+                cpu_pct,
+                mem_bytes,
+                procs,
+            } => {
+                tx.execute(
+                    INSERT_PROC_SAMPLE,
+                    params![ts, host, session, cpu_pct, *mem_bytes as i64, procs],
                 )?;
             }
             StoreMsg::Session {
@@ -194,11 +239,26 @@ fn write_batch(conn: &mut Connection, host: &str, batch: &[StoreMsg]) -> Result<
 fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
     conn.execute("DELETE FROM events WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
+    conn.execute("DELETE FROM proc_samples WHERE ts < ?1", [cutoff])?;
     conn.execute(
         "DELETE FROM sessions WHERE started_at < ?1
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
         [cutoff],
     )?;
+    Ok(())
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, kind) in ADDED_COLUMNS {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            [table, column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -224,7 +284,7 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             let data: Value = serde_json::from_str(&data).ok()?;
             Some(Stamped {
                 at,
-                text: data.get("text")?.as_str()?.to_owned(),
+                text: truncate(data.get("text")?.as_str()?, PREVIEW_LEN),
             })
         }))
     };

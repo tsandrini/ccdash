@@ -31,9 +31,29 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// Keeps the last `max` bytes of `s` on a char boundary, marking the cut with `…`.
+pub fn tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut start = s.len() - max.saturating_sub('…'.len_utf8());
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_respects_char_boundaries() {
+        assert_eq!(tail("short", 10), "short");
+        let cut = tail("příliš žluťoučký kůň", 10);
+        assert!(cut.len() <= 10);
+        assert!(cut.starts_with('…') && cut.ends_with("kůň"));
+    }
 
     #[test]
     fn truncate_respects_char_boundaries() {

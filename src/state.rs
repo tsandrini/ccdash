@@ -7,10 +7,10 @@ use serde_json::{Value, json};
 
 use crate::{
     model::{
-        Activity, Kind, Limit, RateLimits, Session, Snapshot, Stamped, Subagent, Task, TaskStatus,
-        ToolRun, Turn, WindowRef,
+        Activity, Kind, Limit, ProcInfo, RateLimits, Resources, Session, Snapshot, Stamped,
+        Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
     },
-    util::{pid_alive, truncate},
+    util::{pid_alive, tail, truncate},
     wire::{Envelope, Source},
 };
 
@@ -27,6 +27,12 @@ const MAX_SUBAGENTS: usize = 32;
 const MAX_PENDING_AGENTS: usize = 8;
 const MAX_TASKS: usize = 100;
 const MAX_TASK_FORMS: usize = 64;
+/// Prompt and reply text kept on the live session; full text lives in events.
+pub const PREVIEW_LEN: usize = 1200;
+const MESSAGE_TAIL: usize = 800;
+const MESSAGE_MAX: usize = 32 * 1024;
+const MAX_STREAMS: usize = 8;
+const PROC_SAMPLE_EVERY_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -78,10 +84,21 @@ pub enum StoreMsg {
     Sample {
         ts: i64,
         session: String,
+        model: Option<String>,
         context_pct: Option<f64>,
         cost_usd: Option<f64>,
+        lines_added: Option<u64>,
+        lines_removed: Option<u64>,
         five_hour: Option<f64>,
         seven_day: Option<f64>,
+    },
+    /// Process tree usage, averaged (CPU) or peaked (memory) over a minute.
+    ProcSample {
+        ts: i64,
+        session: String,
+        cpu_pct: f64,
+        mem_bytes: u64,
+        procs: u32,
     },
     Session {
         id: String,
@@ -128,6 +145,29 @@ struct Aux {
     pending_agents: Vec<(String, Option<String>)>,
     /// TaskCreate `activeForm` by subject, until the task id is known.
     task_forms: HashMap<String, String>,
+    /// Text of assistant messages still streaming, by `message_id`.
+    streams: HashMap<String, String>,
+    proc_window: Option<ProcWindow>,
+}
+
+/// Process samples collected since the last stored one.
+#[derive(Debug)]
+struct ProcWindow {
+    since: i64,
+    cpu_sum: f64,
+    polls: u32,
+    mem_max: u64,
+    procs_max: u32,
+}
+
+/// One poll of a session's process tree.
+#[derive(Debug, Clone)]
+pub struct ProcPoll {
+    pub session: String,
+    pub cpu_pct: f64,
+    pub mem_bytes: u64,
+    pub procs: u32,
+    pub top: Vec<ProcInfo>,
 }
 
 pub struct State {
@@ -272,8 +312,9 @@ impl State {
                 let text = str_of(p, "prompt").unwrap_or_default();
                 s.prompt = Some(Stamped {
                     at: ts,
-                    text: text.to_owned(),
+                    text: truncate(text, PREVIEW_LEN),
                 });
+                s.message = None;
                 s.tool = None;
                 s.waiting_for = None;
                 s.turn = Some(Turn {
@@ -422,7 +463,7 @@ impl State {
                 if !text.is_empty() {
                     s.reply = Some(Stamped {
                         at: ts,
-                        text: text.to_owned(),
+                        text: truncate(text, PREVIEW_LEN),
                     });
                 }
                 s.tool = None;
@@ -500,6 +541,37 @@ impl State {
                     apply_and_record_task(s, &delta, ts, store);
                 }
             }
+            "MessageDisplay" => {
+                if agent_id.is_none()
+                    && let Some(message) = str_of(p, "message_id")
+                {
+                    let text = aux.streams.entry(message.to_owned()).or_default();
+                    if text.len() < MESSAGE_MAX {
+                        text.push_str(str_of(p, "delta").unwrap_or_default());
+                    }
+                    if !text.trim().is_empty() {
+                        s.message = Some(Stamped {
+                            at: ts,
+                            text: tail(text.trim(), MESSAGE_TAIL),
+                        });
+                    }
+                    if p.get("final").and_then(Value::as_bool) == Some(true) {
+                        let text = aux.streams.remove(message).unwrap_or_default();
+                        if !text.trim().is_empty() {
+                            record(
+                                store,
+                                ts,
+                                id,
+                                "message",
+                                json!({ "text": truncate(text.trim(), MESSAGE_MAX) }),
+                            );
+                        }
+                    }
+                    if aux.streams.len() > MAX_STREAMS {
+                        aux.streams.clear();
+                    }
+                }
+            }
             "PostCompact" => {
                 let summary = str_of(p, "compact_summary").unwrap_or_default();
                 record(
@@ -558,8 +630,8 @@ impl State {
         s.lines_removed = p
             .pointer("/cost/total_lines_removed")
             .and_then(Value::as_u64);
-        let context_pct = s.context_pct;
-        let cost_usd = s.cost_usd;
+        let (context_pct, cost_usd, model) = (s.context_pct, s.cost_usd, s.model.clone());
+        let (lines_added, lines_removed) = (s.lines_added, s.lines_removed);
 
         if let Some(limits) = parse_rate_limits(p, ts) {
             let changed = self.rate_limits.as_ref().is_none_or(|old| {
@@ -579,8 +651,11 @@ impl State {
             fx.store.push(StoreMsg::Sample {
                 ts,
                 session: id.to_owned(),
+                model,
                 context_pct,
                 cost_usd,
+                lines_added,
+                lines_removed,
                 five_hour: limits
                     .and_then(|l| l.five_hour.as_ref())
                     .map(|l| l.used_pct),
@@ -592,6 +667,71 @@ impl State {
         if title_changed {
             self.match_titles(fx);
         }
+    }
+
+    /// Applies one process poll; sessions missing from it lose their numbers.
+    pub fn resources(&mut self, polls: Vec<ProcPoll>, now: i64, fx: &mut Effects) {
+        let mut polled = HashSet::new();
+        for poll in polls {
+            let Some(s) = self.sessions.get_mut(&poll.session) else {
+                continue;
+            };
+            polled.insert(poll.session.clone());
+            let resources = Resources {
+                cpu_pct: poll.cpu_pct.round(),
+                mem_bytes: round_mib(poll.mem_bytes),
+                procs: poll.procs,
+                top: poll
+                    .top
+                    .into_iter()
+                    .map(|p| ProcInfo {
+                        cpu_pct: p.cpu_pct.round(),
+                        mem_bytes: round_mib(p.mem_bytes),
+                        ..p
+                    })
+                    .collect(),
+            };
+            if s.resources.as_ref() != Some(&resources) {
+                s.resources = Some(resources);
+                fx.touched.insert(poll.session.clone());
+            }
+            let aux = self.aux.entry(poll.session.clone()).or_default();
+            let window = aux.proc_window.get_or_insert(ProcWindow {
+                since: now,
+                cpu_sum: 0.0,
+                polls: 0,
+                mem_max: 0,
+                procs_max: 0,
+            });
+            window.cpu_sum += poll.cpu_pct;
+            window.polls += 1;
+            window.mem_max = window.mem_max.max(poll.mem_bytes);
+            window.procs_max = window.procs_max.max(poll.procs);
+            if now - window.since >= PROC_SAMPLE_EVERY_MS {
+                fx.store.push(StoreMsg::ProcSample {
+                    ts: now,
+                    session: poll.session,
+                    cpu_pct: window.cpu_sum / f64::from(window.polls),
+                    mem_bytes: window.mem_max,
+                    procs: window.procs_max,
+                });
+                aux.proc_window = None;
+            }
+        }
+        for s in self.sessions.values_mut() {
+            if !polled.contains(&s.id) && s.resources.take().is_some() {
+                fx.touched.insert(s.id.clone());
+            }
+        }
+    }
+
+    /// Live sessions with a known process.
+    pub fn pids(&self) -> Vec<(String, u32)> {
+        self.sessions
+            .values()
+            .filter(|s| s.activity != Activity::Gone)
+            .filter_map(|s| Some((s.id.clone(), s.pid?)))
+            .collect()
     }
 
     pub fn agents(&mut self, list: &[AgentEntry], now: i64, fx: &mut Effects) {
@@ -752,6 +892,7 @@ impl State {
             tool: None,
             prompt: None,
             reply: None,
+            message: None,
             model: None,
             effort: None,
             permission_mode: None,
@@ -762,6 +903,7 @@ impl State {
             remote_url: None,
             window: None,
             hooked: false,
+            resources: None,
             turn: None,
             tasks: Vec::new(),
             subagents: Vec::new(),
@@ -900,6 +1042,11 @@ impl State {
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+fn round_mib(bytes: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    (bytes + MIB / 2) / MIB * MIB
 }
 
 fn effort_of(v: &Value) -> Option<String> {
@@ -1753,6 +1900,91 @@ mod tests {
         assert!(st.resolve("11111111").is_some());
         assert!(st.resolve("11111111-2222").is_some());
         assert!(st.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn message_display_streams_and_records_whole_messages() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        let delta = |index: u32, text: &str, last: bool| json!({"turn_id": "t", "message_id": "m1", "index": index, "final": last, "delta": text});
+        let fx = hook(
+            &mut st,
+            2,
+            "MessageDisplay",
+            delta(0, "Let me check\n", false),
+        );
+        assert!(kinds(&fx).is_empty());
+        assert_eq!(session(&st).message.as_ref().unwrap().text, "Let me check");
+        let fx = hook(&mut st, 3, "MessageDisplay", delta(1, "the logs.", true));
+        let StoreMsg::Event { kind, data, .. } = &fx.store[0] else {
+            panic!()
+        };
+        assert_eq!(
+            (*kind, data["text"].as_str()),
+            ("message", Some("Let me check\nthe logs."))
+        );
+        assert_eq!(session(&st).activity, Activity::Working);
+
+        let fx = hook(
+            &mut st,
+            4,
+            "MessageDisplay",
+            json!({"agent_id": "a1", "message_id": "m2", "final": true, "delta": "sub"}),
+        );
+        assert!(kinds(&fx).is_empty(), "subagent text is not recorded");
+
+        hook(&mut st, 5, "UserPromptSubmit", json!({"prompt": "next"}));
+        assert!(session(&st).message.is_none());
+    }
+
+    #[test]
+    fn long_prompts_are_previews_on_the_session() {
+        let mut st = state();
+        let long = "x".repeat(PREVIEW_LEN * 3);
+        let fx = hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": long}));
+        assert!(session(&st).prompt.as_ref().unwrap().text.len() <= PREVIEW_LEN);
+        let stored = fx.store.iter().find_map(|m| match m {
+            StoreMsg::Event {
+                kind: "prompt",
+                data,
+                ..
+            } => data["text"].as_str(),
+            _ => None,
+        });
+        assert_eq!(stored.map(str::len), Some(PREVIEW_LEN * 3));
+    }
+
+    #[test]
+    fn resources_publish_and_sample_per_minute() {
+        let mut st = state();
+        hook(&mut st, 1, "SessionStart", json!({}));
+        let poll = |cpu: f64, rss: u64| ProcPoll {
+            session: SID.into(),
+            cpu_pct: cpu,
+            mem_bytes: rss,
+            procs: 2,
+            top: Vec::new(),
+        };
+        let mut fx = Effects::default();
+        st.resources(vec![poll(10.2, 300 << 20)], 1_000, &mut fx);
+        assert!(fx.touched.contains(SID));
+        assert!(fx.store.is_empty());
+        let r = session(&st).resources.clone().unwrap();
+        assert_eq!((r.cpu_pct, r.mem_bytes), (10.0, 300 << 20));
+
+        let mut fx = Effects::default();
+        st.resources(vec![poll(30.0, 400 << 20)], 61_000, &mut fx);
+        let Some(StoreMsg::ProcSample {
+            cpu_pct, mem_bytes, ..
+        }) = fx.store.first()
+        else {
+            panic!("expected a sample")
+        };
+        assert_eq!((*cpu_pct, *mem_bytes), (20.1, 400 << 20));
+
+        let mut fx = Effects::default();
+        st.resources(Vec::new(), 66_000, &mut fx);
+        assert!(session(&st).resources.is_none() && fx.touched.contains(SID));
     }
 
     #[test]

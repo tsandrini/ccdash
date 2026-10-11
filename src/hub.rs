@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::{
     model::{Session, Snapshot, Update},
-    state::{AgentEntry, Effects, NiriEvent, State},
+    state::{AgentEntry, Effects, NiriEvent, ProcPoll, State},
     store::{self, Store},
     util::now_ms,
     wire::Envelope,
@@ -19,6 +19,7 @@ pub enum Input {
     Envelope(Envelope),
     Agents(Vec<AgentEntry>, i64),
     Niri(NiriEvent),
+    Procs(Vec<ProcPoll>, i64),
     Tick(i64),
 }
 
@@ -26,6 +27,7 @@ pub enum Cmd {
     Input(Input),
     Snapshot(oneshot::Sender<Snapshot>),
     Resolve(String, oneshot::Sender<Option<Session>>),
+    Pids(oneshot::Sender<Vec<(String, u32)>>),
 }
 
 #[derive(Clone)]
@@ -64,6 +66,17 @@ impl Hub {
         rx.await.context("hub stopped")
     }
 
+    /// `(session id, pid)` of live sessions.
+    pub async fn pids(&self) -> Result<Vec<(String, u32)>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Pids(tx))
+            .await
+            .ok()
+            .context("hub stopped")?;
+        rx.await.context("hub stopped")
+    }
+
     pub async fn resolve(&self, key: &str) -> Result<Option<Session>> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -94,6 +107,10 @@ async fn run(
                 let _ = reply.send(state.resolve(&key).cloned());
                 continue;
             }
+            Cmd::Pids(reply) => {
+                let _ = reply.send(state.pids());
+                continue;
+            }
         };
 
         let mut fx = Effects::default();
@@ -101,6 +118,7 @@ async fn run(
             Input::Envelope(env) => state.apply(&env, &mut fx),
             Input::Agents(list, now) => state.agents(&list, now, &mut fx),
             Input::Niri(event) => state.niri(event, &mut fx),
+            Input::Procs(polls, now) => state.resources(polls, now, &mut fx),
             Input::Tick(now) => state.tick(now, &mut fx),
         }
         if let Some(conn) = &reader {

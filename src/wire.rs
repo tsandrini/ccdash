@@ -37,6 +37,7 @@ const LONG_KEYS: &[(&str, usize)] = &[
     ("last_assistant_message", 32 * 1024),
     ("prompt", 8 * 1024),
     ("compact_summary", 8 * 1024),
+    ("delta", 16 * 1024),
 ];
 const DEFAULT_LIMIT: usize = 2048;
 

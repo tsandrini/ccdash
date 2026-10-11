@@ -19,7 +19,7 @@ use crate::{
     api::{http, unix},
     config::Config,
     hub::{Cmd, Hub, Input},
-    niri, paths,
+    niri, paths, procs,
     state::State,
     store::Store,
     util::now_ms,
@@ -81,6 +81,12 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     ));
     if cfg.niri.enable {
         tokio::spawn(niri::run(hub.sender()));
+    }
+    if cfg.procs.enable {
+        tokio::spawn(procs::run(
+            hub.clone(),
+            Duration::from_secs(cfg.procs.interval_secs.max(1)),
+        ));
     }
     tokio::spawn(ticker(hub.sender()));
     info!("ccdash daemon up on {host}, sockets in {}", dir.display());

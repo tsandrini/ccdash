@@ -27,6 +27,10 @@ const state = {
   convo: null,
   range: "today",
   history: null,
+  aRange: "7d",
+  analytics: null,
+  /** Activity groups already opened automatically while a turn runs. */
+  autoOpened: new Set(),
 };
 
 // --- DOM helpers ------------------------------------------------------------
@@ -57,7 +61,7 @@ function setAttrs(el, attrs) {
 }
 
 function append(el, children) {
-  for (const child of children.flat()) {
+  for (const child of children.flat(Infinity)) {
     if (child === null || child === undefined || child === false) continue;
     el.append(
       child instanceof Node ? child : document.createTextNode(String(child)),
@@ -105,7 +109,36 @@ const fmtStamp = (ts) =>
     : `${dayFmt.format(ts)}, ${fmtTime(ts)}`;
 const fmtUsd = (usd) =>
   usd >= 100 ? `$${usd.toFixed(0)}` : `$${usd.toFixed(2)}`;
-const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+
+function fmtBytes(bytes) {
+  const gb = bytes / 2 ** 30;
+  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 0 : 1)} GB`;
+  return `${Math.round(bytes / 2 ** 20)} MB`;
+}
+
+const compact = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+/** Byte points rescaled to whole MB or GB for a readable axis. */
+function byteSeries(points) {
+  const peak = Math.max(0, ...points.map(([, v]) => v));
+  const [scale, unit] = peak >= 2 ** 30 ? [2 ** 30, "GB"] : [2 ** 20, "MB"];
+  return {
+    points: points.map(([t, v]) => [t, v / scale]),
+    fmt: (v) => `${Number(v.toFixed(2))} ${unit}`,
+    floorMax: unit === "GB" ? 1 : 256,
+  };
+}
+
+function fmtHours(ms) {
+  const hours = ms / 3_600_000;
+  return hours >= 10 || hours === 0
+    ? `${Math.round(hours)}h`
+    : `${hours.toFixed(1)}h`;
+}
 const known = (v) => v !== null && v !== undefined;
 
 function place(cwd) {
@@ -503,7 +536,7 @@ function card(s) {
     h("span", { class: "session-title", text: label(s) }),
     h("span", { class: "session-where", title: s.cwd, text: where }),
     s.hooked || s.activity === "gone"
-      ? [focusLine(s), taskBar(s.tasks), cardProgress(s), cardMeta(s)]
+      ? [focusLines(s), taskBar(s.tasks), cardProgress(s), cardMeta(s)]
       : h("span", {
           class: "session-note",
           text: "Started before ccdash was installed, so only busy and idle are known. Resume it to see details.",
@@ -512,30 +545,42 @@ function card(s) {
   );
 }
 
-/** The one line that matters most for the session's state. */
-function focusLine(s) {
+/** What matters most for the session's state: the pending request, or the
+ * running tool and what Claude last said. */
+function focusLines(s) {
   if (s.waiting_for)
     return h("span", { class: "session-focus mono", text: s.waiting_for });
-  if (s.activity === "working" && s.tool)
-    return h(
-      "span",
-      { class: "session-tool" },
-      h("span", { class: "mono", text: toolLabel(s.tool) }),
-      clock(s.tool.started_at),
+  const lines = [];
+  const working = s.activity === "working";
+  if (working && s.tool) {
+    lines.push(
+      h(
+        "span",
+        { class: "session-tool" },
+        h("span", { class: "mono", text: toolLabel(s.tool) }),
+        clock(s.tool.started_at),
+      ),
     );
+  }
   const [who, text] =
-    s.activity === "working" || !s.reply
-      ? ["You", s.prompt?.text]
-      : ["Claude", s.reply.text];
+    working && s.message
+      ? ["Claude", s.message.text]
+      : !working && s.reply
+        ? ["Claude", s.reply.text]
+        : ["You", s.prompt?.text];
   const preview = plain(text);
-  if (!preview) return null;
-  return h(
-    "span",
-    { class: "session-detail" },
-    h("span", { class: "who", text: who }),
-    " ",
-    preview,
-  );
+  if (preview) {
+    lines.push(
+      h(
+        "span",
+        { class: "session-detail" },
+        h("span", { class: "who", text: who }),
+        " ",
+        preview,
+      ),
+    );
+  }
+  return lines;
 }
 
 function taskBar(tasks) {
@@ -602,6 +647,13 @@ function cardMeta(s) {
         )
       : null,
     s.cost_usd ? fmtUsd(s.cost_usd) : null,
+    s.resources
+      ? h("span", {
+          title: plural(s.resources.procs, "process", "processes"),
+          text: `${s.resources.cpu_pct}% CPU`,
+        })
+      : null,
+    s.resources ? fmtBytes(s.resources.mem_bytes) : null,
   ].filter(Boolean);
   return items.length
     ? h("span", { class: "session-meta" }, joined(items))
@@ -666,7 +718,15 @@ function scheduleDetailRefresh() {
 
 function openDetail(id) {
   state.detailId = id;
-  state.convo = { id, exchanges: [], more: false, stats: null, loaded: false };
+  state.convo = {
+    id,
+    exchanges: [],
+    more: false,
+    stats: null,
+    resources: null,
+    loaded: false,
+  };
+  state.autoOpened = new Set();
   const dialog = $("#detail");
   dialog.replaceChildren(
     h("div", { class: "detail-head" }),
@@ -778,6 +838,7 @@ async function loadConversation(mode) {
     c.exchanges = [...kept, ...conv.exchanges];
   }
   if (page.stats) c.stats = page.stats;
+  if (page.resources) c.resources = page.resources;
   c.loaded = true;
   renderDetailBody();
 
@@ -805,10 +866,23 @@ function renderDetailBody() {
   } else {
     body.replaceChildren(...conversationTab(s));
     clampReplies(body);
+    openRunningSteps(body, s);
   }
   for (const d of body.querySelectorAll("details[data-key]")) {
     if (openKeys.has(d.dataset.key)) d.open = true;
   }
+}
+
+/** Unfolds the newest tool group once while the turn is still running. */
+function openRunningSteps(body, s) {
+  if (s.activity !== "working" && s.activity !== "permission") return;
+  const group = [...body.querySelectorAll(".exchange")]
+    .at(-1)
+    ?.querySelectorAll("details.activity");
+  const last = group?.[group.length - 1];
+  if (!last || state.autoOpened.has(last.dataset.key)) return;
+  state.autoOpened.add(last.dataset.key);
+  last.open = true;
 }
 
 function unhookedNote(s) {
@@ -921,18 +995,44 @@ function activityGroup(items, omitted) {
       h("span", { class: "activity-sum" }, joined(summary)),
       top ? h("span", { class: "activity-top", text: top }) : null,
     ),
-    h(
-      "ol",
-      { class: "steps" },
-      omitted
-        ? h("li", {
-            class: "muted",
-            text: `${plural(omitted, "earlier tool call")} not shown`,
-          })
-        : null,
-      items.map(step),
-    ),
+    stepList(items, omitted),
   );
+}
+
+const VISIBLE_STEPS = 15;
+
+/** The newest steps, with a button for the earlier ones in long runs. */
+function stepList(items, omitted) {
+  const list = h(
+    "ol",
+    { class: "steps" },
+    omitted
+      ? h("li", {
+          class: "muted",
+          text: `${plural(omitted, "earlier tool call")} not shown`,
+        })
+      : null,
+  );
+  const hidden = items.length - VISIBLE_STEPS;
+  if (hidden > 0) {
+    list.append(
+      h(
+        "li",
+        { class: "steps-more" },
+        h("button", {
+          class: "show-more",
+          type: "button",
+          text: `Show ${plural(hidden, "earlier step")}`,
+          onclick: (event) =>
+            event.currentTarget.parentElement.replaceWith(
+              ...items.slice(0, hidden).map(step),
+            ),
+        }),
+      ),
+    );
+  }
+  list.append(...items.slice(Math.max(0, hidden)).map(step));
+  return list;
 }
 
 function step(item) {
@@ -992,6 +1092,12 @@ function step(item) {
 
 function convItem(item, isLastReply) {
   switch (item.kind) {
+    case "message":
+      return h(
+        "div",
+        { class: "msg msg-claude msg-step" },
+        prose(item.html, true),
+      );
     case "reply":
       return h(
         "div",
@@ -1125,6 +1231,18 @@ function liveBlock(s) {
       ),
     );
   }
+  const said = liveMessage(s);
+  if (said) {
+    rows.push(
+      h(
+        "div",
+        { class: "live-said" },
+        h("span", { class: "who", text: "Claude" }),
+        " ",
+        said,
+      ),
+    );
+  }
   const facts =
     s.activity === "working" || s.activity === "permission"
       ? turnFacts(s).filter(Boolean)
@@ -1145,6 +1263,15 @@ function liveBlock(s) {
   return rows.length
     ? h("div", { class: "live", "data-activity": s.activity }, rows)
     : null;
+}
+
+/** Claude's streaming text, until the finished message is in the loaded conversation. */
+function liveMessage(s) {
+  if (!s.message || s.activity !== "working") return null;
+  const shown = (state.convo?.exchanges || [])
+    .at(-1)
+    ?.items.some((it) => it.kind === "message" && it.at >= s.message.at);
+  return shown ? null : s.message.text;
 }
 
 function renderLive() {
@@ -1273,6 +1400,7 @@ function detailsTab(s, stats) {
       taskList(s.tasks),
     );
   }
+  out.push(...processSection(s, state.convo?.resources));
   if (stats) {
     out.push(
       h("h3", { text: "Session totals" }),
@@ -1294,6 +1422,86 @@ function detailsTab(s, stats) {
     );
   }
   out.push(h("h3", { text: "Session" }), facts(s));
+  return out;
+}
+
+function processSection(s, history) {
+  const r = s.resources;
+  if (!r) return [];
+  const out = [
+    h("h3", { text: "Processes" }),
+    factList([
+      ["CPU", `${r.cpu_pct}% of one core`],
+      ["Memory", fmtBytes(r.mem_bytes)],
+      ["Processes", r.procs],
+    ]),
+    h(
+      "table",
+      { class: "procs" },
+      h(
+        "thead",
+        {},
+        h(
+          "tr",
+          {},
+          ["Process", "CPU", "Memory", "Running"].map((t) =>
+            h("th", { text: t }),
+          ),
+        ),
+      ),
+      h(
+        "tbody",
+        {},
+        r.top.map((p) =>
+          h(
+            "tr",
+            {},
+            h(
+              "td",
+              {},
+              h("strong", { text: p.name }),
+              p.cmd ? h("div", { class: "mono muted", text: p.cmd }) : null,
+            ),
+            h("td", { text: `${p.cpu_pct}%` }),
+            h("td", { text: fmtBytes(p.mem_bytes) }),
+            h("td", { text: fmtDuration(now() - p.started_at) }),
+          ),
+        ),
+      ),
+    ),
+  ];
+  if (history?.length > 1) {
+    const width = Math.max(
+      260,
+      ($("#detail .detail-body")?.clientWidth || 600) - 40,
+    );
+    const until = now();
+    const since = until - 3_600_000;
+    out.push(
+      h(
+        "div",
+        { class: "chart-pair" },
+        lineChart({
+          title: "CPU, last hour",
+          sub: "Average per minute, % of one core",
+          points: history.map(([ts, cpu]) => [ts, cpu]),
+          since,
+          until,
+          width: width > 560 ? (width - 12) / 2 : width,
+          fmt: (v) => `${Math.round(v)}%`,
+          floorMax: 100,
+        }),
+        lineChart({
+          title: "Memory, last hour",
+          sub: "Peak per minute (PSS)",
+          since,
+          until,
+          width: width > 560 ? (width - 12) / 2 : width,
+          ...byteSeries(history.map(([ts, , rss]) => [ts, rss])),
+        }),
+      ),
+    );
+  }
   return out;
 }
 
@@ -1432,8 +1640,10 @@ const stateLegend = (states) =>
   h("div", { class: "legend" }, states.map(legendChip));
 
 function timeTicks(since, until, width) {
-  const steps = [15, 30, 60, 120, 180, 360, 720, 1440].map((m) => m * 60_000);
-  const maxTicks = Math.max(2, Math.floor(width / 110));
+  const steps = [15, 30, 60, 120, 180, 360, 720, 1440, 2880, 4320, 10080].map(
+    (m) => m * 60_000,
+  );
+  const maxTicks = Math.max(3, Math.floor(width / 110));
   const step =
     steps.find((st) => (until - since) / st <= maxTicks) ?? steps.at(-1);
   const first = new Date(since);
@@ -1511,8 +1721,7 @@ const ellipsize = (text, max) =>
  * Horizontal bars, one row per entry, label above the bar and the value
  * label after it. `parts` are stacked `[value, activity|null]` pairs.
  */
-function barRows(figure, rows, { valueText, tipText }) {
-  const width = chartWidth();
+function barRows(figure, rows, { valueText, tipText }, width = chartWidth()) {
   const rowH = 34;
   const barH = 12;
   const valueW = 92;
@@ -1927,6 +2136,657 @@ function timelineChart(data) {
   return figure;
 }
 
+// --- chart building blocks --------------------------------------------------
+
+/** Round tick values covering `lo..hi` (both inclusive of 0). */
+function niceTicks(lo, hi, count = 4) {
+  const span = hi - lo || 1;
+  const raw = span / count;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => st >= raw);
+  const ticks = [];
+  for (let t = Math.floor(lo / step) * step; t <= hi + step / 2; t += step)
+    ticks.push(Number(t.toFixed(10)));
+  if (ticks.at(-1) < hi) ticks.push(ticks.at(-1) + step);
+  return ticks;
+}
+
+/**
+ * One series over time: line + soft area, crosshair tooltip, end label.
+ * `points` are `[ts, value]`; long gaps break the line.
+ */
+function lineChart({ title, sub, points, since, until, width, fmt, floorMax }) {
+  const figure = chartFigure(title, sub);
+  if (points.length < 2) {
+    figure.append(h("p", { class: "muted", text: "Not enough data yet." }));
+    return figure;
+  }
+  const height = 150;
+  const pad = { top: 8, right: 52, bottom: 22, left: 46 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const peak = Math.max(...points.map(([, v]) => v));
+  const ticks = niceTicks(0, Math.max(peak, floorMax * 0.05), 3);
+  const top = ticks.at(-1);
+  const x = (t) => pad.left + ((t - since) / (until - since)) * plotW;
+  const y = (v) => pad.top + plotH - (v / top) * plotH;
+  const svg = s("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    height,
+    role: "img",
+    "aria-label": title,
+  });
+  for (const v of ticks) {
+    svg.append(
+      s("line", {
+        class: v ? "grid" : "baseline",
+        x1: pad.left,
+        x2: pad.left + plotW,
+        y1: y(v),
+        y2: y(v),
+      }),
+      s("text", {
+        x: pad.left - 6,
+        y: y(v) + 4,
+        "text-anchor": "end",
+        text: fmt(v),
+      }),
+    );
+  }
+  const { ticks: times, daily } = timeTicks(since, until, plotW);
+  for (const t of times) {
+    svg.append(
+      s("text", {
+        x: x(t),
+        y: height - 6,
+        "text-anchor": "middle",
+        text: daily ? dayFmt.format(t) : fmtTime(t),
+      }),
+    );
+  }
+  const steps = points.slice(1).map(([t], i) => t - points[i][0]);
+  const maxGap = 3 * (steps.sort((a, b) => a - b)[steps.length >> 1] || 60_000);
+  const runs = [];
+  for (const point of points) {
+    const run = runs.at(-1);
+    if (run && point[0] - run.at(-1)[0] <= maxGap) run.push(point);
+    else runs.push([point]);
+  }
+  for (const run of runs) {
+    if (run.length === 1) {
+      svg.append(
+        s("circle", {
+          class: "end-dot",
+          cx: x(run[0][0]),
+          cy: y(run[0][1]),
+          r: 3,
+        }),
+      );
+      continue;
+    }
+    const line = run
+      .map(
+        ([t, v], i) => `${i ? "L" : "M"}${x(t).toFixed(1)},${y(v).toFixed(1)}`,
+      )
+      .join("");
+    svg.append(
+      s("path", {
+        class: "area",
+        d: `${line}L${x(run.at(-1)[0]).toFixed(1)},${y(0)}L${x(run[0][0]).toFixed(1)},${y(0)}Z`,
+      }),
+      s("path", { class: "line", d: line }),
+    );
+  }
+  const [lastT, lastV] = points.at(-1);
+  svg.append(
+    s("circle", { class: "end-dot", cx: x(lastT), cy: y(lastV), r: 4 }),
+    s("text", { x: x(lastT) + 8, y: y(lastV) + 4, text: fmt(lastV) }),
+  );
+  const crosshair = s("line", {
+    class: "crosshair",
+    y1: pad.top,
+    y2: pad.top + plotH,
+    visibility: "hidden",
+  });
+  const hit = s("rect", {
+    x: pad.left,
+    y: pad.top,
+    width: plotW,
+    height: plotH,
+    fill: "transparent",
+  });
+  svg.append(crosshair, hit);
+  figure.append(svg);
+  const tip = tooltipFor(figure);
+  hit.addEventListener("pointermove", (event) => {
+    const box = svg.getBoundingClientRect();
+    const t =
+      since +
+      (((event.clientX - box.left) * (width / box.width) - pad.left) / plotW) *
+        (until - since);
+    const [pt, pv] = points.reduce((best, q) =>
+      Math.abs(q[0] - t) < Math.abs(best[0] - t) ? q : best,
+    );
+    crosshair.setAttribute("x1", x(pt));
+    crosshair.setAttribute("x2", x(pt));
+    crosshair.setAttribute("visibility", "visible");
+    tip.show(event, fmt(pv), daily ? fmtStamp(pt) : fmtTime(pt));
+  });
+  hit.addEventListener("pointerleave", () => {
+    crosshair.setAttribute("visibility", "hidden");
+    tip.hide();
+  });
+  figure.append(
+    tableView(
+      ["Time", title],
+      points.map(([t, v]) => [fmtStamp(t), fmt(v)]),
+    ),
+  );
+  return figure;
+}
+
+/**
+ * Vertical bars, one per column, stacked from `parts` (`[value, activity]`;
+ * activity null = neutral fill). Negative values hang below the baseline.
+ */
+function columnChart(figure, cols, { width, fmtY, tip, height = 190 }) {
+  const pad = { top: 10, right: 6, bottom: 24, left: 46 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  let hi = 0;
+  let lo = 0;
+  for (const col of cols) {
+    const up = col.parts.reduce((n, [v]) => n + Math.max(0, v), 0);
+    const down = col.parts.reduce((n, [v]) => n + Math.min(0, v), 0);
+    hi = Math.max(hi, up);
+    lo = Math.min(lo, down);
+  }
+  const ticks = niceTicks(lo, hi || 1, 4);
+  const [min, max] = [ticks[0], ticks.at(-1)];
+  const y = (v) => pad.top + ((max - v) / (max - min)) * plotH;
+  const svg = s("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    height,
+    role: "img",
+    "aria-label": figure.querySelector(".chart-title").textContent,
+  });
+  for (const v of ticks) {
+    svg.append(
+      s("line", {
+        class: v === 0 ? "baseline" : "grid",
+        x1: pad.left,
+        x2: pad.left + plotW,
+        y1: y(v),
+        y2: y(v),
+      }),
+      s("text", {
+        x: pad.left - 6,
+        y: y(v) + 4,
+        "text-anchor": "end",
+        text: fmtY(v),
+      }),
+    );
+  }
+  const slot = plotW / cols.length;
+  const barW = Math.max(3, Math.min(32, slot * 0.66));
+  const every = Math.ceil((cols.length * 52) / plotW);
+  const tooltip = tooltipFor(figure);
+  cols.forEach((col, i) => {
+    const cx = pad.left + slot * (i + 0.5);
+    let up = 0;
+    let down = 0;
+    for (const [value, activity] of col.parts) {
+      if (!value) continue;
+      const from = value > 0 ? up : down;
+      const to = from + value;
+      if (value > 0) up = to;
+      else down = to;
+      const top = y(Math.max(from, to));
+      const h0 = Math.abs(y(from) - y(to));
+      const rect = s("rect", {
+        class: activity ? "seg" : "seg seg-neutral",
+        "data-activity": activity,
+        x: cx - barW / 2,
+        y: top + (value > 0 ? 0 : 2),
+        width: barW,
+        height: Math.max(1, h0 - 2),
+        rx: Math.min(2, barW / 2),
+      });
+      rect.addEventListener("pointermove", (event) =>
+        tooltip.show(event, ...tip(col, value, activity)),
+      );
+      rect.addEventListener("pointerleave", () => tooltip.hide());
+      svg.append(rect);
+    }
+    if (i % every === 0) {
+      svg.append(
+        s("text", {
+          x: cx,
+          y: height - 6,
+          "text-anchor": "middle",
+          text: col.label,
+        }),
+      );
+    }
+  });
+  figure.append(svg);
+}
+
+const SEQ_LEVELS = 6;
+
+/** Weekday × hour counts, Monday first. */
+function heatmapChart(matrix, width) {
+  const figure = chartFigure("When you prompt", "Prompts by weekday and hour");
+  const max = Math.max(0, ...matrix.flat());
+  if (!max) {
+    figure.append(
+      h("p", { class: "muted", text: "No prompts in this range." }),
+    );
+    return figure;
+  }
+  const names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const pad = { top: 16, left: 34 };
+  const cell = Math.max(9, Math.min(28, Math.floor((width - pad.left) / 24)));
+  const height = pad.top + 7 * cell;
+  const level = (n) => (n ? Math.max(1, Math.ceil((n / max) * SEQ_LEVELS)) : 0);
+  const svg = s("svg", {
+    viewBox: `0 0 ${pad.left + 24 * cell} ${height}`,
+    width: pad.left + 24 * cell,
+    height,
+    role: "img",
+    "aria-label": "Prompts by weekday and hour",
+  });
+  for (let hour = 0; hour < 24; hour += cell < 16 ? 6 : 3) {
+    svg.append(
+      s("text", {
+        x: pad.left + hour * cell + 1,
+        y: 11,
+        text: String(hour).padStart(2, "0"),
+      }),
+    );
+  }
+  const tip = tooltipFor(figure);
+  matrix.forEach((row, day) => {
+    svg.append(
+      s("text", {
+        x: 0,
+        y: pad.top + day * cell + cell / 2 + 4,
+        text: names[day],
+      }),
+    );
+    row.forEach((n, hour) => {
+      const rect = s("rect", {
+        class: "heat",
+        "data-level": level(n),
+        x: pad.left + hour * cell,
+        y: pad.top + day * cell,
+        width: cell - 2,
+        height: cell - 2,
+        rx: 2,
+      });
+      rect.addEventListener("pointermove", (event) =>
+        tip.show(
+          event,
+          plural(n, "prompt"),
+          `${names[day]} ${String(hour).padStart(2, "0")}:00–${String(hour + 1).padStart(2, "0")}:00`,
+        ),
+      );
+      rect.addEventListener("pointerleave", () => tip.hide());
+      svg.append(rect);
+    });
+  });
+  figure.append(
+    h("div", { class: "heat-wrap" }, svg),
+    h(
+      "div",
+      { class: "legend heat-legend" },
+      h("span", { text: "Fewer" }),
+      [...Array(SEQ_LEVELS).keys()].map((i) =>
+        h("i", {
+          class: "heat-swatch",
+          "data-level": i + 1,
+          "aria-hidden": "true",
+        }),
+      ),
+      h("span", { text: `More (max ${max})` }),
+    ),
+    tableView(
+      ["Day", ...[...Array(24).keys()].map((hr) => String(hr))],
+      matrix.map((row, day) => [names[day], ...row]),
+    ),
+  );
+  return figure;
+}
+
+// --- analytics view ---------------------------------------------------------
+
+const BIN_LABELS = ["<30s", "30s–2m", "2–5m", "5–15m", "15m–1h", ">1h"];
+const shortDay = new Intl.DateTimeFormat(undefined, {
+  day: "numeric",
+  month: "numeric",
+});
+
+function analyticsSince(range) {
+  const days = { "7d": 7, "14d": 14, "30d": 30 }[range] || 7;
+  const start = new Date(now());
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - days + 1);
+  return start.getTime();
+}
+
+async function loadAnalytics() {
+  const container = $("#analytics");
+  container.classList.add("loading");
+  try {
+    const tz = -new Date().getTimezoneOffset();
+    state.analytics = await getJson(
+      `analytics?since=${analyticsSince(state.aRange)}&tz=${tz}`,
+    );
+    renderAnalytics();
+  } catch (e) {
+    if (e instanceof Unauthorized) askToken();
+  } finally {
+    container.classList.remove("loading");
+  }
+}
+
+function renderAnalytics() {
+  const data = state.analytics;
+  if (!data) return;
+  const width = Math.max(280, ($("#analytics").clientWidth || 600) - 32);
+  const half = width > 760 ? (width - 12) / 2 - 32 : width;
+  const sum = (key) => data.days.reduce((n, d) => n + d[key], 0);
+  const peak = Math.max(0, ...data.days.map((d) => d.peak_mem_bytes));
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile("Prompts", sum("prompts"), plural(data.sessions, "session")),
+    statTile("Working time", fmtDuration(sum("working_ms")), "Claude busy"),
+    statTile(
+      "Waited on you",
+      fmtDuration(sum("permission_ms") + sum("your_turn_ms")),
+      "permission prompts and your turn",
+    ),
+    statTile("API-equivalent cost", fmtUsd(sum("cost_usd")), "from statusline"),
+    statTile(
+      "Lines changed",
+      `+${compact.format(sum("lines_added"))} −${compact.format(sum("lines_removed"))}`,
+      "added / removed",
+    ),
+    statTile(
+      "Peak memory",
+      peak ? fmtBytes(peak) : "–",
+      "all sessions at once",
+    ),
+  );
+  $("#analytics").replaceChildren(
+    tiles,
+    dailyActivityChart(data, width),
+    heatmapChart(data.heatmap, width),
+    h(
+      "div",
+      { class: "chart-pair" },
+      histogramChart(
+        "How long Claude works per prompt",
+        data.turns,
+        "working",
+        half,
+      ),
+      histogramChart(
+        "How long sessions wait for you",
+        data.responses,
+        "your_turn",
+        half,
+      ),
+    ),
+    h(
+      "div",
+      { class: "chart-pair" },
+      costChart(data, half),
+      modelChart(data, half),
+    ),
+    linesChart(data, width),
+    h(
+      "div",
+      { class: "chart-pair" },
+      lineChart({
+        title: "Memory",
+        sub: "All session process trees together (PSS), average per bucket",
+        since: data.since,
+        until: data.now,
+        width: half,
+        ...byteSeries(data.memory),
+      }),
+      cpuChart(data, half),
+    ),
+  );
+}
+
+const dayLabel = (data, ts) =>
+  data.days.length > 10 ? shortDay.format(ts) : dayFmt.format(ts);
+
+function dailyActivityChart(data, width) {
+  const figure = chartFigure(
+    "Daily activity",
+    "Hours each day that sessions were working or waiting on you",
+    stateLegend(STATES),
+  );
+  columnChart(
+    figure,
+    data.days.map((d) => ({
+      label: dayLabel(data, d.start),
+      day: d,
+      parts: [
+        [d.working_ms / 3_600_000, "working"],
+        [d.permission_ms / 3_600_000, "permission"],
+        [d.your_turn_ms / 3_600_000, "your_turn"],
+      ],
+    })),
+    {
+      width,
+      fmtY: (v) => `${v}h`,
+      tip: (col, value, activity) => [
+        fmtDuration(value * 3_600_000),
+        `${ACTIVITY[activity].label} · ${dayFmt.format(col.day.start)}`,
+      ],
+    },
+  );
+  figure.append(
+    tableView(
+      ["Day", "Working", "Needs permission", "Your turn", "Prompts"],
+      data.days.map((d) => [
+        dayFmt.format(d.start),
+        fmtDuration(d.working_ms),
+        fmtDuration(d.permission_ms),
+        fmtDuration(d.your_turn_ms),
+        d.prompts,
+      ]),
+    ),
+  );
+  return figure;
+}
+
+function histogramChart(title, hist, activity, width) {
+  const total = hist.counts.reduce((n, c) => n + c, 0);
+  const figure = chartFigure(
+    title,
+    total
+      ? `${plural(total, "case")}, median ${fmtDuration(hist.median_ms)}`
+      : "No data in this range yet",
+  );
+  if (!total) return figure;
+  columnChart(
+    figure,
+    hist.counts.map((count, i) => ({
+      label: BIN_LABELS[i],
+      parts: [[count, activity]],
+    })),
+    {
+      width,
+      height: 170,
+      fmtY: (v) => String(v),
+      tip: (col, value) => [plural(value, "case"), col.label],
+    },
+  );
+  figure.append(
+    tableView(
+      ["Duration", "Count"],
+      hist.counts.map((count, i) => [BIN_LABELS[i], count]),
+    ),
+  );
+  return figure;
+}
+
+function costChart(data, width) {
+  const figure = chartFigure(
+    "Cost per day",
+    "API-equivalent, from statusline totals",
+  );
+  columnChart(
+    figure,
+    data.days.map((d) => ({
+      label: dayLabel(data, d.start),
+      day: d,
+      parts: [[d.cost_usd, null]],
+    })),
+    {
+      width,
+      height: 170,
+      fmtY: (v) => `$${v}`,
+      tip: (col, value) => [fmtUsd(value), dayFmt.format(col.day.start)],
+    },
+  );
+  figure.append(
+    tableView(
+      ["Day", "Cost"],
+      data.days.map((d) => [dayFmt.format(d.start), fmtUsd(d.cost_usd)]),
+    ),
+  );
+  return figure;
+}
+
+function modelChart(data, width) {
+  const figure = chartFigure("Cost by model", "Model shown in the statusline");
+  const rows = data.models
+    .filter((m) => m.cost_usd > 0)
+    .map((m) => ({
+      ...m,
+      label: m.model,
+      total: m.cost_usd,
+      parts: [[m.cost_usd, null]],
+    }));
+  if (!rows.length) {
+    figure.append(h("p", { class: "muted", text: "No cost data yet." }));
+    return figure;
+  }
+  barRows(
+    figure,
+    rows,
+    {
+      valueText: (row) => fmtUsd(row.cost_usd),
+      tipText: (row) => [
+        fmtUsd(row.cost_usd),
+        row.label,
+        plural(row.sessions, "session"),
+      ],
+    },
+    width,
+  );
+  figure.append(
+    tableView(
+      ["Model", "Cost", "Sessions"],
+      rows.map((r) => [r.label, fmtUsd(r.cost_usd), r.sessions]),
+    ),
+  );
+  return figure;
+}
+
+function linesChart(data, width) {
+  const figure = chartFigure(
+    "Lines changed per day",
+    "Added above the line, removed below",
+  );
+  columnChart(
+    figure,
+    data.days.map((d) => ({
+      label: dayLabel(data, d.start),
+      day: d,
+      parts: [
+        [d.lines_added, null],
+        [-d.lines_removed, null],
+      ],
+    })),
+    {
+      width,
+      height: 170,
+      fmtY: (v) => (v > 0 ? `+${v}` : v < 0 ? `−${-v}` : "0"),
+      tip: (col, value) => [
+        value > 0 ? `+${value} added` : `−${-value} removed`,
+        dayFmt.format(col.day.start),
+      ],
+    },
+  );
+  figure.append(
+    tableView(
+      ["Day", "Added", "Removed"],
+      data.days.map((d) => [
+        dayFmt.format(d.start),
+        d.lines_added,
+        d.lines_removed,
+      ]),
+    ),
+  );
+  return figure;
+}
+
+function cpuChart(data, width) {
+  const figure = chartFigure(
+    "CPU by project",
+    "Core-hours used by session process trees",
+  );
+  const rows = data.projects
+    .filter((p) => p.cpu_secs > 0)
+    .slice(0, 8)
+    .map((p) => ({
+      ...p,
+      label: place(p.cwd),
+      total: p.cpu_secs,
+      parts: [[p.cpu_secs, null]],
+    }));
+  if (!rows.length) {
+    figure.append(h("p", { class: "muted", text: "No process data yet." }));
+    return figure;
+  }
+  const fmtCpu = (secs) =>
+    secs >= 3600
+      ? `${(secs / 3600).toFixed(1)} core-h`
+      : `${Math.round(secs / 60)} core-min`;
+  barRows(
+    figure,
+    rows,
+    {
+      valueText: (row) => fmtCpu(row.cpu_secs),
+      tipText: (row) => [
+        fmtCpu(row.cpu_secs),
+        row.label,
+        `peak ${fmtBytes(row.peak_mem_bytes)}`,
+      ],
+    },
+    width,
+  );
+  figure.append(
+    tableView(
+      ["Project", "CPU", "Peak memory"],
+      rows.map((r) => [
+        r.label,
+        fmtCpu(r.cpu_secs),
+        fmtBytes(r.peak_mem_bytes),
+      ]),
+    ),
+  );
+  return figure;
+}
+
 // --- chrome -----------------------------------------------------------------
 
 function applyTheme() {
@@ -1955,7 +2815,9 @@ function showView(view) {
   }
   $("#view-sessions").hidden = view !== "sessions";
   $("#view-history").hidden = view !== "history";
+  $("#view-analytics").hidden = view !== "analytics";
   if (view === "history") loadHistory();
+  else if (view === "analytics") loadAnalytics();
   else loadRecent();
 }
 
@@ -1967,6 +2829,17 @@ function setRange(range) {
   loadHistory();
 }
 
+function setAnalyticsRange(range) {
+  state.aRange = range;
+  for (const button of document.querySelectorAll("[data-analytics-range]")) {
+    button.setAttribute(
+      "aria-checked",
+      String(button.dataset.analyticsRange === range),
+    );
+  }
+  loadAnalytics();
+}
+
 function start() {
   takeTokenFromHash();
   applyTheme();
@@ -1976,6 +2849,11 @@ function start() {
   }
   for (const button of document.querySelectorAll("[data-range]")) {
     button.addEventListener("click", () => setRange(button.dataset.range));
+  }
+  for (const button of document.querySelectorAll("[data-analytics-range]")) {
+    button.addEventListener("click", () =>
+      setAnalyticsRange(button.dataset.analyticsRange),
+    );
   }
   $("#detail").addEventListener("close", () => {
     state.detailId = null;
@@ -1994,14 +2872,20 @@ function start() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(renderHistory, 150);
   }).observe($("#view-history"));
+  let analyticsResize = null;
+  new ResizeObserver(() => {
+    clearTimeout(analyticsResize);
+    analyticsResize = setTimeout(renderAnalytics, 150);
+  }).observe($("#view-analytics"));
 
   setInterval(tickClocks, 1000);
   setInterval(scheduleRender, 15_000);
   setInterval(reconnectIfStale, 10_000);
   setInterval(() => {
     if (!$("#view-history").hidden) loadHistory();
-    else loadRecent();
+    else if ($("#view-analytics").hidden) loadRecent();
   }, 60_000);
+  setInterval(() => !$("#view-analytics").hidden && loadAnalytics(), 300_000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") reconnectIfStale();
   });

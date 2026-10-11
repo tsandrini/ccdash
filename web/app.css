@@ -17,6 +17,12 @@
   --good: #0ca30c;
   --warning: #fab219;
   --critical: #d03b3b;
+  --seq-1: #cde2fb;
+  --seq-2: #9ec5f4;
+  --seq-3: #6da7ec;
+  --seq-4: #3987e5;
+  --seq-5: #256abf;
+  --seq-6: #184f95;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
   --radius: 10px;
@@ -39,6 +45,12 @@
     --permission: #d95926;
     --your-turn: #199e70;
     --idle: #4a4a46;
+    --seq-1: #104281;
+    --seq-2: #1c5cab;
+    --seq-3: #2a78d6;
+    --seq-4: #5598e7;
+    --seq-5: #86b6ef;
+    --seq-6: #b7d3f6;
   }
 }
 
@@ -58,6 +70,12 @@
   --permission: #d95926;
   --your-turn: #199e70;
   --idle: #4a4a46;
+  --seq-1: #104281;
+  --seq-2: #1c5cab;
+  --seq-3: #2a78d6;
+  --seq-4: #5598e7;
+  --seq-5: #86b6ef;
+  --seq-6: #b7d3f6;
 }
 
 * {
@@ -824,6 +842,10 @@ dialog::backdrop {
   font-variant-numeric: tabular-nums;
 }
 
+.steps .steps-more {
+  display: block;
+}
+
 .step-text {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -841,6 +863,51 @@ dialog::backdrop {
 
 .step-failed .step-icon {
   color: var(--critical);
+}
+
+.msg-step {
+  margin: 8px 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.live-said {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+}
+
+.procs {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.procs th,
+.procs td {
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--grid);
+  text-align: right;
+  vertical-align: top;
+}
+
+.procs th:first-child,
+.procs td:first-child {
+  max-width: 0;
+  width: 100%;
+  text-align: left;
+}
+
+.procs .mono {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .subagent .prose,
@@ -1173,6 +1240,80 @@ dialog::backdrop {
   fill: var(--state-color);
 }
 
+.chart svg .heat {
+  fill: var(--surface-2);
+}
+
+.chart svg .heat:hover {
+  stroke: var(--text-primary);
+  stroke-width: 1;
+}
+
+.chart svg .heat[data-level="1"] {
+  fill: var(--seq-1);
+  background: var(--seq-1);
+}
+
+.chart svg .heat[data-level="2"],
+.heat-swatch[data-level="2"] {
+  fill: var(--seq-2);
+  background: var(--seq-2);
+}
+
+.chart svg .heat[data-level="3"],
+.heat-swatch[data-level="3"] {
+  fill: var(--seq-3);
+  background: var(--seq-3);
+}
+
+.chart svg .heat[data-level="4"],
+.heat-swatch[data-level="4"] {
+  fill: var(--seq-4);
+  background: var(--seq-4);
+}
+
+.chart svg .heat[data-level="5"],
+.heat-swatch[data-level="5"] {
+  fill: var(--seq-5);
+  background: var(--seq-5);
+}
+
+.chart svg .heat[data-level="6"],
+.heat-swatch[data-level="6"] {
+  fill: var(--seq-6);
+  background: var(--seq-6);
+}
+
+.heat-swatch[data-level="1"] {
+  background: var(--seq-1);
+}
+
+.heat-wrap {
+  overflow-x: auto;
+}
+
+.heat-wrap svg {
+  width: auto;
+  max-width: 100%;
+}
+
+.legend .heat-swatch {
+  width: 14px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.heat-legend {
+  gap: 4px;
+  align-items: center;
+}
+
+.chart-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  gap: 0 12px;
+}
+
 .chart svg .seg-neutral {
   fill: var(--text-muted);
 }
@@ -1304,7 +1445,11 @@ dialog::backdrop {
   }
 
   .tabs button {
-    padding: 4px 10px;
+    padding: 4px 8px;
+  }
+
+  .brand > span:not(.muted) {
+    display: none;
   }
 
   dialog {

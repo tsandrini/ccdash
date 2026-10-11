@@ -13,6 +13,7 @@ pub struct Config {
     pub http: Http,
     pub agents: Agents,
     pub niri: Niri,
+    pub procs: Procs,
     pub attach: Attach,
     pub store: Store,
 }
@@ -38,6 +39,14 @@ pub struct Niri {
     pub enable: bool,
     /// Window `app_id`s that count as terminals hosting Claude Code.
     pub terminals: Vec<String>,
+}
+
+/// CPU and memory of each session's process tree, from `/proc`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Procs {
+    pub enable: bool,
+    pub interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +86,15 @@ impl Default for Niri {
         Self {
             enable: true,
             terminals: vec!["com.mitchellh.ghostty".to_owned()],
+        }
+    }
+}
+
+impl Default for Procs {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            interval_secs: 5,
         }
     }
 }

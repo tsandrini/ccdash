@@ -47,6 +47,7 @@ let
     "SubagentStop"
     "TaskCreated"
     "TaskCompleted"
+    "MessageDisplay"
   ];
   toolEvents = [
     "PreToolUse"
