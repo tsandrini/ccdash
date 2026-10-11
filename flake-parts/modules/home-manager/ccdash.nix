@@ -89,6 +89,13 @@ in
       '';
     };
 
+    dms.enable = mkEnableOption ''
+      the DankMaterialShell plugin: bar pill, popout list, dash tab and
+      card, notifications, and `dms ipc call ccdash …`. Linked into
+      {file}`$XDG_CONFIG_HOME/DankMaterialShell/plugins/ccdash`; enable it
+      once in DMS Settings → Plugins and add the widget to a bar
+    '';
+
     systemdTarget = mkOption {
       type = types.str;
       default = "graphical-session.target";
@@ -157,6 +164,9 @@ in
       programs.claude-code.settings.hooks = genAttrs hookEvents (event: [
         ({ hooks = [ hook ]; } // optionalAttrs (elem event toolEvents) { matcher = "*"; })
       ]);
+    })
+    (mkIf cfg.dms.enable {
+      xdg.configFile."DankMaterialShell/plugins/ccdash".source = "${cfg.package}/share/ccdash/dms-plugin";
     })
     (mkIf cfg.claudeCode.statusLine.enable {
       programs.claude-code.settings.statusLine = mkForce {

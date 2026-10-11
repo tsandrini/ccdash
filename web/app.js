@@ -35,6 +35,8 @@ const state = {
   analytics: null,
   workspaces: [],
   workspace: localStorage.getItem(WORKSPACE_KEY),
+  /** Session to open from `#session=…` once the snapshot has it. */
+  pendingSession: null,
   /** Activity groups already opened automatically while a turn runs. */
   autoOpened: new Set(),
 };
@@ -209,11 +211,22 @@ class Unauthorized extends Error {}
 
 const token = () => localStorage.getItem(TOKEN_KEY) || "";
 
-function takeTokenFromHash() {
-  const match = location.hash.match(/token=([^&]+)/);
-  if (!match) return;
-  localStorage.setItem(TOKEN_KEY, decodeURIComponent(match[1]));
+/** Reads `#token=…` and `#session=…` (opened once the session is known). */
+function takeHash() {
+  const token = location.hash.match(/token=([^&]+)/);
+  const session = location.hash.match(/session=([^&]+)/);
+  if (!token && !session) return;
+  if (token) localStorage.setItem(TOKEN_KEY, decodeURIComponent(token[1]));
+  if (session) state.pendingSession = decodeURIComponent(session[1]);
   history.replaceState(null, "", location.pathname + location.search);
+  openPendingSession();
+}
+
+function openPendingSession() {
+  const id = state.pendingSession;
+  if (!id || !state.sessions.has(id)) return;
+  state.pendingSession = null;
+  openDetail(id);
 }
 
 async function api(path, init = {}) {
@@ -326,6 +339,7 @@ function applySnapshot(snapshot) {
   scheduleRender();
   loadRecent();
   if (state.detailId) scheduleDetailRefresh();
+  openPendingSession();
 }
 
 function applyUpdate(update) {
@@ -3411,7 +3425,8 @@ function showView(view) {
 }
 
 function start() {
-  takeTokenFromHash();
+  takeHash();
+  addEventListener("hashchange", takeHash);
   applyTheme();
   $("#theme").addEventListener("click", cycleTheme);
   for (const tab of document.querySelectorAll("[data-view]")) {

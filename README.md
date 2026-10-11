@@ -5,8 +5,8 @@ working, which are waiting on you, and which look stuck. On the desktop as a
 [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) plugin,
 on the phone as a web page.
 
-> **Status:** work in progress. The collector daemon and the web UI work;
-> the DMS plugin is not built yet.
+> **Status:** work in progress. The collector daemon, the web UI and the
+> DMS plugin work; several hosts are not supported yet.
 
 ## How it works
 
@@ -97,6 +97,20 @@ its memory as PSS, so shared pages are not counted twice. Turn it off with
 The HTTP API is read-only and needs the bearer token (generated in
 `~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
 port behind your firewall or VPN.
+
+## Desktop (DankMaterialShell)
+
+`services.ccdash.dms.enable = true;` links the [DMS plugin](dms-plugin/) into
+DankMaterialShell: a bar pill with the sessions that need you, a dash tab and
+card, notifications when a session starts waiting, and
+`dms ipc call ccdash focusWaiting` to jump to the session that has waited
+longest. Enable it once under Settings → Plugins and add the widget to a bar.
+Handy niri binds:
+
+```kdl
+Mod+C { spawn "dms" "ipc" "call" "dash" "toggle" "plugin_ccdash"; }
+Mod+Shift+C { spawn "dms" "ipc" "call" "ccdash" "focusWaiting"; }
+```
 
 ## Data
 

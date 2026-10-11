@@ -18,10 +18,16 @@ rustPlatform.buildRustPackage {
       (flake-root + "/Cargo.lock")
       (flake-root + "/src")
       (flake-root + "/web")
+      (flake-root + "/dms-plugin")
     ];
   };
 
   cargoLock.lockFile = flake-root + "/Cargo.lock";
+
+  postInstall = ''
+    mkdir -p $out/share/ccdash
+    cp -r dms-plugin $out/share/ccdash/dms-plugin
+  '';
 
   meta = {
     inherit (cargoToml.package) description;

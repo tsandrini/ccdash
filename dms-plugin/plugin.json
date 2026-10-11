@@ -1,0 +1,33 @@
+{
+  "id": "ccdash",
+  "name": "Claude Code sessions",
+  "description": "Live view of running Claude Code sessions from ccdash: who needs you, what works, notifications and one-key focus",
+  "version": "0.1.0",
+  "author": "tsandrini",
+  "type": "composite",
+  "capabilities": ["daemon", "dankbar-widget", "dash-tab", "dash-card"],
+  "icon": "asterisk",
+  "components": {
+    "daemon": "./CcdashDaemon.qml",
+    "widget": "./CcdashWidget.qml",
+    "dash": "./CcdashTab.qml",
+    "dashCard": "./CcdashCard.qml"
+  },
+  "dash": {
+    "title": "Claude Code",
+    "icon": "asterisk",
+    "card": {
+      "title": "Claude Code",
+      "w": 2,
+      "h": 1,
+      "minW": 2,
+      "minH": 1,
+      "maxW": 4,
+      "maxH": 2
+    }
+  },
+  "settings": "./CcdashSettings.qml",
+  "requires_dms": ">=1.7.0",
+  "requires": ["ccdash", "notify-send"],
+  "permissions": ["settings_read", "settings_write"]
+}

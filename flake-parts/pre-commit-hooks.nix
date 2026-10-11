@@ -39,7 +39,10 @@ in
           markdownlint.enable = true; # Markdown lint tool
           editorconfig-checker.enable = true; # .editorconfig file checker
           typos.enable = true; # Source code spell checker
-          prettier.enable = true; # Prettier is an opinionated code formatter
+          prettier = {
+            enable = true; # Prettier is an opinionated code formatter
+            excludes = [ "dms-plugin/.*\\.js$" ]; # NOTE: QML's `.pragma library` is not JS
+          };
           check-toml.enable = true;
 
           # --- fs utils ---
