@@ -42,7 +42,11 @@ let
     "PermissionDenied"
     "Stop"
     "StopFailure"
-    "PreCompact"
+    "PostCompact"
+    "SubagentStart"
+    "SubagentStop"
+    "TaskCreated"
+    "TaskCompleted"
   ];
   toolEvents = [
     "PreToolUse"

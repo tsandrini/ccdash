@@ -9,13 +9,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
-use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
 use crate::{
-    model::{Kind, Stamped},
-    state::{Restored, StoreMsg},
+    model::{Kind, Stamped, Turn},
+    state::{Restored, StoreMsg, apply_task},
     util::now_ms,
 };
 
@@ -73,13 +72,6 @@ const PRUNE_EVERY_MS: i64 = 3_600_000;
 pub struct Store {
     tx: mpsc::Sender<StoreMsg>,
     path: PathBuf,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EventRow {
-    pub ts: i64,
-    pub kind: String,
-    pub data: Value,
 }
 
 impl Store {
@@ -242,35 +234,83 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         })
         .optional()?
         .flatten();
+    let hooked = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND kind != 'activity')",
+        [session],
+        |r| r.get(0),
+    )?;
+    let mut tasks = Vec::new();
+    for data in conn
+        .prepare_cached(
+            "SELECT data FROM events WHERE session = ?1 AND kind = 'task' ORDER BY ts, rowid",
+        )?
+        .query_map([session], |r| r.get::<_, String>(0))?
+    {
+        if let Ok(delta) = serde_json::from_str::<Value>(&data?) {
+            apply_task(&mut tasks, &delta);
+        }
+    }
     let restored = Restored {
         prompt: last_text("prompt")?,
         reply: last_text("reply")?,
         title,
+        hooked,
+        turn: last_turn(&conn, session)?,
+        tasks,
     };
     conn.finish()?;
     Ok(restored)
 }
 
-/// The newest `limit` events of a session, oldest first.
-pub fn events(conn: &Connection, session: &str, limit: u32) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT ts, kind, data FROM events WHERE session = ?1 ORDER BY ts DESC LIMIT ?2",
+/// Rebuilds the progress of a session's last turn from its events.
+fn last_turn(conn: &Connection, session: &str) -> Result<Option<Turn>> {
+    let started_at: Option<i64> = conn.query_row(
+        "SELECT max(ts) FROM events WHERE session = ?1 AND kind = 'prompt'",
+        [session],
+        |r| r.get(0),
     )?;
-    let rows = stmt.query_map(params![session, limit], |r| {
-        Ok(EventRow {
-            ts: r.get(0)?,
-            kind: r.get(1)?,
-            data: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or(Value::Null),
-        })
+    let Some(started_at) = started_at else {
+        return Ok(None);
+    };
+    let mut turn = Turn {
+        started_at,
+        ..Turn::default()
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts, kind, data FROM events
+            WHERE session = ?1 AND ts >= ?2 AND kind IN ('tool', 'subagent', 'reply', 'error')
+            ORDER BY ts, rowid",
+    )?;
+    let rows = stmt.query_map(params![session, started_at], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
-    let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    events.reverse();
-    Ok(events)
+    for row in rows {
+        let (ts, kind, data) = row?;
+        let data: Value = serde_json::from_str(&data).unwrap_or_default();
+        match kind.as_str() {
+            "tool" => turn.note_tool(
+                data["name"].as_str().unwrap_or_default(),
+                data["summary"].as_str().unwrap_or_default(),
+                data["ok"].as_bool().unwrap_or(true),
+            ),
+            "subagent" => {
+                let tools = data["tools"].as_u64().unwrap_or(0);
+                turn.subagent_tools += u32::try_from(tools).unwrap_or(u32::MAX);
+            }
+            _ => turn.ended_at = Some(ts),
+        }
+    }
+    Ok(Some(turn))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TaskStatus;
     use serde_json::json;
 
     #[test]
@@ -288,16 +328,41 @@ mod tests {
             started_at: t,
             ended_at: None,
         });
-        for (dt, kind, text) in [
-            (1, "prompt", "first"),
-            (2, "reply", "done"),
-            (3, "prompt", "second"),
+        for (dt, kind, data) in [
+            (1, "prompt", json!({ "text": "first" })),
+            (2, "reply", json!({ "text": "done" })),
+            (3, "prompt", json!({ "text": "second" })),
+            (
+                4,
+                "tool",
+                json!({ "name": "Edit", "summary": "a.rs", "ok": true }),
+            ),
+            (
+                5,
+                "task",
+                json!({ "id": "1", "subject": "Ship", "status": "pending" }),
+            ),
+            (
+                6,
+                "task",
+                json!({ "id": "2", "subject": "Test", "status": "pending" }),
+            ),
+            (
+                7,
+                "task",
+                json!({ "id": "1", "subject": "Ship", "status": "completed" }),
+            ),
+            (
+                8,
+                "task",
+                json!({ "id": "2", "subject": "Test", "status": "deleted" }),
+            ),
         ] {
             store.send(StoreMsg::Event {
                 ts: t + dt,
                 session: "s1".into(),
                 kind,
-                data: json!({ "text": text }),
+                data,
             });
         }
 
@@ -305,7 +370,10 @@ mod tests {
         let mut saved = Restored::default();
         for _ in 0..100 {
             saved = restored(&reader, "s1").unwrap();
-            if saved.title.is_some() && saved.prompt.as_ref().is_some_and(|p| p.text == "second") {
+            if saved.title.is_some()
+                && saved.tasks.len() == 1
+                && saved.tasks[0].status == TaskStatus::Completed
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -319,13 +387,14 @@ mod tests {
         );
         assert_eq!(saved.reply.as_ref().unwrap().text, "done");
         assert_eq!(saved.title.as_deref(), Some("Fix it"));
-
-        let kinds: Vec<String> = events(&reader, "s1", 2)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        assert_eq!(kinds, ["reply", "prompt"]);
+        assert!(saved.hooked);
+        let turn = saved.turn.unwrap();
+        assert_eq!(
+            (turn.started_at, turn.tools, turn.ended_at),
+            (t + 3, 1, None)
+        );
+        assert_eq!(turn.files, ["a.rs"]);
+        assert_eq!(saved.tasks[0].subject, "Ship");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

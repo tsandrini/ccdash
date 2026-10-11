@@ -56,10 +56,26 @@ ccdash open <id>       # focus its window, or attach to a background session
 ccdash url --host <ip> # web address for the phone, token included
 ```
 
-The web UI lives on the HTTP port: sessions that need you first, then the
-working and idle ones, a detail view with the last prompt and reply, and a
-history view with usage and a per-session activity timeline. Open the
-address from `ccdash url` once; the token is kept in the browser after that.
+The web UI lives on the HTTP port:
+
+- **Sessions:** the ones that need you first, then working and idle. Each
+  card shows the pending permission, the running tool or a reply preview,
+  task progress, the current turn (time, tool calls, edited files,
+  subagents), context and cost, and the last hour of activity.
+- **Conversation:** your prompts, Claude's replies, the tool calls of each
+  turn, subagent results and compactions, plus what the session is doing
+  right now. Details has the task list, running subagents and totals.
+- **History:** activity timeline, time per project, most used tools and
+  5-hour limit usage.
+
+Open the address from `ccdash url` once; the token is kept in the browser
+after that.
+
+Claude Code reads hooks when a session starts, so sessions that were already
+running when ccdash was installed only show busy/idle until you restart
+them (`claude --resume` keeps the conversation). The conversation is built
+from hook events: you see each turn's final reply, not the text Claude
+writes between tool calls.
 
 The HTTP API is read-only and needs the bearer token (generated in
 `~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the

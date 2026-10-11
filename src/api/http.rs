@@ -31,12 +31,12 @@ use tracing::warn;
 use super::web;
 use crate::{
     config::Config,
+    conversation,
     history::{self, History},
     hub::Hub,
-    markdown,
-    model::Snapshot,
+    model::{Activity, Snapshot},
     paths,
-    store::{self, Store},
+    store::Store,
     util::now_ms,
 };
 
@@ -119,33 +119,46 @@ async fn snapshot(State(app): State<App>) -> Result<Json<Snapshot>, ApiError> {
 }
 
 #[derive(Deserialize)]
-struct EventsQuery {
-    limit: Option<u32>,
+struct ConversationQuery {
+    /// Page backwards: only exchanges that started before this timestamp.
+    before: Option<i64>,
+    limit: Option<usize>,
 }
 
+/// The session, its conversation (newest `limit` exchanges, default 10), and
+/// whole-session stats on the first page.
 async fn session(
     State(app): State<App>,
     Path(id): Path<String>,
-    Query(query): Query<EventsQuery>,
+    Query(query): Query<ConversationQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let session = app
         .hub
         .resolve(&id)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let (store, session_id) = (app.store.clone(), session.id.clone());
-    let limit = query.limit.unwrap_or(200).min(2000);
-    let events =
-        tokio::task::spawn_blocking(move || store::events(&store.reader()?, &session_id, limit))
-            .await
-            .map_err(anyhow::Error::from)??;
-    let prompt_html = session.prompt.as_ref().map(|p| markdown::render(&p.text));
-    let reply_html = session.reply.as_ref().map(|r| markdown::render(&r.text));
+    let store = app.store.clone();
+    let (session_id, started_at) = (session.id.clone(), session.started_at);
+    let end = match session.activity {
+        Activity::Gone => session.activity_since,
+        _ => now_ms(),
+    };
+    let limit = query.limit.unwrap_or(10).clamp(1, 50);
+    let (conversation, stats) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = store.reader()?;
+        let conversation = conversation::conversation(&conn, &session_id, query.before, limit)?;
+        let stats = match query.before {
+            None => Some(conversation::stats(&conn, &session_id, started_at, end)?),
+            Some(_) => None,
+        };
+        Ok((conversation, stats))
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
     Ok(Json(json!({
         "session": session,
-        "events": events,
-        "prompt_html": prompt_html,
-        "reply_html": reply_html,
+        "conversation": conversation,
+        "stats": stats,
     })))
 }
 

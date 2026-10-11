@@ -2,6 +2,8 @@ const TOKEN_KEY = "ccdash.token";
 const THEME_KEY = "ccdash.theme";
 const VIEW_KEY = "ccdash.view";
 const STALE_STREAM_MS = 45_000;
+const STRIP_MS = 60 * 60_000;
+const PAGE = 10;
 
 const ACTIVITY = {
   permission: { label: "Needs permission", rank: 0 },
@@ -10,13 +12,19 @@ const ACTIVITY = {
   idle: { label: "Idle", rank: 3 },
   gone: { label: "Ended", rank: 4 },
 };
+const STATES = ["working", "permission", "your_turn"];
 
 const state = {
   host: "",
   skew: 0,
   sessions: new Map(),
   rateLimits: null,
+  /** Last-hour history lanes by session id, for the card strips. */
+  recent: new Map(),
   detailId: null,
+  detailTab: "conversation",
+  /** Loaded conversation of the open session. */
+  convo: null,
   range: "today",
   history: null,
 };
@@ -59,6 +67,15 @@ function append(el, children) {
 
 const $ = (sel) => document.querySelector(sel);
 
+const joined = (items) =>
+  items
+    .filter((item) => item !== null && item !== undefined && item !== false)
+    .flatMap((item, i) =>
+      i
+        ? [h("span", { class: "sep", "aria-hidden": "true" }, "·"), item]
+        : [item],
+    );
+
 // --- formatting -------------------------------------------------------------
 
 const now = () => Date.now() + state.skew;
@@ -82,8 +99,14 @@ const dayFmt = new Intl.DateTimeFormat(undefined, {
   day: "numeric",
 });
 const fmtTime = (ts) => timeFmt.format(new Date(ts));
+const fmtStamp = (ts) =>
+  new Date(ts).toDateString() === new Date(now()).toDateString()
+    ? fmtTime(ts)
+    : `${dayFmt.format(ts)}, ${fmtTime(ts)}`;
 const fmtUsd = (usd) =>
   usd >= 100 ? `$${usd.toFixed(0)}` : `$${usd.toFixed(2)}`;
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const known = (v) => v !== null && v !== undefined;
 
 function place(cwd) {
   const parts = (cwd || "").split("/").filter(Boolean);
@@ -91,8 +114,30 @@ function place(cwd) {
 }
 
 const label = (s) => s.title || s.name || s.id.slice(0, 8);
-const firstLine = (text) =>
-  (text || "").split("\n").find((line) => line.trim()) || "";
+
+/** Rough plain text of a markdown reply, for one-line previews. */
+function plain(text) {
+  return (text || "")
+    .replace(/```[\s\S]*?(```|$)/g, " ")
+    .replace(/^\s*\|.*$/gm, "")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/^\s{0,3}(#{1,6}\s+|>\s?|[-*+]\s+(\[[ x]\]\s+)?|\d+\.\s+)/gm, "")
+    .replace(/(\*\*|__|~~)(\S(?:.*?\S)?)\1/g, "$2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** `mcp__plugin_hm_playwright__browser_click` → `playwright: browser_click`. */
+function toolName(name) {
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name || "");
+  return mcp ? `${mcp[1].split("_").at(-1)}: ${mcp[2]}` : name;
+}
+
+const toolLabel = (tool) =>
+  tool.summary
+    ? `${toolName(tool.name)}: ${tool.summary}`
+    : toolName(tool.name);
 
 function meterLevel(pct) {
   if (pct >= 90) return "critical";
@@ -218,6 +263,8 @@ function applySnapshot(snapshot) {
   state.sessions = new Map(snapshot.sessions.map((s) => [s.id, s]));
   state.rateLimits = snapshot.rate_limits;
   scheduleRender();
+  loadRecent();
+  if (state.detailId) scheduleDetailRefresh();
 }
 
 function applyUpdate(update) {
@@ -226,7 +273,8 @@ function applyUpdate(update) {
     state.sessions.set(update.session.id, update.session);
     if (
       state.detailId === update.session.id &&
-      detailChanged(previous, update.session)
+      (!previous ||
+        detailSignature(previous) !== detailSignature(update.session))
     ) {
       scheduleDetailRefresh();
     }
@@ -238,12 +286,17 @@ function applyUpdate(update) {
   scheduleRender();
 }
 
-const detailChanged = (a, b) =>
-  !a ||
-  a.activity !== b.activity ||
-  a.reply?.at !== b.reply?.at ||
-  a.prompt?.at !== b.prompt?.at ||
-  a.tool?.started_at !== b.tool?.started_at;
+/** Changes that add or alter conversation items. */
+const detailSignature = (s) =>
+  [
+    s.activity,
+    s.prompt?.at,
+    s.reply?.at,
+    s.turn?.tools,
+    s.turn?.ended_at,
+    s.subagents.length,
+    s.tasks.map((t) => t.status).join(),
+  ].join("|");
 
 // --- sessions view ----------------------------------------------------------
 
@@ -255,7 +308,11 @@ function scheduleRender() {
   requestAnimationFrame(() => {
     renderQueued = false;
     renderSessions();
-    if (state.detailId) renderDetailHead();
+    if (state.detailId) {
+      renderDetailHead();
+      if (state.detailTab === "details") renderDetailBody();
+      else renderLive();
+    }
   });
 }
 
@@ -301,6 +358,15 @@ function renderSessions() {
         text: "No Claude Code sessions are running.",
       }),
     );
+  } else {
+    groups.push(
+      h(
+        "div",
+        { class: "legend strip-legend" },
+        h("span", { class: "muted", text: "Bars show the last hour:" }),
+        [...STATES, "idle"].map(legendChip),
+      ),
+    );
   }
   if (needs.length) groups.push(group("Needs you", needs));
   if (working.length) groups.push(group("Working", working));
@@ -308,6 +374,14 @@ function renderSessions() {
   if (gone.length) groups.push(group("Ended", gone, true));
   $("#groups").replaceChildren(...groups);
 }
+
+const legendChip = (activity) =>
+  h(
+    "span",
+    { "data-activity": activity },
+    h("i", { "aria-hidden": "true" }),
+    ACTIVITY[activity].label,
+  );
 
 function countTile(name, value) {
   return h(
@@ -397,13 +471,12 @@ function badge(activity) {
   );
 }
 
-function sessionDetail(s) {
-  if (s.waiting_for) return s.waiting_for;
-  if (s.tool) return `${s.tool.name}: ${s.tool.summary}`.replace(/: $/, "");
-  if (s.activity === "your_turn" && s.reply) return firstLine(s.reply.text);
-  if (s.prompt) return firstLine(s.prompt.text);
-  return "";
-}
+const clock = (since) =>
+  h("span", {
+    class: "since",
+    "data-since": since,
+    text: fmtDuration(now() - since),
+  });
 
 function card(s) {
   const where = [
@@ -413,24 +486,6 @@ function card(s) {
   ]
     .filter(Boolean)
     .join(" · ");
-  const meta = [];
-  if (s.context_pct !== null && s.context_pct !== undefined) {
-    meta.push(
-      h(
-        "span",
-        { class: "meta-item" },
-        h(
-          "span",
-          { class: "meter", "data-level": meterLevel(s.context_pct) },
-          meterFill(s.context_pct),
-        ),
-        `context ${Math.round(s.context_pct)}%`,
-      ),
-    );
-  }
-  if (s.cost_usd) meta.push(fmtUsd(s.cost_usd));
-  if (s.tool) meta.push(`tool ${fmtDuration(now() - s.tool.started_at)}`);
-
   return h(
     "button",
     {
@@ -443,27 +498,151 @@ function card(s) {
       "span",
       { class: "session-top" },
       badge(s.activity),
-      h("span", {
-        class: "since",
-        "data-since": s.activity_since,
-        text: fmtDuration(now() - s.activity_since),
-      }),
+      clock(s.activity_since),
     ),
     h("span", { class: "session-title", text: label(s) }),
     h("span", { class: "session-where", title: s.cwd, text: where }),
-    sessionDetail(s)
-      ? h("span", { class: "session-detail", text: sessionDetail(s) })
-      : null,
-    meta.length
-      ? h(
-          "span",
-          { class: "session-meta" },
-          ...meta.flatMap((m, i) =>
-            i ? [h("span", { "aria-hidden": "true", text: "·" }), m] : [m],
-          ),
-        )
+    s.hooked || s.activity === "gone"
+      ? [focusLine(s), taskBar(s.tasks), cardProgress(s), cardMeta(s)]
+      : h("span", {
+          class: "session-note",
+          text: "Started before ccdash was installed, so only busy and idle are known. Resume it to see details.",
+        }),
+    strip(s),
+  );
+}
+
+/** The one line that matters most for the session's state. */
+function focusLine(s) {
+  if (s.waiting_for)
+    return h("span", { class: "session-focus mono", text: s.waiting_for });
+  if (s.activity === "working" && s.tool)
+    return h(
+      "span",
+      { class: "session-tool" },
+      h("span", { class: "mono", text: toolLabel(s.tool) }),
+      clock(s.tool.started_at),
+    );
+  const [who, text] =
+    s.activity === "working" || !s.reply
+      ? ["You", s.prompt?.text]
+      : ["Claude", s.reply.text];
+  const preview = plain(text);
+  if (!preview) return null;
+  return h(
+    "span",
+    { class: "session-detail" },
+    h("span", { class: "who", text: who }),
+    " ",
+    preview,
+  );
+}
+
+function taskBar(tasks) {
+  if (!tasks?.length) return null;
+  const done = tasks.filter((t) => t.status === "completed").length;
+  const active = tasks.find((t) => t.status === "in_progress");
+  return h(
+    "span",
+    { class: "session-tasks" },
+    h(
+      "span",
+      { class: "meter", "data-level": "neutral" },
+      meterFill((100 * done) / tasks.length),
+    ),
+    h("span", { class: "tasks-count", text: `${done}/${tasks.length}` }),
+    active
+      ? h("span", {
+          class: "tasks-active",
+          text: active.active_form || active.subject,
+        })
       : null,
   );
+}
+
+function turnFacts(s) {
+  const t = s.turn;
+  if (!t) return [];
+  const running =
+    !t.ended_at && (s.activity === "working" || s.activity === "permission");
+  return [
+    running
+      ? h("span", {}, "turn ", clock(t.started_at))
+      : t.ended_at
+        ? `turn took ${fmtDuration(t.ended_at - t.started_at)}`
+        : null,
+    t.tools ? plural(t.tools, "tool") : null,
+    t.failures ? `${t.failures} failed` : null,
+    t.files.length ? plural(t.files.length, "file") : null,
+  ];
+}
+
+function cardProgress(s) {
+  const items = [
+    ...(s.activity === "gone" ? [] : turnFacts(s)),
+    s.subagents.length ? plural(s.subagents.length, "subagent") : null,
+  ].filter(Boolean);
+  return items.length
+    ? h("span", { class: "session-meta" }, joined(items))
+    : null;
+}
+
+function cardMeta(s) {
+  const items = [
+    known(s.context_pct)
+      ? h(
+          "span",
+          { class: "meta-item" },
+          h(
+            "span",
+            { class: "meter", "data-level": meterLevel(s.context_pct) },
+            meterFill(s.context_pct),
+          ),
+          `context ${Math.round(s.context_pct)}%`,
+        )
+      : null,
+    s.cost_usd ? fmtUsd(s.cost_usd) : null,
+  ].filter(Boolean);
+  return items.length
+    ? h("span", { class: "session-meta" }, joined(items))
+    : null;
+}
+
+/** Last-hour activity bar; the newest stretch comes from the live state. */
+function strip(s) {
+  const t1 = now();
+  const t0 = t1 - STRIP_MS;
+  const segs = (state.recent.get(s.id)?.segments || []).map((seg) => [...seg]);
+  if (s.activity !== "gone") {
+    const from = Math.max(s.activity_since, t0);
+    while (segs.length && segs.at(-1)[0] >= from) segs.pop();
+    const last = segs.at(-1);
+    if (last) last[1] = Math.min(last[1], from);
+    if (last && last[2] === s.activity) last[1] = t1;
+    else segs.push([from, t1, s.activity]);
+  }
+  const bar = h("span", { class: "strip", "aria-hidden": "true" });
+  for (const [a, b, activity] of segs) {
+    if (b <= t0 || activity === "gone") continue;
+    const left = ((Math.max(a, t0) - t0) / STRIP_MS) * 100;
+    const width = ((Math.min(b, t1) - Math.max(a, t0)) / STRIP_MS) * 100;
+    const seg = h("i", { "data-activity": activity });
+    seg.style.left = `${left}%`;
+    seg.style.width = `calc(${width}% - 2px)`;
+    bar.append(seg);
+  }
+  return bar;
+}
+
+async function loadRecent() {
+  if ($("#view-sessions").hidden || !token()) return;
+  try {
+    const data = await getJson(`history?since=${Math.round(now() - STRIP_MS)}`);
+    state.recent = new Map(data.lanes.map((lane) => [lane.id, lane]));
+    scheduleRender();
+  } catch (e) {
+    if (e instanceof Unauthorized) askToken();
+  }
 }
 
 function tickClocks() {
@@ -472,28 +651,39 @@ function tickClocks() {
   }
 }
 
-// --- detail dialog ----------------------------------------------------------
+// --- session sheet ----------------------------------------------------------
 
 let detailTimer = null;
 
+/** Refetches the newest exchanges at most once a second. */
 function scheduleDetailRefresh() {
-  clearTimeout(detailTimer);
-  detailTimer = setTimeout(
-    () => state.detailId && loadDetail(state.detailId),
-    400,
-  );
+  if (detailTimer) return;
+  detailTimer = setTimeout(() => {
+    detailTimer = null;
+    if (state.detailId) loadConversation("refresh");
+  }, 1000);
 }
 
 function openDetail(id) {
   state.detailId = id;
+  state.convo = { id, exchanges: [], more: false, stats: null, loaded: false };
   const dialog = $("#detail");
   dialog.replaceChildren(
     h("div", { class: "detail-head" }),
     h("div", { class: "detail-body" }),
   );
   renderDetailHead();
+  renderDetailBody();
   if (!dialog.open) dialog.showModal();
-  loadDetail(id);
+  loadConversation("initial");
+}
+
+function setDetailTab(tab) {
+  state.detailTab = tab;
+  renderDetailHead();
+  renderDetailBody();
+  if (tab === "conversation") scrollToEnd();
+  else $("#detail").scrollTop = 0;
 }
 
 function renderDetailHead() {
@@ -524,64 +714,360 @@ function renderDetailHead() {
       "div",
       { class: "session-top" },
       badge(s.activity),
-      h("span", {
-        class: "since",
-        "data-since": s.activity_since,
-        text: fmtDuration(now() - s.activity_since),
-      }),
+      clock(s.activity_since),
     ),
     h("h2", { id: "detail-title", text: label(s) }),
     h("div", { class: "session-where", title: s.cwd, text: s.cwd }),
-    actions.length ? h("div", { class: "detail-actions" }, actions) : null,
+    h(
+      "div",
+      { class: "detail-bar" },
+      h(
+        "div",
+        { class: "filters", role: "tablist", "aria-label": "Session view" },
+        [
+          ["conversation", "Conversation"],
+          ["details", "Details"],
+        ].map(([tab, text]) =>
+          h("button", {
+            type: "button",
+            role: "tab",
+            "aria-selected": String(state.detailTab === tab),
+            text,
+            onclick: () => setDetailTab(tab),
+          }),
+        ),
+      ),
+      actions,
+    ),
   );
 }
 
-async function loadDetail(id) {
-  let detail;
+async function loadConversation(mode) {
+  const c = state.convo;
+  if (!c) return;
+  const id = c.id;
+  const query =
+    mode === "older"
+      ? `?before=${c.exchanges[0].at}&limit=${PAGE}`
+      : `?limit=${mode === "refresh" ? 4 : PAGE}`;
+  let page;
   try {
-    detail = await getJson(`sessions/${encodeURIComponent(id)}?limit=80`);
+    page = await getJson(`sessions/${encodeURIComponent(id)}${query}`);
   } catch (e) {
     if (e instanceof Unauthorized) return askToken();
     return;
   }
-  if (state.detailId !== id) return;
-  const s = detail.session;
-  const body = $("#detail .detail-body");
-  if (!body) return;
-  const sections = [];
-  if (s.waiting_for)
-    sections.push(
-      h("h3", { text: "Waiting for" }),
-      h("p", { text: s.waiting_for }),
-    );
-  if (s.tool && s.activity !== "permission") {
-    sections.push(
-      h("h3", { text: "Running" }),
-      h("p", { class: "mono", text: `${s.tool.name}: ${s.tool.summary}` }),
-    );
+  if (state.convo !== c) return;
+  const conv = page.conversation;
+  const dialog = $("#detail");
+  const atEnd =
+    dialog.scrollHeight - dialog.scrollTop - dialog.clientHeight < 80;
+  const heightBefore = dialog.scrollHeight;
+
+  if (mode === "older") {
+    c.exchanges = [...conv.exchanges, ...c.exchanges];
+    c.more = conv.more;
+  } else if (mode === "initial" || !conv.more || !c.exchanges.length) {
+    c.exchanges = conv.exchanges;
+    c.more = conv.more;
+  } else {
+    const cut = conv.exchanges[0].at;
+    const kept = c.exchanges.filter((e) => e.at < cut);
+    if (kept.length === c.exchanges.length && kept.length)
+      return void loadConversation("initial");
+    c.exchanges = [...kept, ...conv.exchanges];
   }
-  if (detail.reply_html)
-    sections.push(
-      h("h3", { text: `Last reply · ${fmtTime(s.reply.at)}` }),
-      prose(detail.reply_html),
-    );
-  if (detail.prompt_html)
-    sections.push(
-      h("h3", { text: `Last prompt · ${fmtTime(s.prompt.at)}` }),
-      prose(detail.prompt_html),
-    );
-  sections.push(h("h3", { text: "Details" }), facts(s));
-  if (detail.events.length) {
-    sections.push(
-      h("h3", { text: "Recent activity" }),
-      h("ul", { class: "events" }, [...detail.events].reverse().map(eventItem)),
-    );
-  }
-  body.replaceChildren(...sections);
+  if (page.stats) c.stats = page.stats;
+  c.loaded = true;
+  renderDetailBody();
+
+  if (state.detailTab !== "conversation") return;
+  if (mode === "older") dialog.scrollTop += dialog.scrollHeight - heightBefore;
+  else if (mode === "initial" || atEnd) scrollToEnd();
 }
 
-function prose(html) {
-  const el = h("div", { class: "prose" });
+function scrollToEnd() {
+  const dialog = $("#detail");
+  dialog.scrollTop = dialog.scrollHeight;
+}
+
+function renderDetailBody() {
+  const body = $("#detail .detail-body");
+  const s = state.sessions.get(state.detailId);
+  if (!body || !s) return;
+  const openKeys = new Set(
+    [...body.querySelectorAll("details[data-key][open]")].map(
+      (d) => d.dataset.key,
+    ),
+  );
+  if (state.detailTab === "details") {
+    body.replaceChildren(...detailsTab(s, state.convo?.stats));
+  } else {
+    body.replaceChildren(...conversationTab(s));
+    clampReplies(body);
+  }
+  for (const d of body.querySelectorAll("details[data-key]")) {
+    if (openKeys.has(d.dataset.key)) d.open = true;
+  }
+}
+
+function unhookedNote(s) {
+  return h(
+    "div",
+    { class: "callout" },
+    h("strong", { text: "No hook data for this session." }),
+    " It started before ccdash was installed, so only busy and idle are known. Exit it and run ",
+    h("code", { text: `claude --resume ${s.id}` }),
+    " in the same directory to see its conversation and progress.",
+  );
+}
+
+// --- conversation tab -------------------------------------------------------
+
+function conversationTab(s) {
+  const c = state.convo;
+  const out = [];
+  if (!s.hooked && s.activity !== "gone") out.push(unhookedNote(s));
+  if (c.more) {
+    out.push(
+      h("button", {
+        class: "btn btn-quiet load-older",
+        type: "button",
+        text: "Show earlier messages",
+        onclick: (event) => {
+          event.currentTarget.disabled = true;
+          loadConversation("older");
+        },
+      }),
+    );
+  }
+  if (c.loaded && !c.exchanges.length && s.hooked) {
+    out.push(h("p", { class: "muted center", text: "No messages yet." }));
+  }
+  const lastReply = lastReplyAt(c.exchanges);
+  for (const ex of c.exchanges) out.push(exchange(ex, lastReply));
+  out.push(h("div", { id: "live" }, liveBlock(s)));
+  return out;
+}
+
+function lastReplyAt(exchanges) {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const reply = exchanges[i].items.findLast((it) => it.kind === "reply");
+    if (reply) return reply.at;
+  }
+  return null;
+}
+
+const GROUPED = new Set(["tool", "permission", "task"]);
+
+function exchange(ex, lastReply) {
+  const out = [];
+  if (ex.prompt !== null) {
+    out.push(
+      h(
+        "div",
+        { class: "msg msg-user" },
+        h("div", { class: "bubble clamp", text: ex.prompt }),
+        h("time", { text: fmtStamp(ex.at) }),
+      ),
+    );
+  }
+  let run = [];
+  let omitted = ex.omitted;
+  const flush = () => {
+    if (!run.length) return;
+    out.push(activityGroup(run, omitted));
+    run = [];
+    omitted = 0;
+  };
+  for (const item of ex.items) {
+    if (GROUPED.has(item.kind)) {
+      run.push(item);
+      continue;
+    }
+    flush();
+    out.push(convItem(item, item.at === lastReply));
+  }
+  flush();
+  return h("section", { class: "exchange" }, out);
+}
+
+function activityGroup(items, omitted) {
+  const tools = items.filter((i) => i.kind === "tool");
+  const failed = tools.filter((t) => !t.ok).length;
+  const asks = items.filter((i) => i.kind === "permission").length;
+  const tasks = items.filter((i) => i.kind === "task").length;
+  const span = items.at(-1).at - items[0].at;
+  const counts = new Map();
+  for (const t of tools) counts.set(t.name, (counts.get(t.name) || 0) + 1);
+  const top = [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name, n]) => `${toolName(name)}${n > 1 ? ` ×${n}` : ""}`)
+    .join(", ");
+  const summary = [
+    tools.length + omitted ? plural(tools.length + omitted, "tool call") : null,
+    failed ? `${failed} failed` : null,
+    asks ? plural(asks, "permission request") : null,
+    tasks ? plural(tasks, "task update") : null,
+    span >= 1000 ? fmtDuration(span) : null,
+  ].filter(Boolean);
+  return h(
+    "details",
+    { class: "activity", "data-key": `g${items[0].at}` },
+    h(
+      "summary",
+      {},
+      h("span", { class: "activity-sum" }, joined(summary)),
+      top ? h("span", { class: "activity-top", text: top }) : null,
+    ),
+    h(
+      "ol",
+      { class: "steps" },
+      omitted
+        ? h("li", {
+            class: "muted",
+            text: `${plural(omitted, "earlier tool call")} not shown`,
+          })
+        : null,
+      items.map(step),
+    ),
+  );
+}
+
+function step(item) {
+  const time = h("time", { text: fmtTime(item.at) });
+  if (item.kind === "permission") {
+    return h(
+      "li",
+      { class: "step-ask" },
+      time,
+      h("span", { class: "step-icon", text: "?" }),
+      h("span", {
+        class: "step-text",
+        text: `Asked permission: ${toolName(item.tool)}${item.summary ? ` ${item.summary}` : ""}`,
+      }),
+    );
+  }
+  if (item.kind === "task") {
+    const verb = {
+      pending: "added",
+      in_progress: "started",
+      completed: "completed",
+      deleted: "removed",
+    }[item.status];
+    return h(
+      "li",
+      {},
+      time,
+      h("span", {
+        class: "step-icon",
+        text: item.status === "completed" ? "✓" : "☐",
+      }),
+      h("span", { class: "step-text", text: `Task ${verb}: ${item.subject}` }),
+    );
+  }
+  return h(
+    "li",
+    { class: item.ok ? null : "step-failed" },
+    time,
+    h("span", {
+      class: "step-icon",
+      text: item.ok ? "" : "✗",
+      title: item.ok ? null : "failed",
+    }),
+    h(
+      "span",
+      { class: "step-text" },
+      h("strong", { text: toolName(item.name) }),
+      item.summary
+        ? h("span", { class: "mono", text: ` ${item.summary}` })
+        : null,
+    ),
+    known(item.ms) && item.ms >= 1000
+      ? h("span", { class: "step-ms", text: fmtDuration(item.ms) })
+      : null,
+  );
+}
+
+function convItem(item, isLastReply) {
+  switch (item.kind) {
+    case "reply":
+      return h(
+        "div",
+        { class: "msg msg-claude" },
+        prose(item.html, !isLastReply),
+        h("time", { text: fmtStamp(item.at) }),
+      );
+    case "error":
+      return h(
+        "div",
+        { class: "conv-note conv-error" },
+        h("strong", { text: "Turn failed: " }),
+        item.error,
+      );
+    case "subagent":
+      return h(
+        "details",
+        { class: "subagent", "data-key": `a${item.at}` },
+        h(
+          "summary",
+          {},
+          h("span", {
+            class: "subagent-kind",
+            text: item.agent_type || "Subagent",
+          }),
+          h("span", { text: item.description || "finished" }),
+          h(
+            "span",
+            { class: "muted" },
+            joined(
+              [
+                known(item.tools) ? plural(item.tools, "tool call") : null,
+                known(item.ms) ? fmtDuration(item.ms) : null,
+              ].filter(Boolean),
+            ),
+          ),
+        ),
+        item.html
+          ? prose(item.html)
+          : h("p", { class: "muted", text: "No final message." }),
+      );
+    case "compact":
+      return h(
+        "details",
+        { class: "conv-note compact", "data-key": `c${item.at}` },
+        h("summary", {
+          text: `Context compacted${item.trigger ? ` (${item.trigger})` : ""} · ${fmtTime(item.at)}`,
+        }),
+        item.html ? prose(item.html) : null,
+      );
+    case "start":
+      if (item.source === "compact") return null;
+      return divider(
+        {
+          startup: "Session started",
+          resume: "Session resumed",
+          clear: "Conversation cleared",
+        }[item.source] || `Session started (${item.source})`,
+        item.at,
+      );
+    case "end":
+      return divider(`Session ended (${item.reason})`, item.at);
+    default:
+      return null;
+  }
+}
+
+const divider = (text, at) =>
+  h(
+    "div",
+    { class: "divider" },
+    h("span", { text: `${text} · ${fmtStamp(at)}` }),
+  );
+
+function prose(html, clamp = false) {
+  const el = h("div", { class: clamp ? "prose clamp" : "prose" });
   // NOTE: server-rendered markdown with raw HTML escaped (src/markdown.rs)
   el.innerHTML = html;
   for (const a of el.querySelectorAll("a")) {
@@ -591,20 +1077,246 @@ function prose(html) {
   return el;
 }
 
+function clampReplies(root) {
+  for (const el of root.querySelectorAll(".clamp")) {
+    if (el.scrollHeight <= el.clientHeight + 8) {
+      el.classList.remove("clamp");
+      continue;
+    }
+    el.after(
+      h("button", {
+        class: "show-more",
+        type: "button",
+        text: "Show all",
+        onclick: (event) => {
+          el.classList.remove("clamp");
+          event.currentTarget.remove();
+        },
+      }),
+    );
+  }
+}
+
+/** What the session is doing right now, below the newest exchange. */
+function liveBlock(s) {
+  if (!s || s.activity === "gone" || !s.hooked) return null;
+  const rows = [];
+  if (s.activity === "permission") {
+    rows.push(
+      h(
+        "div",
+        { class: "live-row" },
+        badge("permission"),
+        h("span", { class: "mono", text: s.waiting_for || "" }),
+      ),
+    );
+  } else if (s.activity === "working") {
+    rows.push(
+      h(
+        "div",
+        { class: "live-row" },
+        badge("working"),
+        s.tool
+          ? [
+              h("span", { class: "mono", text: toolLabel(s.tool) }),
+              clock(s.tool.started_at),
+            ]
+          : h("span", { class: "muted", text: "thinking" }),
+      ),
+    );
+  }
+  const facts =
+    s.activity === "working" || s.activity === "permission"
+      ? turnFacts(s).filter(Boolean)
+      : [];
+  if (facts.length) rows.push(h("div", { class: "live-facts" }, joined(facts)));
+  if (s.subagents.length) rows.push(subagentList(s.subagents));
+  if (s.tasks.length) {
+    const done = s.tasks.filter((t) => t.status === "completed").length;
+    rows.push(
+      h(
+        "details",
+        { class: "live-tasks", "data-key": "tasks" },
+        h("summary", {}, taskBar(s.tasks) || `${done}/${s.tasks.length} tasks`),
+        taskList(s.tasks),
+      ),
+    );
+  }
+  return rows.length
+    ? h("div", { class: "live", "data-activity": s.activity }, rows)
+    : null;
+}
+
+function renderLive() {
+  const live = $("#live");
+  const s = state.sessions.get(state.detailId);
+  if (!live || !s) return;
+  const open = live.querySelector("details[open]") !== null;
+  live.replaceChildren(...[liveBlock(s)].filter(Boolean));
+  const details = live.querySelector("details");
+  if (details && open) details.open = true;
+}
+
+function subagentList(subagents) {
+  return h(
+    "ul",
+    { class: "subagents" },
+    subagents.map((a) =>
+      h(
+        "li",
+        {},
+        h("span", {
+          class: "dot",
+          "data-activity": "working",
+          "aria-hidden": "true",
+        }),
+        h("span", { class: "subagent-kind", text: a.agent_type || "Subagent" }),
+        h("span", { text: a.description || "" }),
+        h(
+          "span",
+          { class: "muted" },
+          joined(
+            [
+              a.tool
+                ? h("span", { class: "mono", text: toolLabel(a.tool) })
+                : null,
+              a.tools ? plural(a.tools, "tool") : null,
+              clock(a.started_at),
+            ].filter(Boolean),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function taskList(tasks) {
+  const icon = { completed: "✓", in_progress: "◐", pending: "○" };
+  return h(
+    "ul",
+    { class: "tasks" },
+    tasks.map((t) =>
+      h(
+        "li",
+        { "data-status": t.status },
+        h("span", {
+          class: "task-icon",
+          "aria-hidden": "true",
+          text: icon[t.status],
+        }),
+        h("span", {
+          text:
+            t.status === "in_progress" && t.active_form
+              ? t.active_form
+              : t.subject,
+        }),
+        h("span", {
+          class: "visually-hidden",
+          text: ` (${t.status.replace("_", " ")})`,
+        }),
+      ),
+    ),
+  );
+}
+
+// --- details tab ------------------------------------------------------------
+
+function detailsTab(s, stats) {
+  const out = [];
+  if (!s.hooked && s.activity !== "gone") out.push(unhookedNote(s));
+  if (s.waiting_for) {
+    out.push(
+      h("h3", { text: "Waiting for" }),
+      h("p", { class: "mono", text: s.waiting_for }),
+    );
+  }
+  if (s.turn) {
+    const t = s.turn;
+    out.push(
+      h("h3", { text: t.ended_at ? "Last turn" : "Current turn" }),
+      factList([
+        ["Started", fmtStamp(t.started_at)],
+        [
+          "Duration",
+          t.ended_at
+            ? fmtDuration(t.ended_at - t.started_at)
+            : `${fmtDuration(now() - t.started_at)} so far`,
+        ],
+        [
+          "Tool calls",
+          `${t.tools}${t.failures ? ` (${t.failures} failed)` : ""}`,
+        ],
+        ["Subagent tool calls", t.subagent_tools || null],
+      ]),
+    );
+    if (t.files.length) {
+      out.push(
+        h("h3", { text: `Files edited (${t.files.length})` }),
+        h(
+          "ul",
+          { class: "files" },
+          t.files.map((f) => h("li", { class: "mono", text: f })),
+        ),
+      );
+    }
+  }
+  if (s.subagents.length) {
+    out.push(
+      h("h3", { text: `Running subagents (${s.subagents.length})` }),
+      subagentList(s.subagents),
+    );
+  }
+  if (s.tasks.length) {
+    const done = s.tasks.filter((t) => t.status === "completed").length;
+    out.push(
+      h("h3", { text: `Tasks (${done}/${s.tasks.length} done)` }),
+      taskList(s.tasks),
+    );
+  }
+  if (stats) {
+    out.push(
+      h("h3", { text: "Session totals" }),
+      factList([
+        ["Prompts", stats.prompts],
+        [
+          "Tool calls",
+          `${stats.tools}${stats.failures ? ` (${stats.failures} failed)` : ""}`,
+        ],
+        ["Files edited", stats.files],
+        ["Subagents run", stats.subagents || null],
+        ["Compactions", stats.compactions || null],
+        ["Working", fmtDuration(stats.working_ms)],
+        [
+          "Waited on you",
+          fmtDuration(stats.permission_ms + stats.your_turn_ms),
+        ],
+      ]),
+    );
+  }
+  out.push(h("h3", { text: "Session" }), facts(s));
+  return out;
+}
+
+function factList(rows) {
+  return h(
+    "dl",
+    { class: "facts" },
+    rows
+      .filter(([, value]) => known(value) && value !== "")
+      .flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v })]),
+  );
+}
+
 function facts(s) {
-  const rows = [
+  return factList([
     ["Model", s.model],
+    ["Effort", s.effort],
     ["Permission mode", s.permission_mode],
-    [
-      "Context",
-      s.context_pct !== null && s.context_pct !== undefined
-        ? `${Math.round(s.context_pct)}%`
-        : null,
-    ],
+    ["Context", known(s.context_pct) ? `${Math.round(s.context_pct)}%` : null],
     ["Cost", s.cost_usd ? `${fmtUsd(s.cost_usd)} (API-equivalent)` : null],
     [
       "Lines",
-      s.lines_added !== null && s.lines_added !== undefined
+      known(s.lines_added)
         ? `+${s.lines_added} −${s.lines_removed ?? 0}`
         : null,
     ],
@@ -615,53 +1327,12 @@ function facts(s) {
     ["Window", s.window ? `niri #${s.window.id}` : null],
     [
       "Started",
-      `${fmtTime(s.started_at)} (${fmtDuration(now() - s.started_at)} ago)`,
+      `${fmtStamp(s.started_at)} (${fmtDuration(now() - s.started_at)} ago)`,
     ],
+    ["Directory", s.cwd],
     ["Host", s.host],
     ["Session id", s.id],
-  ].filter(([, value]) => value);
-  return h(
-    "dl",
-    { class: "facts" },
-    rows.flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v })]),
-  );
-}
-
-function describeEvent(e) {
-  const d = e.data || {};
-  switch (e.kind) {
-    case "prompt":
-      return `Prompt: ${firstLine(d.text)}`;
-    case "reply":
-      return `Reply: ${firstLine(d.text)}`;
-    case "tool":
-      return `${d.ok === false ? "✗ " : ""}${d.name}${d.summary ? `: ${d.summary}` : ""}${d.ms !== null && d.ms !== undefined ? ` (${fmtDuration(d.ms)})` : ""}`;
-    case "permission":
-      return `Asked permission: ${d.tool}${d.summary ? ` ${d.summary}` : ""}`;
-    case "activity":
-      return `→ ${ACTIVITY[d.to]?.label ?? d.to}`;
-    case "notification":
-      return d.message || d.type;
-    case "start":
-      return `Session started (${d.source})`;
-    case "end":
-      return `Session ended (${d.reason})`;
-    case "compact":
-      return "Context compacted";
-    case "error":
-      return `Error: ${d.error}`;
-    default:
-      return e.kind;
-  }
-}
-
-function eventItem(e) {
-  return h(
-    "li",
-    {},
-    h("time", { text: fmtTime(e.ts) }),
-    h("span", { text: describeEvent(e) }),
-  );
+  ]);
 }
 
 // --- history view -----------------------------------------------------------
@@ -679,7 +1350,9 @@ async function loadHistory() {
   const container = $("#history");
   container.classList.add("loading");
   try {
-    state.history = await getJson(`history?since=${rangeSince(state.range)}`);
+    state.history = await getJson(
+      `history?since=${Math.round(rangeSince(state.range))}`,
+    );
     renderHistory();
   } catch (e) {
     if (e instanceof Unauthorized) askToken();
@@ -711,14 +1384,20 @@ function renderHistory() {
       "total across sessions",
     ),
     statTile("Working time", fmtDuration(sum.working), "total across sessions"),
-    statTile("Sessions", data.lanes.length, null),
+    statTile("Prompts", data.prompts, plural(data.lanes.length, "session")),
     statTile(
       "API-equivalent cost",
       fmtUsd(data.cost_usd),
       "from statusline totals",
     ),
   );
-  $("#history").replaceChildren(tiles, usageChart(data), timelineChart(data));
+  $("#history").replaceChildren(
+    tiles,
+    timelineChart(data),
+    projectsChart(data),
+    toolsChart(data),
+    usageChart(data),
+  );
 }
 
 function statTile(name, value, sub) {
@@ -735,9 +1414,26 @@ function chartWidth() {
   return Math.max(280, ($("#history").clientWidth || 600) - 32);
 }
 
+function chartFigure(title, sub, ...extra) {
+  return h(
+    "figure",
+    { class: "chart" },
+    h(
+      "figcaption",
+      {},
+      h("div", { class: "chart-title", text: title }),
+      h("div", { class: "chart-sub", text: sub }),
+    ),
+    ...extra,
+  );
+}
+
+const stateLegend = (states) =>
+  h("div", { class: "legend" }, states.map(legendChip));
+
 function timeTicks(since, until, width) {
   const steps = [15, 30, 60, 120, 180, 360, 720, 1440].map((m) => m * 60_000);
-  const maxTicks = Math.max(2, Math.floor(width / 80));
+  const maxTicks = Math.max(2, Math.floor(width / 110));
   const step =
     steps.find((st) => (until - since) / st <= maxTicks) ?? steps.at(-1);
   const first = new Date(since);
@@ -758,7 +1454,9 @@ function tooltipFor(figure) {
     show(event, value, ...lines) {
       tip.replaceChildren(
         h("strong", { text: value }),
-        ...lines.map((l) => h("div", { class: "muted", text: l })),
+        ...lines
+          .filter(Boolean)
+          .map((l) => h("div", { class: "muted", text: l })),
       );
       tip.hidden = false;
       const box = figure.getBoundingClientRect();
@@ -806,19 +1504,171 @@ function tableView(headers, rows) {
   );
 }
 
-function usageChart(data) {
-  const figure = h(
-    "figure",
-    { class: "chart" },
-    h(
-      "figcaption",
-      {},
-      h("div", { class: "chart-title", text: "5-hour limit used" }),
-      h("div", {
-        class: "chart-sub",
-        text: `Highest reading per ${fmtDuration(data.bucket_ms)}`,
+const ellipsize = (text, max) =>
+  text.length > max ? `${text.slice(0, max - 1)}…` : text;
+
+/**
+ * Horizontal bars, one row per entry, label above the bar and the value
+ * label after it. `parts` are stacked `[value, activity|null]` pairs.
+ */
+function barRows(figure, rows, { valueText, tipText }) {
+  const width = chartWidth();
+  const rowH = 34;
+  const barH = 12;
+  const valueW = 92;
+  const plotW = width - valueW;
+  const max = Math.max(...rows.map((r) => r.total), 1);
+  const svg = s("svg", {
+    viewBox: `0 0 ${width} ${rows.length * rowH}`,
+    height: rows.length * rowH,
+    role: "img",
+    "aria-label": figure.querySelector(".chart-title").textContent,
+  });
+  const tip = tooltipFor(figure);
+  const maxChars = Math.floor(width / 7.2);
+  rows.forEach((row, i) => {
+    const top = i * rowH;
+    svg.append(
+      s("text", {
+        class: "lane-label",
+        x: 0,
+        y: top + 12,
+        text: ellipsize(row.label, maxChars),
       }),
+    );
+    let x = 0;
+    for (const [value, activity] of row.parts) {
+      if (value <= 0) continue;
+      const w = (value / max) * plotW;
+      const rect = s("rect", {
+        class: activity ? "seg" : "seg seg-neutral",
+        "data-activity": activity,
+        x,
+        y: top + 17,
+        width: Math.max(1, w - 2),
+        height: barH,
+        rx: Math.min(3, w / 2),
+      });
+      rect.addEventListener("pointermove", (event) =>
+        tip.show(event, ...tipText(row, value, activity)),
+      );
+      rect.addEventListener("pointerleave", () => tip.hide());
+      svg.append(rect);
+      x += w;
+    }
+    svg.append(
+      s("text", {
+        x: x + 6,
+        y: top + 27,
+        text: valueText(row),
+      }),
+    );
+  });
+  figure.append(svg);
+}
+
+function projectsChart(data) {
+  const figure = chartFigure(
+    "Time by project",
+    "Working and waiting time per directory",
+    stateLegend(STATES),
+  );
+  const by = new Map();
+  for (const lane of data.lanes) {
+    const key = place(lane.cwd);
+    const t = totals(lane);
+    const p = by.get(key) || {
+      label: key,
+      working: 0,
+      permission: 0,
+      your_turn: 0,
+      sessions: 0,
+    };
+    for (const a of STATES) p[a] += t[a];
+    p.sessions += 1;
+    by.set(key, p);
+  }
+  let rows = [...by.values()]
+    .map((p) => ({ ...p, total: p.working + p.permission + p.your_turn }))
+    .filter((p) => p.total > 0)
+    .sort((a, b) => b.total - a.total);
+  if (rows.length > 8) {
+    const rest = rows.slice(7);
+    const other = { label: `Other (${rest.length})`, sessions: 0, total: 0 };
+    for (const a of STATES) other[a] = rest.reduce((n, p) => n + p[a], 0);
+    other.sessions = rest.reduce((n, p) => n + p.sessions, 0);
+    other.total = rest.reduce((n, p) => n + p.total, 0);
+    rows = [...rows.slice(0, 7), other];
+  }
+  if (!rows.length) {
+    figure.append(
+      h("p", { class: "muted", text: "No session activity in this range." }),
+    );
+    return figure;
+  }
+  for (const row of rows) row.parts = STATES.map((a) => [row[a], a]);
+  barRows(figure, rows, {
+    valueText: (row) => fmtDuration(row.total),
+    tipText: (row, value, activity) => [
+      fmtDuration(value),
+      `${ACTIVITY[activity].label} · ${row.label}`,
+      plural(row.sessions, "session"),
+    ],
+  });
+  figure.append(
+    tableView(
+      ["Project", "Working", "Needs permission", "Your turn", "Sessions"],
+      rows.map((r) => [
+        r.label,
+        fmtDuration(r.working),
+        fmtDuration(r.permission),
+        fmtDuration(r.your_turn),
+        r.sessions,
+      ]),
     ),
+  );
+  return figure;
+}
+
+function toolsChart(data) {
+  const figure = chartFigure(
+    "Tools",
+    "Most used tools in the main conversation, by calls",
+  );
+  if (!data.tools.length) {
+    figure.append(
+      h("p", { class: "muted", text: "No tool calls in this range." }),
+    );
+    return figure;
+  }
+  const rows = data.tools.map((t) => ({
+    ...t,
+    label: toolName(t.name),
+    total: t.calls,
+    parts: [[t.calls, null]],
+  }));
+  barRows(figure, rows, {
+    valueText: (row) =>
+      `${row.calls}${row.failed ? ` · ${row.failed} failed` : ""}`,
+    tipText: (row) => [
+      plural(row.calls, "call"),
+      row.label,
+      row.failed ? `${row.failed} failed` : null,
+    ],
+  });
+  figure.append(
+    tableView(
+      ["Tool", "Calls", "Failed"],
+      rows.map((r) => [r.label, r.calls, r.failed]),
+    ),
+  );
+  return figure;
+}
+
+function usageChart(data) {
+  const figure = chartFigure(
+    "5-hour limit used",
+    `Highest reading per ${fmtDuration(data.bucket_ms)}`,
   );
   const points = data.usage.filter((p) => p.five_hour !== null);
   if (!points.length) {
@@ -971,30 +1821,10 @@ function usageChart(data) {
 }
 
 function timelineChart(data) {
-  const figure = h(
-    "figure",
-    { class: "chart" },
-    h(
-      "figcaption",
-      {},
-      h("div", { class: "chart-title", text: "Session activity" }),
-      h("div", {
-        class: "chart-sub",
-        text: "When each session was working or waiting on you",
-      }),
-    ),
-    h(
-      "div",
-      { class: "legend" },
-      ["working", "permission", "your_turn", "idle"].map((a) =>
-        h(
-          "span",
-          { "data-activity": a },
-          h("i", { "aria-hidden": "true" }),
-          ACTIVITY[a].label,
-        ),
-      ),
-    ),
+  const figure = chartFigure(
+    "Session activity",
+    "When each session was working or waiting on you",
+    stateLegend([...STATES, "idle"]),
   );
   if (!data.lanes.length) {
     figure.append(
@@ -1046,13 +1876,12 @@ function timelineChart(data) {
   const maxChars = Math.floor(width / 7.2);
   data.lanes.forEach((lane, i) => {
     const top = pad.top + i * laneH;
-    const name = `${lane.label} · ${place(lane.cwd)}`;
     svg.append(
       s("text", {
         class: "lane-label",
         x: pad.left,
         y: top + 13,
-        text: name.length > maxChars ? `${name.slice(0, maxChars - 1)}…` : name,
+        text: ellipsize(`${lane.label} · ${place(lane.cwd)}`, maxChars),
       }),
     );
     for (const [from, to, activity] of lane.segments) {
@@ -1127,6 +1956,7 @@ function showView(view) {
   $("#view-sessions").hidden = view !== "sessions";
   $("#view-history").hidden = view !== "history";
   if (view === "history") loadHistory();
+  else loadRecent();
 }
 
 function setRange(range) {
@@ -1149,6 +1979,7 @@ function start() {
   }
   $("#detail").addEventListener("close", () => {
     state.detailId = null;
+    state.convo = null;
   });
   $("#detail").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) event.currentTarget.close();
@@ -1167,7 +1998,10 @@ function start() {
   setInterval(tickClocks, 1000);
   setInterval(scheduleRender, 15_000);
   setInterval(reconnectIfStale, 10_000);
-  setInterval(() => !$("#view-history").hidden && loadHistory(), 60_000);
+  setInterval(() => {
+    if (!$("#view-history").hidden) loadHistory();
+    else loadRecent();
+  }, 60_000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") reconnectIfStale();
   });

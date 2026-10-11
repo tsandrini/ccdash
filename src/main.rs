@@ -3,6 +3,7 @@ mod agents;
 mod api;
 mod client;
 mod config;
+mod conversation;
 mod daemon;
 mod emit;
 mod history;

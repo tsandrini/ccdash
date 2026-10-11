@@ -16,6 +16,16 @@ pub struct History {
     pub lanes: Vec<Lane>,
     pub usage: Vec<UsagePoint>,
     pub cost_usd: f64,
+    pub prompts: i64,
+    /// Most used main-thread tools, by call count.
+    pub tools: Vec<ToolCount>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ToolCount {
+    pub name: String,
+    pub calls: i64,
+    pub failed: i64,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -35,10 +45,11 @@ pub struct UsagePoint {
     pub seven_day: Option<f64>,
 }
 
+/// Data of an `activity` event.
 #[derive(Deserialize)]
-struct Transition {
-    from: Activity,
-    to: Activity,
+pub struct Transition {
+    pub from: Activity,
+    pub to: Activity,
 }
 
 struct Row {
@@ -96,10 +107,34 @@ pub fn history(conn: &Connection, since: i64, now: i64, live: &[Session]) -> Res
         lanes,
         usage: usage(conn, since, bucket_ms)?,
         cost_usd: cost(conn, since)?,
+        prompts: conn.query_row(
+            "SELECT count(*) FROM events WHERE kind = 'prompt' AND ts >= ?1",
+            [since],
+            |r| r.get(0),
+        )?,
+        tools: tools(conn, since)?,
     })
 }
 
-fn segments(
+fn tools(conn: &Connection, since: i64) -> Result<Vec<ToolCount>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT json_extract(data, '$.name') AS name, count(*),
+                coalesce(sum(json_extract(data, '$.ok') = 0), 0)
+            FROM events WHERE kind = 'tool' AND ts >= ?1 AND name IS NOT NULL
+            GROUP BY name ORDER BY 2 DESC, name LIMIT 12",
+    )?;
+    let rows = stmt.query_map([since], |r| {
+        Ok(ToolCount {
+            name: r.get(0)?,
+            calls: r.get(1)?,
+            failed: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Splits `start..end` into spans of one activity; time spent gone is left out.
+pub fn segments(
     start: i64,
     end: i64,
     initial: Activity,
@@ -277,7 +312,33 @@ mod tests {
             )
             .unwrap();
         }
+        for (ts, name, ok) in [
+            (150, "Bash", true),
+            (160, "Bash", false),
+            (170, "Read", true),
+        ] {
+            conn.execute(
+                "INSERT INTO events VALUES (?1, 'h', 'new', 'tool', ?2)",
+                params![ts, format!(r#"{{"name":"{name}","ok":{ok}}}"#)],
+            )
+            .unwrap();
+        }
         let h = history(&conn, 100, 100 + 288 * 60_000, &[]).unwrap();
+        assert_eq!(
+            h.tools,
+            [
+                ToolCount {
+                    name: "Bash".into(),
+                    calls: 2,
+                    failed: 1
+                },
+                ToolCount {
+                    name: "Read".into(),
+                    calls: 1,
+                    failed: 0
+                },
+            ]
+        );
         assert!((h.cost_usd - 0.9).abs() < 1e-9);
         assert_eq!(h.usage.len(), 1);
         assert_eq!(h.usage[0].five_hour, Some(13.0));

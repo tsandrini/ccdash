@@ -35,6 +35,66 @@ pub struct ToolRun {
     pub started_at: i64,
 }
 
+/// Progress of the current or last turn. Counts cover the main thread;
+/// `subagent_tools` counts tool calls made by subagents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub tools: u32,
+    pub failures: u32,
+    pub subagent_tools: u32,
+    /// Edited files, relative to the session cwd, in first-edit order.
+    pub files: Vec<String>,
+}
+
+impl Turn {
+    const MAX_FILES: usize = 50;
+
+    /// Counts a finished main-thread tool call; successful edits add their file.
+    pub fn note_tool(&mut self, name: &str, summary: &str, ok: bool) {
+        self.tools += 1;
+        self.failures += u32::from(!ok);
+        if ok
+            && matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+            && !summary.is_empty()
+            && self.files.len() < Self::MAX_FILES
+            && !self.files.iter().any(|f| f == summary)
+        {
+            self.files.push(summary.to_owned());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// An entry of Claude's task list (TaskCreate/TaskUpdate or TodoWrite).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub subject: String,
+    /// Present-tense label shown while the task is in progress.
+    pub active_form: Option<String>,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    pub id: String,
+    pub agent_type: String,
+    /// The `description` the main thread gave the Agent tool.
+    pub description: Option<String>,
+    pub started_at: i64,
+    pub tools: u32,
+    pub tool: Option<ToolRun>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
     pub id: u64,
@@ -75,6 +135,7 @@ pub struct Session {
     pub prompt: Option<Stamped>,
     pub reply: Option<Stamped>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub context_pct: Option<f64>,
     pub cost_usd: Option<f64>,
@@ -82,6 +143,12 @@ pub struct Session {
     pub lines_removed: Option<u64>,
     pub remote_url: Option<String>,
     pub window: Option<WindowRef>,
+    /// Hooks or the statusline have reported; false for sessions started
+    /// before ccdash was installed, which only the agents poll sees.
+    pub hooked: bool,
+    pub turn: Option<Turn>,
+    pub tasks: Vec<Task>,
+    pub subagents: Vec<Subagent>,
     pub started_at: i64,
     pub last_event_at: i64,
 }

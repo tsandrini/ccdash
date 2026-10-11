@@ -6,7 +6,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{Activity, Kind, Limit, RateLimits, Session, Snapshot, Stamped, ToolRun, WindowRef},
+    model::{
+        Activity, Kind, Limit, RateLimits, Session, Snapshot, Stamped, Subagent, Task, TaskStatus,
+        ToolRun, Turn, WindowRef,
+    },
     util::{pid_alive, truncate},
     wire::{Envelope, Source},
 };
@@ -18,6 +21,12 @@ const PENDING_WINDOW_MS: i64 = 30_000;
 const SAMPLE_EVERY_MS: i64 = 60_000;
 const SAMPLE_MIN_GAP_MS: i64 = 5_000;
 const SUMMARY_LEN: usize = 160;
+const SUBAGENT_TEXT_LEN: usize = 4096;
+const COMPACT_SUMMARY_LEN: usize = 8192;
+const MAX_SUBAGENTS: usize = 32;
+const MAX_PENDING_AGENTS: usize = 8;
+const MAX_TASKS: usize = 100;
+const MAX_TASK_FORMS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -101,6 +110,9 @@ pub struct Restored {
     pub prompt: Option<Stamped>,
     pub reply: Option<Stamped>,
     pub title: Option<String>,
+    pub hooked: bool,
+    pub turn: Option<Turn>,
+    pub tasks: Vec<Task>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +122,12 @@ struct Aux {
     missing_polls: u8,
     pending_window: Option<(u64, i64)>,
     last_sample: Option<(i64, Option<f64>)>,
+    /// `agent_id` of the pending permission request (None = main thread).
+    permission_agent: Option<String>,
+    /// `(subagent_type, description)` of Agent calls awaiting SubagentStart.
+    pending_agents: Vec<(String, Option<String>)>,
+    /// TaskCreate `activeForm` by subject, until the task id is known.
+    task_forms: HashMap<String, String>,
 }
 
 pub struct State {
@@ -178,6 +196,11 @@ impl State {
             s.prompt = s.prompt.take().or(saved.prompt);
             s.reply = s.reply.take().or(saved.reply);
             s.title = s.title.take().or(saved.title);
+            s.hooked |= saved.hooked;
+            s.turn = s.turn.take().or(saved.turn);
+            if s.tasks.is_empty() {
+                s.tasks = saved.tasks;
+            }
         }
     }
 
@@ -200,12 +223,12 @@ impl State {
             return;
         }
         self.ensure(id, str_of(p, "cwd"), ts, ts, fx);
-        if let Some(aux) = self.aux.get_mut(id) {
-            aux.last_hook_at = ts;
-        }
 
         let store = &mut fx.store;
+        let aux = self.aux.entry(id.to_owned()).or_default();
+        aux.last_hook_at = ts;
         let s = self.sessions.get_mut(id).expect("ensured above");
+        s.hooked = true;
         s.last_event_at = ts;
         if let Some(pid) = env.pid {
             s.pid = Some(pid);
@@ -219,18 +242,28 @@ impl State {
         if let Some(mode) = str_of(p, "permission_mode") {
             s.permission_mode = Some(mode.to_owned());
         }
+        if let Some(effort) = p.get("effort").and_then(effort_of) {
+            s.effort = Some(effort);
+        }
         if s.activity == Activity::Gone {
             set_activity(s, Activity::Idle, ts, store);
         }
 
         let tool_name = str_of(p, "tool_name").unwrap_or("?");
         let tool_input = p.get("tool_input").unwrap_or(&Value::Null);
+        // Only set inside a subagent (and on Subagent* events, as the subagent's own id).
+        let agent_id = str_of(p, "agent_id");
         let mut focus_candidate = false;
+        let mut title_changed = false;
         match event {
             "SessionStart" => {
                 let source = str_of(p, "source").unwrap_or("startup");
                 if s.model.is_none() {
                     s.model = str_of(p, "model").map(str::to_owned);
+                }
+                if source == "clear" {
+                    s.turn = None;
+                    s.tasks.clear();
                 }
                 record(store, ts, id, "start", json!({ "source": source }));
                 focus_candidate = matches!(source, "startup" | "resume");
@@ -243,18 +276,54 @@ impl State {
                 });
                 s.tool = None;
                 s.waiting_for = None;
+                s.turn = Some(Turn {
+                    started_at: ts,
+                    ..Turn::default()
+                });
+                if let Some(title) = str_of(p, "session_title").filter(|t| !t.is_empty())
+                    && s.title.as_deref() != Some(title)
+                {
+                    s.title = Some(title.to_owned());
+                    store.push(session_row(s, None));
+                    title_changed = true;
+                }
                 set_activity(s, Activity::Working, ts, store);
                 record(store, ts, id, "prompt", json!({ "text": text }));
                 focus_candidate = true;
             }
             "PreToolUse" => {
-                s.tool = Some(ToolRun {
+                let run = ToolRun {
                     name: tool_name.to_owned(),
                     summary: tool_summary(tool_name, tool_input, &s.cwd),
                     started_at: ts,
-                });
-                if s.activity != Activity::Permission {
-                    set_activity(s, Activity::Working, ts, store);
+                };
+                if tool_name == "TaskCreate"
+                    && let (Some(subject), Some(form)) = (
+                        str_of(tool_input, "subject"),
+                        str_of(tool_input, "activeForm"),
+                    )
+                {
+                    aux.task_forms.insert(subject.to_owned(), form.to_owned());
+                }
+                if let Some(agent) = agent_id {
+                    if let Some(sub) = s.subagents.iter_mut().find(|a| a.id == agent) {
+                        sub.tool = Some(run);
+                    }
+                } else {
+                    if matches!(tool_name, "Agent" | "Task") {
+                        aux.pending_agents.push((
+                            str_of(tool_input, "subagent_type")
+                                .unwrap_or_default()
+                                .to_owned(),
+                            str_of(tool_input, "description").map(str::to_owned),
+                        ));
+                        let excess = aux.pending_agents.len().saturating_sub(MAX_PENDING_AGENTS);
+                        aux.pending_agents.drain(..excess);
+                    }
+                    s.tool = Some(run);
+                    if s.activity != Activity::Permission {
+                        set_activity(s, Activity::Working, ts, store);
+                    }
                 }
             }
             "PermissionRequest" => {
@@ -264,6 +333,7 @@ impl State {
                 } else {
                     format!("{tool_name}: {summary}")
                 });
+                aux.permission_agent = agent_id.map(str::to_owned);
                 set_activity(s, Activity::Permission, ts, store);
                 record(
                     store,
@@ -294,36 +364,58 @@ impl State {
                 );
             }
             "PostToolUse" | "PostToolUseFailure" => {
-                let running = s.tool.take_if(|t| t.name == tool_name);
-                let ms = p
-                    .get("duration_ms")
-                    .and_then(Value::as_i64)
-                    .or_else(|| running.as_ref().map(|t| ts - t.started_at));
-                let summary = running.map_or_else(
-                    || tool_summary(tool_name, tool_input, &s.cwd),
-                    |t| t.summary,
-                );
-                record(
-                    store,
-                    ts,
-                    id,
-                    "tool",
-                    json!({
-                        "name": tool_name,
-                        "summary": summary,
-                        "ms": ms,
-                        "ok": event == "PostToolUse",
-                    }),
-                );
-                if s.activity == Activity::Permission {
+                let ok = event == "PostToolUse";
+                if ok {
+                    for delta in task_deltas(&s.tasks, tool_name, tool_input, p, aux) {
+                        apply_and_record_task(s, &delta, ts, store);
+                    }
+                }
+                if let Some(agent) = agent_id {
+                    if let Some(sub) = s.subagents.iter_mut().find(|a| a.id == agent) {
+                        sub.tools += 1;
+                        sub.tool = None;
+                    }
+                    if let Some(turn) = &mut s.turn {
+                        turn.subagent_tools += 1;
+                    }
+                } else {
+                    let running = s.tool.take_if(|t| t.name == tool_name);
+                    let ms = p
+                        .get("duration_ms")
+                        .and_then(Value::as_i64)
+                        .or_else(|| running.as_ref().map(|t| ts - t.started_at));
+                    let summary = running.map_or_else(
+                        || tool_summary(tool_name, tool_input, &s.cwd),
+                        |t| t.summary,
+                    );
+                    if let Some(turn) = &mut s.turn {
+                        turn.note_tool(tool_name, &summary, ok);
+                    }
+                    record(
+                        store,
+                        ts,
+                        id,
+                        "tool",
+                        json!({ "name": tool_name, "summary": summary, "ms": ms, "ok": ok }),
+                    );
+                }
+                if s.activity == Activity::Permission && aux.permission_agent.as_deref() == agent_id
+                {
                     s.waiting_for = None;
                     set_activity(s, Activity::Working, ts, store);
                 }
             }
             "PermissionDenied" => {
-                s.tool = None;
-                s.waiting_for = None;
-                set_activity(s, Activity::Working, ts, store);
+                if agent_id.is_none() {
+                    s.tool = None;
+                }
+                if agent_id.is_none()
+                    || (s.activity == Activity::Permission
+                        && aux.permission_agent.as_deref() == agent_id)
+                {
+                    s.waiting_for = None;
+                    set_activity(s, Activity::Working, ts, store);
+                }
             }
             "Stop" => {
                 let text = str_of(p, "last_assistant_message").unwrap_or_default();
@@ -335,6 +427,9 @@ impl State {
                 }
                 s.tool = None;
                 s.waiting_for = None;
+                if let Some(turn) = &mut s.turn {
+                    turn.ended_at = Some(ts);
+                }
                 set_activity(s, Activity::YourTurn, ts, store);
                 record(store, ts, id, "reply", json!({ "text": text }));
             }
@@ -344,19 +439,84 @@ impl State {
                     .unwrap_or("turn failed");
                 s.tool = None;
                 s.waiting_for = Some(format!("error: {error}"));
+                if let Some(turn) = &mut s.turn {
+                    turn.ended_at = Some(ts);
+                }
                 set_activity(s, Activity::YourTurn, ts, store);
                 record(store, ts, id, "error", json!({ "error": error }));
             }
-            "PreCompact" => {
+            "SubagentStart" => {
+                let agent_type = str_of(p, "agent_type").unwrap_or_default();
+                let description = take_pending_agent(&mut aux.pending_agents, agent_type);
+                if let Some(agent) = agent_id
+                    && s.subagents.len() < MAX_SUBAGENTS
+                    && !s.subagents.iter().any(|a| a.id == agent)
+                {
+                    s.subagents.push(Subagent {
+                        id: agent.to_owned(),
+                        agent_type: agent_type.to_owned(),
+                        description,
+                        started_at: ts,
+                        tools: 0,
+                        tool: None,
+                    });
+                }
+            }
+            "SubagentStop" => {
+                let done = s
+                    .subagents
+                    .iter()
+                    .position(|a| Some(a.id.as_str()) == agent_id)
+                    .map(|i| s.subagents.remove(i));
+                let text = str_of(p, "last_assistant_message").unwrap_or_default();
+                record(
+                    store,
+                    ts,
+                    id,
+                    "subagent",
+                    json!({
+                        "agent_type": done.as_ref().map_or_else(
+                            || str_of(p, "agent_type").unwrap_or_default(),
+                            |a| a.agent_type.as_str(),
+                        ),
+                        "description": done.as_ref().and_then(|a| a.description.as_deref()),
+                        "ms": done.as_ref().map(|a| ts - a.started_at),
+                        "tools": done.as_ref().map(|a| a.tools),
+                        "text": truncate(text, SUBAGENT_TEXT_LEN),
+                    }),
+                );
+            }
+            "TaskCreated" | "TaskCompleted" => {
+                if let (Some(task), Some(subject)) =
+                    (str_of(p, "task_id"), str_of(p, "task_subject"))
+                {
+                    let mut delta = json!({ "id": task, "subject": subject });
+                    if let Some(form) = aux.task_forms.remove(subject) {
+                        delta["active_form"] = form.into();
+                    }
+                    if event == "TaskCompleted" {
+                        delta["status"] = "completed".into();
+                    }
+                    apply_and_record_task(s, &delta, ts, store);
+                }
+            }
+            "PostCompact" => {
+                let summary = str_of(p, "compact_summary").unwrap_or_default();
                 record(
                     store,
                     ts,
                     id,
                     "compact",
-                    json!({ "trigger": str_of(p, "trigger") }),
+                    json!({
+                        "trigger": str_of(p, "trigger"),
+                        "summary": truncate(summary, COMPACT_SUMMARY_LEN),
+                    }),
                 );
             }
             _ => {}
+        }
+        if title_changed {
+            self.match_titles(fx);
         }
         if focus_candidate {
             self.note_focus_candidate(id, ts, fx);
@@ -372,6 +532,7 @@ impl State {
         self.ensure(id, str_of(p, "cwd"), ts, ts, fx);
 
         let s = self.sessions.get_mut(id).expect("ensured above");
+        s.hooked = true;
         if let Some(pid) = env.pid {
             s.pid = Some(pid);
         }
@@ -592,6 +753,7 @@ impl State {
             prompt: None,
             reply: None,
             model: None,
+            effort: None,
             permission_mode: None,
             context_pct: None,
             cost_usd: None,
@@ -599,6 +761,10 @@ impl State {
             lines_removed: None,
             remote_url: None,
             window: None,
+            hooked: false,
+            turn: None,
+            tasks: Vec::new(),
+            subagents: Vec::new(),
             started_at,
             last_event_at: now,
         };
@@ -617,6 +783,7 @@ impl State {
         }
         s.tool = None;
         s.waiting_for = None;
+        s.subagents.clear();
         set_activity(s, Activity::Gone, ts, &mut fx.store);
         record(&mut fx.store, ts, id, "end", json!({ "reason": reason }));
         fx.store.push(session_row(s, Some(ts)));
@@ -735,6 +902,157 @@ fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
+fn effort_of(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn id_of(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Description of the Agent call that started a subagent of `agent_type`.
+fn take_pending_agent(
+    pending: &mut Vec<(String, Option<String>)>,
+    agent_type: &str,
+) -> Option<String> {
+    let i = pending
+        .iter()
+        .position(|(t, _)| t == agent_type || (t.is_empty() && agent_type == "general-purpose"))?;
+    pending.remove(i).1
+}
+
+/// Task-list changes made by a successful TaskCreate, TaskUpdate or TodoWrite call.
+fn task_deltas(
+    tasks: &[Task],
+    tool: &str,
+    input: &Value,
+    payload: &Value,
+    aux: &mut Aux,
+) -> Vec<Value> {
+    match tool {
+        "TaskCreate" => {
+            let subject = str_of(input, "subject");
+            if let Some(subject) = subject {
+                aux.task_forms.remove(subject);
+            }
+            if aux.task_forms.len() > MAX_TASK_FORMS {
+                aux.task_forms.clear();
+            }
+            payload
+                .pointer("/tool_response/task/id")
+                .and_then(id_of)
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "subject": subject,
+                        "active_form": str_of(input, "activeForm"),
+                    })
+                })
+                .into_iter()
+                .collect()
+        }
+        "TaskUpdate" => input
+            .get("taskId")
+            .and_then(id_of)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "subject": str_of(input, "subject"),
+                    "active_form": str_of(input, "activeForm"),
+                    "status": str_of(input, "status"),
+                })
+            })
+            .into_iter()
+            .collect(),
+        "TodoWrite" => {
+            let Some(todos) = input.get("todos").and_then(Value::as_array) else {
+                return Vec::new();
+            };
+            let listed = |t: &Task| todos.iter().any(|d| str_of(d, "content") == Some(&t.id));
+            let mut out: Vec<Value> = tasks
+                .iter()
+                .filter(|t| !listed(t))
+                .map(|t| json!({ "id": t.id, "status": "deleted" }))
+                .collect();
+            out.extend(todos.iter().filter_map(|d| {
+                let content = str_of(d, "content")?;
+                Some(json!({
+                    "id": content,
+                    "subject": content,
+                    "active_form": str_of(d, "activeForm"),
+                    "status": str_of(d, "status"),
+                }))
+            }));
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn apply_and_record_task(s: &mut Session, delta: &Value, ts: i64, store: &mut Vec<StoreMsg>) {
+    if let Some(entry) = apply_task(&mut s.tasks, delta) {
+        record(store, ts, &s.id, "task", entry);
+    }
+}
+
+/// Applies one task-list change (`{id, subject?, active_form?, status?}`,
+/// status `deleted` removes). Returns the resulting entry when anything
+/// changed; replaying those entries rebuilds the list.
+pub fn apply_task(tasks: &mut Vec<Task>, delta: &Value) -> Option<Value> {
+    let id = str_of(delta, "id")?;
+    let status = str_of(delta, "status");
+    if status == Some("deleted") {
+        let i = tasks.iter().position(|t| t.id == id)?;
+        let gone = tasks.remove(i);
+        return Some(json!({ "id": id, "subject": gone.subject, "status": "deleted" }));
+    }
+    let (i, created) = match tasks.iter().position(|t| t.id == id) {
+        Some(i) => (i, false),
+        None => {
+            let subject = str_of(delta, "subject")?;
+            if tasks.len() >= MAX_TASKS {
+                return None;
+            }
+            tasks.push(Task {
+                id: id.to_owned(),
+                subject: subject.to_owned(),
+                active_form: None,
+                status: TaskStatus::Pending,
+            });
+            (tasks.len() - 1, true)
+        }
+    };
+    let task = &mut tasks[i];
+    let before = task.clone();
+    if let Some(subject) = str_of(delta, "subject") {
+        task.subject = subject.to_owned();
+    }
+    if let Some(form) = str_of(delta, "active_form") {
+        task.active_form = Some(form.to_owned());
+    }
+    if let Some(status) = status.and_then(task_status) {
+        task.status = status;
+    }
+    (created || *task != before).then(|| serde_json::to_value(&*task).unwrap_or_default())
+}
+
+fn task_status(s: &str) -> Option<TaskStatus> {
+    match s {
+        "pending" => Some(TaskStatus::Pending),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "completed" => Some(TaskStatus::Completed),
+        _ => None,
+    }
+}
+
 fn remote_url(remote_id: &str) -> String {
     format!("https://claude.ai/code/{remote_id}")
 }
@@ -816,7 +1134,13 @@ fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {
             .map(|p| relative(p, cwd)),
         "Grep" | "Glob" => field("pattern").map(str::to_owned),
         "WebFetch" => field("url").map(str::to_owned),
-        "WebSearch" => field("query").map(str::to_owned),
+        "WebSearch" | "ToolSearch" => field("query").map(str::to_owned),
+        "Skill" => field("skill").map(str::to_owned),
+        "TaskCreate" => field("subject").map(str::to_owned),
+        "TaskUpdate" => input.get("taskId").and_then(id_of).map(|id| {
+            let status = field("status").map(|s| s.replace('_', " "));
+            format!("#{id} {}", status.unwrap_or_else(|| "updated".into()))
+        }),
         _ => field("description").map(str::to_owned),
     };
     truncate(&text.unwrap_or_default(), SUMMARY_LEN)
@@ -998,6 +1322,230 @@ mod tests {
         assert_eq!((s.activity, s.activity_since), (Activity::YourTurn, 60));
         assert_eq!(s.reply.as_ref().unwrap().text, "- done");
         assert_eq!(kinds(&fx), vec!["activity", "reply"]);
+    }
+
+    #[test]
+    fn turn_progress_and_prompt_title() {
+        let mut st = state();
+        hook(
+            &mut st,
+            1,
+            "UserPromptSubmit",
+            json!({"prompt": "go", "session_title": "Fix the parser", "effort": "high"}),
+        );
+        let s = session(&st);
+        assert!(s.hooked);
+        assert_eq!(s.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        for (ts, event, file) in [
+            (2, "PostToolUse", "/work/repo/src/a.rs"),
+            (3, "PostToolUse", "/work/repo/src/a.rs"),
+            (4, "PostToolUseFailure", "/work/repo/src/b.rs"),
+        ] {
+            hook(
+                &mut st,
+                ts,
+                event,
+                json!({"tool_name": "Edit", "tool_input": {"file_path": file}}),
+            );
+        }
+        hook(&mut st, 9, "Stop", json!({}));
+        let turn = session(&st).turn.clone().unwrap();
+        assert_eq!(
+            turn,
+            Turn {
+                started_at: 1,
+                ended_at: Some(9),
+                tools: 3,
+                failures: 1,
+                subagent_tools: 0,
+                files: vec!["src/a.rs".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn subagents_track_progress_without_moving_the_main_state() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "look"}));
+        hook(
+            &mut st,
+            2,
+            "PreToolUse",
+            json!({"tool_name": "Agent", "tool_input": {"description": "Find callers", "subagent_type": "Explore", "run_in_background": true}}),
+        );
+        hook(
+            &mut st,
+            3,
+            "SubagentStart",
+            json!({"agent_id": "a1", "agent_type": "Explore"}),
+        );
+        hook(&mut st, 4, "PostToolUse", json!({"tool_name": "Agent"}));
+        hook(
+            &mut st,
+            5,
+            "Stop",
+            json!({"last_assistant_message": "started"}),
+        );
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+
+        hook(
+            &mut st,
+            6,
+            "PreToolUse",
+            json!({"agent_id": "a1", "agent_type": "Explore", "tool_name": "Grep", "tool_input": {"pattern": "parse("}}),
+        );
+        let s = session(&st);
+        assert_eq!(s.activity, Activity::YourTurn);
+        assert!(s.tool.is_none());
+        let sub = &s.subagents[0];
+        assert_eq!(sub.description.as_deref(), Some("Find callers"));
+        assert_eq!(sub.tool.as_ref().unwrap().summary, "parse(");
+
+        let fx = hook(
+            &mut st,
+            7,
+            "PostToolUse",
+            json!({"agent_id": "a1", "tool_name": "Grep"}),
+        );
+        assert!(kinds(&fx).is_empty(), "subagent tools are not recorded");
+        assert_eq!(session(&st).subagents[0].tools, 1);
+        assert_eq!(session(&st).turn.as_ref().unwrap().subagent_tools, 1);
+
+        let fx = hook(
+            &mut st,
+            9,
+            "SubagentStop",
+            json!({"agent_id": "a1", "agent_type": "Explore", "last_assistant_message": "3 callers"}),
+        );
+        assert!(session(&st).subagents.is_empty());
+        let StoreMsg::Event { kind, data, .. } = &fx.store[0] else {
+            panic!()
+        };
+        assert_eq!(*kind, "subagent");
+        assert_eq!(
+            data,
+            &json!({"agent_type": "Explore", "description": "Find callers", "ms": 6, "tools": 1, "text": "3 callers"})
+        );
+    }
+
+    #[test]
+    fn subagent_permission_is_cleared_by_that_subagent_only() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        hook(
+            &mut st,
+            2,
+            "PermissionRequest",
+            json!({"agent_id": "a1", "tool_name": "Bash", "tool_input": {"command": "rm x"}}),
+        );
+        hook(
+            &mut st,
+            3,
+            "PostToolUse",
+            json!({"agent_id": "a2", "tool_name": "Read"}),
+        );
+        assert_eq!(session(&st).activity, Activity::Permission);
+        hook(
+            &mut st,
+            4,
+            "PostToolUse",
+            json!({"agent_id": "a1", "tool_name": "Bash"}),
+        );
+        assert_eq!(session(&st).activity, Activity::Working);
+    }
+
+    #[test]
+    fn task_list_from_hooks_and_tools() {
+        let mut st = state();
+        hook(
+            &mut st,
+            1,
+            "PreToolUse",
+            json!({"tool_name": "TaskCreate", "tool_input": {"subject": "Flash board", "activeForm": "Flashing board"}}),
+        );
+        hook(
+            &mut st,
+            2,
+            "TaskCreated",
+            json!({"task_id": "1", "task_subject": "Flash board"}),
+        );
+        let fx = hook(
+            &mut st,
+            3,
+            "PostToolUse",
+            json!({"tool_name": "TaskCreate", "tool_input": {"subject": "Flash board", "activeForm": "Flashing board"}, "tool_response": {"task": {"id": "1", "subject": "Flash board"}}}),
+        );
+        assert!(kinds(&fx).contains(&"tool") && !kinds(&fx).contains(&"task"));
+        hook(
+            &mut st,
+            4,
+            "PostToolUse",
+            json!({"tool_name": "TaskCreate", "tool_input": {"subject": "Verify"}, "tool_response": {"task": {"id": 2}}}),
+        );
+        hook(
+            &mut st,
+            5,
+            "PostToolUse",
+            json!({"tool_name": "TaskUpdate", "tool_input": {"taskId": "1", "status": "in_progress"}}),
+        );
+        let tasks = &session(&st).tasks;
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks[0],
+            Task {
+                id: "1".into(),
+                subject: "Flash board".into(),
+                active_form: Some("Flashing board".into()),
+                status: TaskStatus::InProgress,
+            }
+        );
+        let fx = hook(
+            &mut st,
+            6,
+            "TaskCompleted",
+            json!({"task_id": "1", "task_subject": "Flash board"}),
+        );
+        let StoreMsg::Event { data, .. } = &fx.store[0] else {
+            panic!()
+        };
+        assert_eq!(data["status"], "completed");
+        hook(
+            &mut st,
+            7,
+            "PostToolUse",
+            json!({"tool_name": "TaskUpdate", "tool_input": {"taskId": "2", "status": "deleted"}}),
+        );
+        assert_eq!(session(&st).tasks.len(), 1);
+        assert_eq!(session(&st).tasks[0].status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn todo_write_replaces_the_list() {
+        let mut st = state();
+        let todos =
+            |items: Value| json!({"tool_name": "TodoWrite", "tool_input": {"todos": items}});
+        hook(
+            &mut st,
+            1,
+            "PostToolUse",
+            todos(json!([
+                {"content": "a", "status": "completed", "activeForm": "Doing a"},
+                {"content": "b", "status": "in_progress", "activeForm": "Doing b"},
+            ])),
+        );
+        hook(
+            &mut st,
+            2,
+            "PostToolUse",
+            todos(json!([{"content": "b", "status": "completed"}])),
+        );
+        let tasks = &session(&st).tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            (tasks[0].subject.as_str(), tasks[0].status),
+            ("b", TaskStatus::Completed)
+        );
     }
 
     #[test]
@@ -1205,6 +1753,36 @@ mod tests {
         assert!(st.resolve("11111111").is_some());
         assert!(st.resolve("11111111-2222").is_some());
         assert!(st.resolve("nope").is_none());
+    }
+
+    #[test]
+    fn tool_summaries() {
+        let cases = [
+            ("Bash", json!({"command": "make\nmake test"}), "make"),
+            (
+                "Edit",
+                json!({"file_path": "/work/repo/src/a.rs"}),
+                "src/a.rs",
+            ),
+            (
+                "TaskCreate",
+                json!({"subject": "Ship", "description": "long"}),
+                "Ship",
+            ),
+            (
+                "TaskUpdate",
+                json!({"taskId": "2", "status": "in_progress"}),
+                "#2 in progress",
+            ),
+            (
+                "Agent",
+                json!({"description": "Find callers"}),
+                "Find callers",
+            ),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(tool_summary(name, &input, "/work/repo"), want, "{name}");
+        }
     }
 
     #[test]

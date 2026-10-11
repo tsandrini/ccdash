@@ -31,14 +31,26 @@ pub struct Envelope {
 }
 
 const DROPPED_KEYS: &[&str] = &["tool_response", "permission_suggestions"];
-const LONG_KEYS: &[(&str, usize)] = &[("last_assistant_message", 32 * 1024), ("prompt", 8 * 1024)];
+/// Tools whose `tool_response` the daemon reads (TaskCreate returns the task id).
+const KEPT_RESPONSES: &[&str] = &["TaskCreate"];
+const LONG_KEYS: &[(&str, usize)] = &[
+    ("last_assistant_message", 32 * 1024),
+    ("prompt", 8 * 1024),
+    ("compact_summary", 8 * 1024),
+];
 const DEFAULT_LIMIT: usize = 2048;
 
 /// Serializes `env`, shrinking the payload until it fits in one datagram.
 pub fn encode(mut env: Envelope) -> Option<Vec<u8>> {
     if let Value::Object(map) = &mut env.payload {
+        let keep_response = map
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| KEPT_RESPONSES.contains(&name));
         for key in DROPPED_KEYS {
-            map.remove(*key);
+            if !(keep_response && *key == "tool_response") {
+                map.remove(*key);
+            }
         }
     }
     for divisor in [1, 4, 16] {
@@ -108,6 +120,17 @@ mod tests {
                 .len(),
             10_000
         );
+    }
+
+    #[test]
+    fn keeps_task_create_response() {
+        let bytes = encode(envelope(json!({
+            "tool_name": "TaskCreate",
+            "tool_response": {"task": {"id": "3", "subject": "Ship it"}},
+        })))
+        .unwrap();
+        let back: Envelope = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.payload["tool_response"]["task"]["id"], "3");
     }
 
     #[test]

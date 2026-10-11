@@ -278,6 +278,10 @@ main {
   --meter-fill: var(--critical);
 }
 
+.meter[data-level="neutral"] {
+  --meter-fill: var(--text-secondary);
+}
+
 /* --- session groups & cards --- */
 
 .group {
@@ -446,12 +450,100 @@ main {
   word-break: break-word;
 }
 
+.session-focus {
+  display: -webkit-box;
+  margin: 2px 0 0;
+  overflow: hidden;
+  font-size: 13px;
+  color: var(--text-primary);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  word-break: break-word;
+}
+
+.session-tool {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 2px 0 0;
+  font-size: 13px;
+}
+
+.session-tool .mono {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.who {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.session-note {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.session-tasks {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.session-tasks .meter {
+  flex: none;
+  width: 64px;
+  height: 6px;
+  margin: 0;
+}
+
+.tasks-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-active {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strip {
+  position: relative;
+  display: block;
+  height: 4px;
+  margin-top: 8px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.strip i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-radius: 2px;
+  background: var(--state-color);
+}
+
+.strip-legend {
+  margin: -8px 0 16px;
+  font-size: 12px;
+}
+
 .session-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin-top: 4px;
+  margin-top: 2px;
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -499,6 +591,7 @@ dialog::backdrop {
 .detail-head {
   position: sticky;
   top: 0;
+  z-index: 2;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -524,11 +617,17 @@ dialog::backdrop {
   font-size: 20px;
 }
 
-.detail-actions {
+.detail-bar {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
   margin-top: 4px;
+}
+
+.detail-bar .filters {
+  margin: 0;
 }
 
 .btn {
@@ -542,10 +641,328 @@ dialog::backdrop {
   color: #fff;
   font-weight: 600;
   text-decoration: none;
+  cursor: pointer;
+}
+
+.btn-quiet {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .detail-body {
-  padding: 4px 20px 20px;
+  padding: 4px 20px 24px;
+}
+
+.callout {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 14px;
+}
+
+.center {
+  text-align: center;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* --- conversation --- */
+
+.load-older {
+  display: flex;
+  margin: 14px auto 0;
+}
+
+.exchange {
+  margin-top: 18px;
+}
+
+.msg {
+  display: flex;
+  flex-direction: column;
+  margin: 10px 0;
+}
+
+.msg time {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.msg-user {
+  align-items: flex-end;
+}
+
+.bubble {
+  max-width: min(88%, 560px);
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--surface-2);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.bubble.clamp {
+  max-height: 12em;
+}
+
+.prose.clamp {
+  max-height: 22em;
+}
+
+.clamp {
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, #000 70%, transparent);
+}
+
+.msg-user .show-more {
+  align-self: flex-end;
+}
+
+.show-more {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.activity,
+.subagent,
+.compact {
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.activity > summary,
+.subagent > summary,
+.compact > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px var(--border);
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+}
+
+.activity > summary::-webkit-details-marker,
+.subagent > summary::-webkit-details-marker,
+.compact > summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity > summary::before,
+.subagent > summary::before,
+.compact > summary::before {
+  content: "▸";
+  color: var(--text-muted);
+}
+
+.activity[open] > summary::before,
+.subagent[open] > summary::before,
+.compact[open] > summary::before {
+  content: "▾";
+}
+
+.activity-sum,
+.live-facts,
+.subagent .muted,
+.subagents .muted {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.activity-top {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.steps {
+  margin: 6px 0 0;
+  padding: 0 0 0 10px;
+  list-style: none;
+}
+
+.steps li {
+  display: grid;
+  grid-template-columns: max-content 1.1em minmax(0, 1fr) max-content;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--grid);
+}
+
+.steps time,
+.step-ms {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.step-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-text strong {
+  font-weight: 600;
+}
+
+.step-icon {
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.step-failed .step-icon {
+  color: var(--critical);
+}
+
+.subagent .prose,
+.compact .prose {
+  margin: 6px 0 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--grid);
+  font-size: 14px;
+}
+
+.subagent-kind {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.conv-error {
+  margin: 8px 0;
+  font-size: 14px;
+}
+
+.conv-error strong {
+  color: var(--critical);
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 0 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px solid var(--grid);
+}
+
+.live {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 13px;
+}
+
+.live-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+
+.live-row .mono {
+  overflow-wrap: anywhere;
+}
+
+.live-facts {
+  color: var(--text-secondary);
+}
+
+.live-tasks > summary {
+  cursor: pointer;
+}
+
+.live-tasks > summary .session-tasks {
+  display: inline-flex;
+  max-width: calc(100% - 2em);
+  vertical-align: middle;
+}
+
+.subagents,
+.tasks,
+.files {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 14px;
+}
+
+.subagents li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 4px 0;
+}
+
+.live .subagents,
+.live .tasks {
+  font-size: 13px;
+}
+
+.tasks li {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.task-icon {
+  flex: none;
+  width: 1.1em;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.tasks [data-status="in_progress"] {
+  font-weight: 600;
+}
+
+.tasks [data-status="completed"] {
+  color: var(--text-muted);
+}
+
+.files li {
+  padding: 1px 0;
+  overflow-wrap: anywhere;
 }
 
 .detail-body h3 {
@@ -558,6 +975,14 @@ dialog::backdrop {
 
 .prose {
   overflow-wrap: anywhere;
+}
+
+.prose > :first-child {
+  margin-top: 0;
+}
+
+.prose > :last-child {
+  margin-bottom: 0;
 }
 
 .prose pre {
@@ -659,7 +1084,8 @@ dialog::backdrop {
   cursor: pointer;
 }
 
-.filters button[aria-checked="true"] {
+.filters button[aria-checked="true"],
+.filters button[aria-selected="true"] {
   background: var(--surface-1);
   color: var(--text-primary);
   font-weight: 600;
@@ -745,6 +1171,10 @@ dialog::backdrop {
 
 .chart svg .seg {
   fill: var(--state-color);
+}
+
+.chart svg .seg-neutral {
+  fill: var(--text-muted);
 }
 
 .chart svg .seg:hover {
