@@ -14,9 +14,10 @@ const ACTIVITY = {
   permission: { label: "Needs permission", rank: 0 },
   your_turn: { label: "Your turn", rank: 1 },
   working: { label: "Working", rank: 2 },
-  idle: { label: "Idle", rank: 3 },
-  gone: { label: "Ended", rank: 4 },
-  finished: { label: "Finished", rank: 5 },
+  parked: { label: "Parked", rank: 3 },
+  idle: { label: "Idle", rank: 4 },
+  gone: { label: "Ended", rank: 5 },
+  finished: { label: "Finished", rank: 6 },
 };
 const STATES = ["working", "permission", "your_turn"];
 
@@ -456,6 +457,7 @@ function renderSessions() {
   );
   const working = mine.filter((s) => s.activity === "working");
   const idle = mine.filter((s) => s.activity === "idle");
+  const parked = mine.filter((s) => s.activity === "parked");
   const running = agents.filter(
     (s) => s.activity !== "gone" && s.activity !== "permission",
   );
@@ -475,7 +477,11 @@ function renderSessions() {
   fill(
     $("#tiles"),
     countTile("Working", working.length),
-    countTile("Idle", idle.length),
+    countTile(
+      "Idle",
+      idle.length + parked.length,
+      parked.length ? `${parked.length} parked` : null,
+    ),
     countTile(
       "Background agents",
       running.length,
@@ -499,12 +505,22 @@ function renderSessions() {
         "div",
         { class: "legend strip-legend" },
         h("span", { class: "muted", text: "Bars show the last hour:" }),
-        [...STATES, "idle"].map(legendChip),
+        [...STATES, "parked", "idle"].map(legendChip),
       ),
     );
   }
   if (needs.length) groups.push(group("Needs you", needs));
   if (working.length) groups.push(group("Working", working));
+  if (parked.length) {
+    groups.push(
+      group(
+        "Parked",
+        parked,
+        false,
+        "Your turn for over an hour: most likely done, so not counted as waiting on you.",
+      ),
+    );
+  }
   if (idle.length) groups.push(group("Idle", idle));
   if (running.length) {
     groups.push(
@@ -1955,6 +1971,7 @@ function detailsTab(s, stats) {
           "Waited on you",
           fmtDuration(stats.permission_ms + stats.your_turn_ms),
         ],
+        ["Parked", stats.parked_ms ? fmtDuration(stats.parked_ms) : null],
       ]),
     );
   }
@@ -2525,7 +2542,7 @@ async function loadHistory() {
 }
 
 function totals(lane) {
-  const out = { working: 0, permission: 0, your_turn: 0, idle: 0 };
+  const out = { working: 0, permission: 0, your_turn: 0, parked: 0, idle: 0 };
   for (const [from, to, activity] of lane.segments)
     out[activity] = (out[activity] || 0) + (to - from);
   return out;
@@ -2534,7 +2551,7 @@ function totals(lane) {
 function renderHistory() {
   const data = state.history;
   if (!data) return;
-  const sum = { working: 0, permission: 0, your_turn: 0, idle: 0 };
+  const sum = { working: 0, permission: 0, your_turn: 0, parked: 0, idle: 0 };
   for (const lane of data.lanes) {
     for (const [k, v] of Object.entries(totals(lane))) sum[k] += v;
   }
@@ -2544,7 +2561,9 @@ function renderHistory() {
     statTile(
       "Waited on you",
       fmtDuration(sum.permission + sum.your_turn),
-      "total across sessions",
+      sum.parked
+        ? `total across sessions; ${fmtDuration(sum.parked)} parked apart`
+        : "total across sessions",
     ),
     statTile("Working time", fmtDuration(sum.working), "total across sessions"),
     statTile("Prompts", data.prompts, plural(data.lanes.length, "session")),
@@ -2997,8 +3016,8 @@ function usageChart(data) {
 function timelineChart(data) {
   const figure = chartFigure(
     "Session activity",
-    "When each session was working or waiting on you",
-    stateLegend([...STATES, "idle"]),
+    "When each session was working or waiting on you. Parked: no reply within an hour, or the session was closed without one.",
+    stateLegend([...STATES, "parked", "idle"]),
   );
   if (!data.lanes.length) {
     figure.append(
@@ -3521,6 +3540,7 @@ function bucketBrush(data) {
 const ANALYTICS_SECTION_KEY = "ccdash.analytics.section";
 const SECTIONS = [
   ["overview", "Overview"],
+  ["waits", "Waits"],
   ["parallel", "Parallel"],
   ["limits", "Limits"],
   ["projects", "Projects"],
@@ -3547,6 +3567,7 @@ function renderAnalytics() {
     : "overview";
   const views = {
     overview: overviewSection,
+    waits: waitsSection,
     parallel: parallelSection,
     limits: limitsSection,
     projects: projectsSection,
@@ -3593,7 +3614,7 @@ function overviewSection(data, width, half) {
     statTile(
       "Waited on you",
       fmtDuration(sum("permission_ms") + sum("your_turn_ms")),
-      "permission prompts and your turn",
+      `${fmtDuration(sum("parked_ms"))} parked, not counted`,
     ),
     statTile("API-equivalent cost", fmtUsd(sum("cost_usd")), "from statusline"),
     statTile(
@@ -4100,6 +4121,7 @@ function sortableTable(columns, rows, sortKey) {
                 "th",
                 {
                   scope: "col",
+                  class: c.text ? "text" : null,
                   "aria-sort":
                     c.key === key
                       ? desc
@@ -4133,6 +4155,7 @@ function sortableTable(columns, rows, sortKey) {
               columns.map((c, i) =>
                 h(i ? "td" : "th", {
                   scope: i ? null : "row",
+                  class: c.text ? "text" : null,
                   text: c.fmt ? c.fmt(row[c.key], row) : row[c.key],
                 }),
               ),
@@ -4144,6 +4167,167 @@ function sortableTable(columns, rows, sortKey) {
   };
   render();
   return wrap;
+}
+
+// Waits
+
+/** `[key, label, what happened, counts as]`, in `waiting` (src/analytics/waiting.rs). */
+const OUTCOMES = [
+  ["answered", "Answered", "You replied within the hour", "waiting on you"],
+  ["waiting", "Waiting now", "Open, under an hour so far", "waiting on you"],
+  ["came_back", "Came back later", "You replied after the hour", "parked"],
+  ["finished", "Finished", "Closed without another prompt", "parked"],
+  ["left_open", "Left open", "Open for over an hour", "parked"],
+  [
+    "resumed",
+    "Claude carried on",
+    "Claude went on by itself before you replied",
+    "neither",
+  ],
+];
+
+function waitsSection(data, width, half) {
+  const w = data.waiting;
+  const sum = (key) => data.buckets.reduce((n, d) => n + d[key], 0);
+  const parked = ["came_back", "finished", "left_open"].map((k) => w[k]);
+  const hour = `${Math.round(w.parked_after_ms / MINUTE)} min`;
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile(
+      "Waited on you",
+      fmtDuration(sum("permission_ms") + sum("your_turn_ms")),
+      `${plural(w.answered.waits + w.waiting.waits, "wait")} and permission prompts`,
+    ),
+    statTile(
+      "Answer time",
+      w.answer_p50_ms === null ? "–" : fmtDuration(w.answer_p50_ms),
+      w.answer_p90_ms === null
+        ? "median"
+        : `median; 90% within ${fmtDuration(w.answer_p90_ms)}`,
+    ),
+    statTile(
+      "Parked",
+      fmtDuration(parked.reduce((n, t) => n + t.ms, 0)),
+      `${plural(
+        parked.reduce((n, t) => n + t.waits, 0),
+        "wait",
+      )}, not counted`,
+    ),
+    statTile("Came back later", w.came_back.waits, `replied after ${hour}`),
+  );
+
+  const perBucket = chartFigure(
+    hourly(data) ? "Answer time per hour" : "Answer time per day",
+    `Median time from Claude handing over to your reply, for replies within ${hour}`,
+  );
+  if (data.buckets.some((d) => d.answers)) {
+    columnChart(
+      perBucket,
+      data.buckets.map((d) => ({
+        label: bucketLabel(data, d.start),
+        day: d,
+        parts: [[(d.answer_p50_ms ?? 0) / MINUTE, "your_turn"]],
+      })),
+      {
+        width: half,
+        fmtY: (v) => (v === 0 ? "0" : fmtDuration(v * MINUTE)),
+        brush: bucketBrush(data),
+        tip: (col) => [
+          col.day.answers ? fmtDuration(col.day.answer_p50_ms) : "–",
+          `median of ${plural(col.day.answers, "reply", "replies")} · ${bucketName(data, col.day.start)}`,
+        ],
+      },
+    );
+    perBucket.append(
+      tableView(
+        [hourly(data) ? "Hour" : "Day", "Replies", "Median"],
+        data.buckets.map((d) => [
+          bucketName(data, d.start),
+          d.answers,
+          d.answers ? fmtDuration(d.answer_p50_ms) : "–",
+        ]),
+      ),
+    );
+  } else {
+    perBucket.append(
+      h("p", { class: "muted", text: "No replies in this range." }),
+    );
+  }
+
+  const ended = chartFigure(
+    "How waits ended",
+    "A wait runs from Claude handing the turn back to whatever came next; time inside this range",
+  );
+  ended.append(
+    sortableTable(
+      [
+        { key: "label", label: "Outcome", text: true },
+        { key: "what", label: "What happened", text: true },
+        { key: "waits", label: "Waits" },
+        { key: "ms", label: "Time", fmt: fmtDuration },
+        { key: "counts", label: "Counts as", text: true },
+      ],
+      OUTCOMES.map(([key, label, what, counts]) => ({
+        label,
+        what,
+        counts,
+        waits: w[key].waits,
+        ms: w[key].ms,
+      })),
+      "ms",
+    ),
+  );
+
+  const late = chartFigure(
+    "Came back later",
+    `Waits you replied to after ${hour}, longest first: parked and picked up again, or forgotten`,
+  );
+  late.append(
+    w.late.length
+      ? h(
+          "ol",
+          { class: "call-list" },
+          w.late.map((l) =>
+            h(
+              "li",
+              {},
+              h("span", { class: "call-time", text: fmtDuration(l.ms) }),
+              h(
+                "span",
+                { class: "call-what" },
+                sessionRef(l.session, l.label),
+                h(
+                  "span",
+                  { class: "muted" },
+                  `${place(l.cwd)} · handed over ${fmtStamp(l.start)}`,
+                ),
+              ),
+            ),
+          ),
+        )
+      : h("p", { class: "muted", text: "None in this range." }),
+  );
+
+  return [
+    tiles,
+    h(
+      "div",
+      { class: "chart-pair" },
+      perBucket,
+      histogramChart(
+        "How long you took to reply",
+        data.responses,
+        "your_turn",
+        half,
+      ),
+    ),
+    ended,
+    late,
+    note(
+      `Permission prompts always count as waiting on you. A session left on your turn for ${hour} is parked; History draws parked time lighter.`,
+    ),
+  ];
 }
 
 // Parallel
@@ -4267,7 +4451,7 @@ function parallelSection(data, width) {
     over,
     spread,
     note(
-      `A wait counts for its first ${fmtDuration(p.wait_cap_ms)}: a session left longer is parked, not waiting on you.`,
+      "Parked sessions (no reply within an hour, or closed without one) don't count as waiting on you; see Waits.",
     ),
   ];
 }
@@ -4495,6 +4679,7 @@ function projectsSection(data, width, half) {
       waiting: 0,
       permission_ms: 0,
       your_turn_ms: 0,
+      parked: 0,
       prompts: 0,
       cost: 0,
       added: 0,
@@ -4510,6 +4695,7 @@ function projectsSection(data, width, half) {
     row.permission_ms += p.permission_ms;
     row.your_turn_ms += p.your_turn_ms;
     row.waiting += p.permission_ms + p.your_turn_ms;
+    row.parked += p.parked_ms;
     row.prompts += p.prompts;
     row.cost += p.cost_usd;
     row.added += p.lines_added;
@@ -4534,6 +4720,7 @@ function projectsSection(data, width, half) {
     { key: "project", label: "Project", text: true },
     { key: "working", label: "Working", fmt: fmtDuration },
     { key: "waiting", label: "Waited", fmt: fmtDuration },
+    { key: "parked", label: "Parked", fmt: fmtDuration },
     { key: "prompts", label: "Prompts" },
     { key: "cost", label: "Cost", fmt: fmtUsd },
     {
@@ -4632,7 +4819,7 @@ function projectsSection(data, width, half) {
     table,
     h("div", { class: "chart-pair" }, time, cost),
     note(
-      `Waits count for their first ${fmtDuration(data.parallel.wait_cap_ms)}, as in Parallel: a session left longer is parked.`,
+      "Waited counts waits on you only; parked time (no reply within an hour, or closed without one) has its own column.",
     ),
   ];
 }

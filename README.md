@@ -66,12 +66,14 @@ ccdash url --lan --qr     # web address for the phone as a QR code, token includ
 
 The web UI lives on the HTTP port:
 
-- **Sessions:** the ones that need you first, then working and idle, then
-  background agents (sessions Claude started, or `claude --bg`), which show
+- **Sessions:** the ones that need you first, then working, parked and idle,
+  then background agents (sessions Claude started, or `claude --bg`), which show
   the session that started them and "Finished" instead of "Your turn". Each
   card shows the pending permission or the running tool and what Claude is
   saying, task progress, the current turn (time, tool calls, edited files,
   subagents), context, cost, CPU and memory, and the last hour of activity.
+  A session left on your turn for an hour is _parked_: most likely done, it
+  no longer counts as needing you.
 - **Conversation:** your prompts, what Claude writes between tool calls as
   it streams, the tool calls themselves, subagent results, compactions and
   replies. Details has the task list, running subagents, the session's
@@ -82,6 +84,13 @@ The web UI lives on the HTTP port:
   - _Overview:_ daily activity, when you prompt (weekday × hour), how long
     Claude works per prompt and how long sessions wait for you, cost per day
     and per model, lines changed, memory and CPU per project.
+  - _Waits:_ how long sessions waited on you and how fast you replied, apart
+    from parked time. A wait runs from Claude handing the turn back to what
+    came next: a reply within an hour counts as waiting on you; a later
+    reply, closing the session or leaving it open counts as parked; Claude
+    carrying on by itself (a background task, a wakeup) counts as neither.
+    Permission prompts always count. Lists the sessions you came back to
+    late.
   - _Parallel:_ how many sessions worked or waited on you at once, and how
     long everything waited on you with nothing working.
   - _Limits:_ the 5-hour and 7-day limits with their pace and where they
@@ -184,8 +193,8 @@ port behind your firewall or VPN.
 DankMaterialShell: a bar pill with the sessions that need you, a dash tab and
 card, notifications when a session starts waiting, and
 `dms ipc call ccdash focusWaiting` to jump to the session that has waited
-longest. Enable it once under Settings → Plugins and add the widget to a bar.
-Handy niri binds:
+longest (parked sessions are skipped). Enable it once under Settings →
+Plugins and add the widget to a bar. Handy niri binds:
 
 ```kdl
 Mod+C { spawn "dms" "ipc" "call" "dash" "toggle" "plugin_ccdash"; }

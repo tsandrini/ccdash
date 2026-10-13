@@ -9,6 +9,7 @@ mod parallel;
 mod permissions;
 mod telemetry;
 mod turns;
+mod waiting;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -18,14 +19,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    history::{Transition, lanes},
+    history::lanes,
     model::{Activity, RateLimits, Session},
     workspace::{IN_SCOPE, Scope, Workspaces},
 };
 
 pub use self::{
     context::ContextHealth, limits::Limits, parallel::Parallel, permissions::Permissions,
-    telemetry::Telemetry, turns::Anatomy,
+    telemetry::Telemetry, turns::Anatomy, waiting::Waiting,
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -52,7 +53,8 @@ pub struct Analytics {
     pub bounds_ms: [i64; 5],
     /// How long Claude worked per prompt, binned by `bounds_ms`.
     pub turns: Histogram,
-    /// How long a session waited on you before you answered.
+    /// How long a session waited on you before you answered: your-turn
+    /// waits answered within the parking time, and permission prompts.
     pub responses: Histogram,
     pub models: Vec<ModelCost>,
     /// Per working directory, most working time first.
@@ -67,6 +69,7 @@ pub struct Analytics {
     pub anatomy: Anatomy,
     pub context: ContextHealth,
     pub permissions: Permissions,
+    pub waiting: Waiting,
     /// None until Claude Code has sent OpenTelemetry data at all.
     pub telemetry: Option<Telemetry>,
 }
@@ -77,7 +80,12 @@ pub struct Bucket {
     pub start: i64,
     pub working_ms: i64,
     pub permission_ms: i64,
+    /// Waits on you; parked time is apart.
     pub your_turn_ms: i64,
+    pub parked_ms: i64,
+    /// Your-turn waits answered in the bucket, and their median.
+    pub answers: u32,
+    pub answer_p50_ms: Option<i64>,
     pub prompts: u32,
     pub cost_usd: f64,
     pub lines_added: i64,
@@ -121,9 +129,10 @@ pub struct ProjectUse {
     pub cwd: String,
     pub sessions: u32,
     pub working_ms: i64,
-    /// Waits count for their first `parallel::WAIT_CAP_MS`, as in `parallel`.
     pub permission_ms: i64,
+    /// Waits on you; parked time is apart.
     pub your_turn_ms: i64,
+    pub parked_ms: i64,
     pub prompts: u32,
     pub cost_usd: f64,
     pub lines_added: i64,
@@ -239,11 +248,11 @@ pub fn analytics(
         let project = project(&mut projects, &lane.cwd);
         project.sessions += 1;
         for &(from, to, activity) in &lane.segments {
-            let waited = (to - from).min(parallel::WAIT_CAP_MS);
             match activity {
                 Activity::Working => project.working_ms += to - from,
-                Activity::Permission => project.permission_ms += waited,
-                Activity::YourTurn => project.your_turn_ms += waited,
+                Activity::Permission => project.permission_ms += to - from,
+                Activity::YourTurn => project.your_turn_ms += to - from,
+                Activity::Parked => project.parked_ms += to - from,
                 Activity::Idle | Activity::Gone => {}
             }
             split_buckets(&clock, from, to, |i, ms| {
@@ -252,11 +261,14 @@ pub fn analytics(
                     Activity::Working => bucket.working_ms += ms,
                     Activity::Permission => bucket.permission_ms += ms,
                     Activity::YourTurn => bucket.your_turn_ms += ms,
+                    Activity::Parked => bucket.parked_ms += ms,
                     Activity::Idle | Activity::Gone => {}
                 }
             });
         }
     }
+    let (waiting, responses) =
+        waiting::waiting(&lanes, (scope.since, scope.until), &clock, &mut buckets);
 
     let mut heatmap = [[0; 24]; 7];
     let mut turn_lengths = Vec::new();
@@ -328,7 +340,7 @@ pub fn analytics(
         heatmap,
         bounds_ms: BOUNDS_MS,
         turns: histogram(turn_lengths),
-        responses: histogram(response_times(conn, scope)?),
+        responses: histogram(responses),
         models,
         projects,
         memory,
@@ -338,6 +350,7 @@ pub fn analytics(
         anatomy,
         context,
         permissions,
+        waiting,
         telemetry,
     })
 }
@@ -407,42 +420,6 @@ fn split_buckets(clock: &Clock, from: i64, to: i64, mut add: impl FnMut(usize, i
         add(clock.index(at), end - at);
         at = end;
     }
-}
-
-/// Waits ended by you: the time spent in `your_turn` or `permission` right
-/// before a switch back to `working`.
-fn response_times(conn: &Connection, scope: &Scope) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT e.session, e.ts, e.data FROM events e LEFT JOIN sessions x ON x.id = e.session
-            WHERE e.kind = 'activity' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}
-                AND coalesce(x.kind, '') != 'background'
-            ORDER BY e.ts, e.rowid"
-    ))?;
-    let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        },
-    )?;
-    let mut entered: HashMap<String, i64> = HashMap::new();
-    let mut out = Vec::new();
-    for row in rows {
-        let (session, ts, data) = row?;
-        let Ok(t) = serde_json::from_str::<Transition>(&data) else {
-            continue;
-        };
-        if let Some(start) = entered.insert(session, ts)
-            && t.to == Activity::Working
-            && matches!(t.from, Activity::YourTurn | Activity::Permission)
-        {
-            out.push(ts - start);
-        }
-    }
-    Ok(out)
 }
 
 fn histogram(mut values: Vec<i64>) -> Histogram {

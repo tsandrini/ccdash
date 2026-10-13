@@ -12,8 +12,14 @@ pub enum Activity {
     Permission,
     /// Turn finished; waiting for the next prompt.
     YourTurn,
+    /// Your turn for over `PARKED_AFTER_MS`: most likely done, not counted as
+    /// waiting on you.
+    Parked,
     Gone,
 }
+
+/// How long an interactive session stays "your turn" before it is parked.
+pub const PARKED_AFTER_MS: i64 = 60 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

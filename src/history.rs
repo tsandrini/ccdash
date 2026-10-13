@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{Activity, Kind, Session},
+    waits::{self, CLOSERS, Close, Edges, Wait},
     workspace::{IN_SCOPE, Scope},
 };
 
@@ -40,8 +41,11 @@ pub struct Lane {
     pub live: bool,
     /// Started by Claude or `claude --bg`; its finished time is not a wait on you.
     pub background: bool,
-    /// `[from, to, activity]`; time spent gone is not drawn.
+    /// `[from, to, activity]`; time spent gone is not drawn. Your-turn
+    /// stretches are drawn by how they ended (see `waits`).
     pub segments: Vec<(i64, i64, Activity)>,
+    /// Your-turn waits overlapping the range.
+    pub waits: Vec<Wait>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -100,6 +104,7 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
     let live: HashMap<&str, &Session> = live.iter().map(|s| (s.id.as_str(), s)).collect();
     let (since, until) = (scope.since, scope.until);
     let mut transitions = transitions_in(conn, scope)?;
+    let mut closes = closes_in(conn, scope)?;
     let mut lanes = Vec::new();
     for row in sessions_overlapping(conn, scope)? {
         if !scope.contains(&row.cwd) {
@@ -132,12 +137,24 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
             && !events.iter().any(|(_, t)| t.to == Activity::Working);
         let background = current.map_or(row.kind == "background", |s| s.kind == Kind::Background);
         let mut segments = segments(row.started_at.max(since), end, initial, &events);
-        if background {
-            finished_is_idle(&mut segments);
-        }
         if segments.is_empty() || trivial {
             continue;
         }
+        let waits = if background {
+            finished_is_idle(&mut segments);
+            Vec::new()
+        } else {
+            let edges = Edges {
+                conn,
+                session: &row.id,
+                since,
+                until,
+                live: current.is_some(),
+                now: scope.now,
+            };
+            let closes = closes.remove(&row.id).unwrap_or_default();
+            waits::settle(&mut segments, &closes, &edges)?
+        };
         let label = current
             .and_then(|s| s.title.clone().or_else(|| s.name.clone()))
             .or(row.title)
@@ -150,6 +167,7 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
             live: current.is_some(),
             background,
             segments,
+            waits,
         });
     }
     lanes.sort_by_key(|lane| lane.segments[0].0);
@@ -205,7 +223,7 @@ fn finished_is_idle(segments: &mut Vec<(i64, i64, Activity)>) {
     let mut merged: Vec<(i64, i64, Activity)> = Vec::with_capacity(segments.len());
     for &(from, to, activity) in segments.iter() {
         let activity = match activity {
-            Activity::YourTurn => Activity::Idle,
+            Activity::YourTurn | Activity::Parked => Activity::Idle,
             other => other,
         };
         match merged.last_mut() {
@@ -252,6 +270,30 @@ fn transitions_in(
         if let Ok(transition) = serde_json::from_str(&data) {
             out.entry(session).or_default().push((ts, transition));
         }
+    }
+    Ok(out)
+}
+
+/// Events that can end a wait, per session, in order.
+fn closes_in(conn: &Connection, scope: &Scope) -> Result<HashMap<String, Vec<Close>>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT session, kind, ts, json_extract(data, '$.ms') FROM events
+            WHERE kind IN ({CLOSERS}) AND ts >= ?1 AND ts < ?2 ORDER BY ts, rowid"
+    ))?;
+    let mut out: HashMap<String, Vec<Close>> = HashMap::new();
+    let rows = stmt.query_map(params![scope.since, scope.until], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (session, kind, ts, ms) = row?;
+        out.entry(session)
+            .or_default()
+            .push(Close::new(&kind, ts, ms));
     }
     Ok(out)
 }
@@ -380,12 +422,10 @@ mod tests {
 
         let h = history(&conn, &scope(100, 1_000), &[]).unwrap();
         assert_eq!(h.lanes.len(), 1);
+        // Closed without another prompt: parked.
         assert_eq!(
             h.lanes[0].segments,
-            vec![
-                (100, 200, Activity::Working),
-                (200, 500, Activity::YourTurn)
-            ]
+            vec![(100, 200, Activity::Working), (200, 500, Activity::Parked)]
         );
         assert_eq!(h.lanes[0].label, "title a");
     }

@@ -44,7 +44,7 @@ DashTabComponent {
     }
 
     function grouped(sessions) {
-        const groups = [["Needs you", s => Cc.needsYou(s)], ["Working", s => !Cc.isAgent(s) && s.activity === "working"], ["Idle", s => !Cc.isAgent(s) && !Cc.needsYou(s) && s.activity !== "working"], ["Background agents", s => Cc.isAgent(s) && !Cc.needsYou(s)]];
+        const groups = [["Needs you", s => Cc.needsYou(s)], ["Working", s => !Cc.isAgent(s) && s.activity === "working"], ["Parked", s => !Cc.isAgent(s) && s.activity === "parked"], ["Idle", s => !Cc.isAgent(s) && !Cc.needsYou(s) && s.activity !== "working" && s.activity !== "parked"], ["Background agents", s => Cc.isAgent(s) && !Cc.needsYou(s)]];
         const out = [];
         for (const [title, test] of groups) {
             const members = sessions.filter(test);

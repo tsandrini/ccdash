@@ -7,9 +7,10 @@ const ACTIVITY = {
     permission: { label: "Needs permission", rank: 0 },
     your_turn: { label: "Your turn", rank: 1 },
     working: { label: "Working", rank: 2 },
-    idle: { label: "Idle", rank: 3 },
-    finished: { label: "Finished", rank: 4 },
-    gone: { label: "Ended", rank: 5 }
+    parked: { label: "Parked", rank: 3 },
+    idle: { label: "Idle", rank: 4 },
+    finished: { label: "Finished", rank: 5 },
+    gone: { label: "Ended", rank: 6 }
 };
 
 function isAgent(s) {
@@ -188,7 +189,9 @@ function stateColor(activity, light) {
     const colors = {
         working: light ? "#2a78d6" : "#3987e5",
         permission: light ? "#eb6834" : "#d95926",
-        your_turn: light ? "#1baf7a" : "#199e70"
+        your_turn: light ? "#1baf7a" : "#199e70",
+        // your_turn faded 60% towards idle
+        parked: light ? "#80ba9f" : "#4a7f6a"
     };
     return colors[activity] || (light ? "#c3c2b7" : "#6b6b66");
 }

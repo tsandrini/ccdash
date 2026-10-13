@@ -81,8 +81,9 @@ fn attention_rank(activity: Activity) -> u8 {
         Activity::Permission => 0,
         Activity::YourTurn => 1,
         Activity::Working => 2,
-        Activity::Idle => 3,
-        Activity::Gone => 4,
+        Activity::Parked => 3,
+        Activity::Idle => 4,
+        Activity::Gone => 5,
     }
 }
 
@@ -91,6 +92,7 @@ fn activity_label(activity: Activity) -> &'static str {
         Activity::Permission => "PERMISSION",
         Activity::YourTurn => "your turn",
         Activity::Working => "working",
+        Activity::Parked => "parked",
         Activity::Idle => "idle",
         Activity::Gone => "gone",
     }

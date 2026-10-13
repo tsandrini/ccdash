@@ -20,6 +20,7 @@ mod procs;
 mod state;
 mod store;
 mod util;
+mod waits;
 mod wire;
 mod workspace;
 

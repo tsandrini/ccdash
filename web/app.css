@@ -14,6 +14,8 @@
   --permission: #eb6834;
   --your-turn: #1baf7a;
   --idle: #c3c2b7;
+  /* NOTE: follows the theme's --your-turn and --idle */
+  --parked: color-mix(in oklab, var(--your-turn) 40%, var(--idle));
   --good: #0ca30c;
   --warning: #fab219;
   --critical: #d03b3b;
@@ -412,6 +414,10 @@ main {
 
 [data-activity="your_turn"] {
   --state-color: var(--your-turn);
+}
+
+[data-activity="parked"] {
+  --state-color: var(--parked);
 }
 
 [data-activity="idle"] {
@@ -2140,7 +2146,8 @@ dl.ask-preview {
 }
 
 .data-table thead th:first-child,
-.data-table tbody th {
+.data-table tbody th,
+.data-table .text {
   text-align: left;
 }
 

@@ -1,4 +1,5 @@
-//! How many sessions worked, or waited on you, at the same time.
+//! How many sessions worked, or waited on you, at the same time. Parked
+//! sessions don't wait on you (see `crate::waits`).
 
 use serde::Serialize;
 
@@ -7,13 +8,10 @@ use crate::{history::Lane, model::Activity};
 /// About this many points across the range.
 const POINTS: i64 = 240;
 const MIN_SLOT_MS: i64 = 60_000;
-/// A wait counts this long; after that the session is parked, not waiting.
-pub const WAIT_CAP_MS: i64 = 30 * 60_000;
 
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Parallel {
     pub slot_ms: i64,
-    pub wait_cap_ms: i64,
     /// `[slot start, mean working, max working, mean waiting, max waiting]`.
     pub series: Vec<(i64, f64, u32, f64, u32)>,
     /// Time with exactly 1, 2, 3, 4, 5, and 6 or more sessions working.
@@ -39,12 +37,7 @@ pub fn parallel(lanes: &[Lane], since: i64, until: i64) -> Parallel {
             let (working, waiting) = match activity {
                 Activity::Working => (1, 0),
                 Activity::Permission | Activity::YourTurn => (0, 1),
-                Activity::Idle | Activity::Gone => continue,
-            };
-            let to = if waiting > 0 {
-                to.min(from + WAIT_CAP_MS)
-            } else {
-                to
+                Activity::Idle | Activity::Parked | Activity::Gone => continue,
             };
             if to <= since || from >= until {
                 continue;
@@ -60,7 +53,6 @@ pub fn parallel(lanes: &[Lane], since: i64, until: i64) -> Parallel {
     let mut sums = vec![(0i64, 0u32, 0i64, 0u32); slots];
     let mut out = Parallel {
         slot_ms,
-        wait_cap_ms: WAIT_CAP_MS,
         ..Parallel::default()
     };
     let (mut working, mut waiting) = (0i32, 0i32);
@@ -142,6 +134,7 @@ mod tests {
             live: false,
             background: false,
             segments,
+            waits: Vec::new(),
         }
     }
 
@@ -172,7 +165,7 @@ mod tests {
         assert_eq!(p.series[7], (7 * m, 2.0, 2, 0.0, 0));
         assert_eq!(p.series[25], (25 * m, 0.0, 0, 0.0, 0));
 
-        let parked = [lane(vec![(0, 120 * m, Activity::YourTurn)])];
-        assert_eq!(parallel(&parked, 0, 120 * m).waiting_ms, WAIT_CAP_MS);
+        let parked = [lane(vec![(0, 120 * m, Activity::Parked)])];
+        assert_eq!(parallel(&parked, 0, 120 * m).waiting_ms, 0);
     }
 }

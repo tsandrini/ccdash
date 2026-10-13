@@ -11,6 +11,7 @@ use crate::{
     history::{Transition, segments},
     markdown,
     model::Activity,
+    waits::{self, CLOSERS, Close, Edges},
 };
 
 const MAX_TOOLS_PER_EXCHANGE: usize = 200;
@@ -134,7 +135,9 @@ pub struct Stats {
     pub compactions: i64,
     pub working_ms: i64,
     pub permission_ms: i64,
+    /// Waits on you; parked time is apart (see `waits`).
     pub your_turn_ms: i64,
+    pub parked_ms: i64,
 }
 
 /// The newest `limit` exchanges before `before` (all of them when `None`),
@@ -295,8 +298,14 @@ pub fn resources(conn: &Connection, session: &str, since: i64) -> Result<Vec<(i6
 }
 
 /// Totals over the whole session; time in each activity runs from
-/// `started_at` to `end` (now for live sessions).
-pub fn stats(conn: &Connection, session: &str, started_at: i64, end: i64) -> Result<Stats> {
+/// `started_at` to `end` (now for `live` sessions).
+pub fn stats(
+    conn: &Connection,
+    session: &str,
+    started_at: i64,
+    end: i64,
+    live: bool,
+) -> Result<Stats> {
     let mut stats = conn.query_row(
         "SELECT
             coalesce(sum(kind = 'prompt'), 0),
@@ -336,11 +345,31 @@ pub fn stats(conn: &Connection, session: &str, started_at: i64, end: i64) -> Res
         })
         .collect();
     if let Some((_, first)) = transitions.first() {
-        for (from, to, activity) in segments(started_at, end, first.from, &transitions) {
+        let mut segments = segments(started_at, end, first.from, &transitions);
+        let closes: Vec<Close> = conn
+            .prepare_cached(&format!(
+                "SELECT kind, ts, json_extract(data, '$.ms') FROM events
+                    WHERE session = ?1 AND kind IN ({CLOSERS}) ORDER BY ts, rowid"
+            ))?
+            .query_map([session], |r| {
+                Ok(Close::new(&r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let edges = Edges {
+            conn,
+            session,
+            since: started_at,
+            until: end,
+            live,
+            now: end,
+        };
+        waits::settle(&mut segments, &closes, &edges)?;
+        for (from, to, activity) in segments {
             let total = match activity {
                 Activity::Working => &mut stats.working_ms,
                 Activity::Permission => &mut stats.permission_ms,
                 Activity::YourTurn => &mut stats.your_turn_ms,
+                Activity::Parked => &mut stats.parked_ms,
                 Activity::Idle | Activity::Gone => continue,
             };
             *total += to - from;
@@ -510,7 +539,7 @@ mod tests {
     fn stats_count_and_time() {
         let conn = db();
         seed(&conn);
-        let s = stats(&conn, "s", 0, 20).unwrap();
+        let s = stats(&conn, "s", 0, 20, false).unwrap();
         assert_eq!(
             s,
             Stats {
@@ -523,6 +552,7 @@ mod tests {
                 working_ms: 3 + 10,
                 permission_ms: 0,
                 your_turn_ms: 5,
+                parked_ms: 0,
             }
         );
     }

@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use crate::{
     model::{
-        Activity, Kind, Limit, PermissionAsk, ProcInfo, RateLimits, Resources, Session, Snapshot,
-        Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
+        Activity, Kind, Limit, PARKED_AFTER_MS, PermissionAsk, ProcInfo, RateLimits, Resources,
+        Session, Snapshot, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
     },
     util::{pid_alive, tail, truncate},
     wire::{Envelope, Source},
@@ -934,7 +934,7 @@ impl State {
             if e.name.is_some() {
                 s.name = e.name.clone();
             }
-            if quiet && let Some(to) = agent_activity(e, s.activity) {
+            if quiet && let Some(to) = agent_activity(e, s) {
                 if to == Activity::Permission {
                     s.waiting_for = e.waiting_for.clone();
                 }
@@ -1019,8 +1019,26 @@ impl State {
         self.match_titles(fx);
     }
 
-    /// Marks sessions whose process died as gone and forgets old gone ones.
+    /// Parks long-waiting sessions, marks sessions whose process died as gone
+    /// and forgets old gone ones.
     pub fn tick(&mut self, now: i64, fx: &mut Effects) {
+        for s in self.sessions.values_mut() {
+            if s.kind == Kind::Interactive
+                && s.activity == Activity::YourTurn
+                && now - s.activity_since >= PARKED_AFTER_MS
+            {
+                let handed_over = s.activity_since;
+                set_activity(
+                    s,
+                    Activity::Parked,
+                    handed_over + PARKED_AFTER_MS,
+                    &mut fx.store,
+                );
+                // NOTE: a parked session's age counts from the hand-over
+                s.activity_since = handed_over;
+                fx.touched.insert(s.id.clone());
+            }
+        }
         let dead: Vec<String> = self
             .sessions
             .values()
@@ -1465,16 +1483,21 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
     }
 }
 
-fn agent_activity(e: &AgentEntry, current: Activity) -> Option<Activity> {
+/// The poll's view of `s`, when it should override the hooks'. After a Stop,
+/// only hooks end the turn: the poll can report `busy` for minutes past it.
+fn agent_activity(e: &AgentEntry, s: &Session) -> Option<Activity> {
     let waiting_permission = e
         .waiting_for
         .as_deref()
         .is_some_and(|w| w.contains("permission"));
+    let turn_over = matches!(s.activity, Activity::YourTurn | Activity::Parked);
     match e.status.as_deref()? {
+        "busy" if s.hooked && turn_over && s.subagents.is_empty() => None,
         "busy" => Some(Activity::Working),
         "waiting" if waiting_permission => Some(Activity::Permission),
+        "waiting" if turn_over => None,
         "waiting" => Some(Activity::YourTurn),
-        "idle" if matches!(current, Activity::Working | Activity::Permission) => {
+        "idle" if matches!(s.activity, Activity::Working | Activity::Permission) => {
             Some(Activity::YourTurn)
         }
         _ => None,
@@ -2045,6 +2068,72 @@ mod tests {
         assert_eq!(session(&st).activity, Activity::YourTurn);
         st.agents(&[], 205_000, &mut fx);
         assert_eq!(session(&st).activity, Activity::Gone);
+    }
+
+    #[test]
+    fn a_busy_poll_does_not_reopen_a_finished_turn() {
+        let mut st = state();
+        hook(&mut st, 1_000, "UserPromptSubmit", json!({"prompt": "hi"}));
+        hook(
+            &mut st,
+            2_000,
+            "Stop",
+            json!({"last_assistant_message": "ok"}),
+        );
+        agents(&mut st, 60_000, "interactive", "busy");
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+
+        // A running subagent makes the session busy for real.
+        hook(
+            &mut st,
+            61_000,
+            "SubagentStart",
+            json!({"agent_id": "a1", "agent_type": "Explore"}),
+        );
+        agents(&mut st, 80_000, "interactive", "busy");
+        assert_eq!(session(&st).activity, Activity::Working);
+    }
+
+    #[test]
+    fn your_turn_parks_after_an_hour() {
+        let mut st = state();
+        hook(&mut st, 1_000, "UserPromptSubmit", json!({"prompt": "hi"}));
+        hook(
+            &mut st,
+            2_000,
+            "Stop",
+            json!({"last_assistant_message": "ok"}),
+        );
+        let mut fx = Effects::default();
+        st.tick(2_000 + PARKED_AFTER_MS - 1, &mut fx);
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+        st.tick(2_000 + PARKED_AFTER_MS + 10_000, &mut fx);
+        let s = session(&st);
+        assert_eq!((s.activity, s.activity_since), (Activity::Parked, 2_000));
+        assert!(fx.touched.contains(SID));
+        let StoreMsg::Event { ts, data, .. } = fx.store.last().unwrap() else {
+            panic!("expected the transition");
+        };
+        assert_eq!(
+            (*ts, data["to"].as_str()),
+            (2_000 + PARKED_AFTER_MS, Some("parked"))
+        );
+
+        // The poll's view of an idle session doesn't unpark it; a prompt does.
+        agents(
+            &mut st,
+            2_000 + PARKED_AFTER_MS + 20_000,
+            "interactive",
+            "waiting",
+        );
+        assert_eq!(session(&st).activity, Activity::Parked);
+        hook(
+            &mut st,
+            2_000 + PARKED_AFTER_MS + 30_000,
+            "UserPromptSubmit",
+            json!({"prompt": "next"}),
+        );
+        assert_eq!(session(&st).activity, Activity::Working);
     }
 
     #[test]

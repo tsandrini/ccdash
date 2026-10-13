@@ -165,9 +165,11 @@ async fn session(
         .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?;
     let store = app.store.clone();
     let (session_id, started_at) = (session.id.clone(), session.started_at);
-    let end = match session.activity {
-        Activity::Gone => session.activity_since,
-        _ => now_ms(),
+    let live = session.activity != Activity::Gone;
+    let end = if live {
+        now_ms()
+    } else {
+        session.activity_since
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
     let (conversation, stats, resources) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -175,7 +177,13 @@ async fn session(
         let conversation = conversation::conversation(&conn, &session_id, query.before, limit)?;
         let (stats, resources) = match query.before {
             None => (
-                Some(conversation::stats(&conn, &session_id, started_at, end)?),
+                Some(conversation::stats(
+                    &conn,
+                    &session_id,
+                    started_at,
+                    end,
+                    live,
+                )?),
                 Some(conversation::resources(&conn, &session_id, end - HOUR_MS)?),
             ),
             Some(_) => (None, None),
