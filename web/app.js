@@ -3518,11 +3518,71 @@ function bucketBrush(data) {
   };
 }
 
+const ANALYTICS_SECTION_KEY = "ccdash.analytics.section";
+const SECTIONS = [
+  ["overview", "Overview"],
+  ["parallel", "Parallel"],
+  ["limits", "Limits"],
+  ["projects", "Projects"],
+  ["turns", "Turns"],
+  ["context", "Context"],
+  ["tokens", "Tokens"],
+  ["permissions", "Permissions"],
+];
+
+function setAnalyticsSection(section) {
+  state.aSection = section;
+  localStorage.setItem(ANALYTICS_SECTION_KEY, section);
+  renderAnalytics();
+}
+
 function renderAnalytics() {
   const data = state.analytics;
   if (!data) return;
   const width = Math.max(280, ($("#analytics").clientWidth || 600) - 32);
   const half = width > 760 ? (width - 12) / 2 - 32 : width;
+  state.aSection ??= localStorage.getItem(ANALYTICS_SECTION_KEY);
+  const section = SECTIONS.some(([id]) => id === state.aSection)
+    ? state.aSection
+    : "overview";
+  const views = {
+    overview: overviewSection,
+    parallel: parallelSection,
+    limits: limitsSection,
+    projects: projectsSection,
+    turns: turnsSection,
+    context: contextSection,
+    tokens: tokensSection,
+    permissions: permissionsSection,
+  };
+  fill(
+    $("#analytics"),
+    h(
+      "div",
+      {
+        class: "filters section-tabs",
+        role: "tablist",
+        "aria-label": "Analytics section",
+      },
+      SECTIONS.map(([id, text]) =>
+        h("button", {
+          type: "button",
+          role: "tab",
+          "aria-selected": String(id === section),
+          text,
+          onclick: () => setAnalyticsSection(id),
+        }),
+      ),
+    ),
+    views[section](data, width, half),
+  );
+  $("#analytics .section-tabs [aria-selected=true]").scrollIntoView({
+    block: "nearest",
+    inline: "nearest",
+  });
+}
+
+function overviewSection(data, width, half) {
   const sum = (key) => data.buckets.reduce((n, d) => n + d[key], 0);
   const peak = Math.max(0, ...data.buckets.map((d) => d.peak_mem_bytes));
   const tiles = h(
@@ -3547,8 +3607,7 @@ function renderAnalytics() {
       "all sessions at once",
     ),
   );
-  fill(
-    $("#analytics"),
+  return [
     tiles,
     dailyActivityChart(data, width),
     heatmapChart(data.heatmap, width),
@@ -3590,7 +3649,7 @@ function renderAnalytics() {
       }),
       cpuChart(data, half),
     ),
-  );
+  ];
 }
 
 const bucketLabel = (data, ts) =>
@@ -3788,6 +3847,7 @@ function cpuChart(data, width) {
   );
   const rows = data.projects
     .filter((p) => p.cpu_secs > 0)
+    .sort((a, b) => b.cpu_secs - a.cpu_secs)
     .slice(0, 8)
     .map((p) => ({
       ...p,
@@ -3827,6 +3887,1483 @@ function cpuChart(data, width) {
     ),
   );
   return figure;
+}
+
+// --- analytics sections -------------------------------------------------------
+
+const pct = (v) => `${Math.round(v)}%`;
+/** Axis labels for counts: whole numbers only. */
+const fmtCount = (v) => (Number.isInteger(v) ? String(v) : "");
+const fmtTokens = (n) => compact.format(n);
+const note = (text) => h("p", { class: "section-note", text });
+
+/** A legend for colors that aren't session states: `[role, label]` pairs. */
+const roleLegend = (items) =>
+  h(
+    "div",
+    { class: "legend" },
+    items.map(([role, text]) =>
+      h(
+        "span",
+        { "data-activity": role },
+        h("i", { "aria-hidden": "true" }),
+        text,
+      ),
+    ),
+  );
+
+/** Opens the session sheet when the session is still known, else plain text. */
+function sessionRef(id, text) {
+  if (!state.sessions.has(id)) return h("span", { text });
+  return h("button", {
+    class: "link-btn",
+    type: "button",
+    text,
+    onclick: () => openDetail(id),
+  });
+}
+
+/**
+ * Lines over time on one scale. `series` are `{ label, role, points, area }`
+ * with `[ts, value]` points; `extra(svg, x, y)` draws marks on top; `tip(t)`
+ * gives the tooltip lines for the point nearest the pointer.
+ */
+function multiLineChart(
+  figure,
+  { series, since, until, width, fmt, max = null, extra = null, tip },
+) {
+  const height = 170;
+  const pad = { top: 8, right: 52, bottom: 22, left: 46 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  const peak = Math.max(
+    0,
+    ...series.flatMap((sr) => sr.points.map(([, v]) => v)),
+  );
+  const ticks = niceTicks(0, max ?? (peak || 1), 3);
+  const top = ticks.at(-1);
+  const x = (t) => pad.left + ((t - since) / (until - since)) * plotW;
+  const y = (v) => pad.top + plotH - (Math.min(v, top) / top) * plotH;
+  const svg = s("svg", {
+    viewBox: `0 0 ${width} ${height}`,
+    height,
+    role: "img",
+    "aria-label": figure.querySelector(".chart-title").textContent,
+  });
+  for (const v of ticks) {
+    svg.append(
+      s("line", {
+        class: v ? "grid" : "baseline",
+        x1: pad.left,
+        x2: pad.left + plotW,
+        y1: y(v),
+        y2: y(v),
+      }),
+      s("text", {
+        x: pad.left - 6,
+        y: y(v) + 4,
+        "text-anchor": "end",
+        text: fmt(v),
+      }),
+    );
+  }
+  const { ticks: times, daily } = timeTicks(since, until, plotW);
+  for (const t of times) {
+    svg.append(
+      s("text", {
+        x: x(t),
+        y: height - 6,
+        "text-anchor": "middle",
+        text: daily ? dayFmt.format(t) : fmtTime(t),
+      }),
+    );
+  }
+  for (const sr of series) {
+    const steps = sr.points.slice(1).map(([t], i) => t - sr.points[i][0]);
+    const maxGap =
+      3 * (steps.sort((a, b) => a - b)[steps.length >> 1] || 60_000);
+    const runs = [];
+    for (const point of sr.points) {
+      const run = runs.at(-1);
+      if (run && point[0] - run.at(-1)[0] <= maxGap) run.push(point);
+      else runs.push([point]);
+    }
+    for (const run of runs) {
+      if (run.length === 1) {
+        svg.append(
+          s("circle", {
+            class: "end-dot",
+            "data-activity": sr.role,
+            cx: x(run[0][0]),
+            cy: y(run[0][1]),
+            r: 3,
+          }),
+        );
+        continue;
+      }
+      const line = run
+        .map(
+          ([t, v], i) =>
+            `${i ? "L" : "M"}${x(t).toFixed(1)},${y(v).toFixed(1)}`,
+        )
+        .join("");
+      if (sr.area) {
+        svg.append(
+          s("path", {
+            class: "area",
+            "data-activity": sr.role,
+            d: `${line}L${x(run.at(-1)[0]).toFixed(1)},${y(0)}L${x(run[0][0]).toFixed(1)},${y(0)}Z`,
+          }),
+        );
+      }
+      svg.append(
+        s("path", { class: "line", "data-activity": sr.role, d: line }),
+      );
+    }
+  }
+  if (extra) extra(svg, x, y);
+  const stamps = [
+    ...new Set(series.flatMap((sr) => sr.points.map(([t]) => t))),
+  ];
+  if (!stamps.length) {
+    figure.append(svg);
+    return;
+  }
+  const crosshair = s("line", {
+    class: "crosshair",
+    y1: pad.top,
+    y2: pad.top + plotH,
+    visibility: "hidden",
+  });
+  const hit = s("rect", {
+    x: pad.left,
+    y: pad.top,
+    width: plotW,
+    height: plotH,
+    fill: "transparent",
+  });
+  svg.append(crosshair, hit);
+  figure.append(svg);
+  const tooltip = tooltipFor(figure);
+  hit.addEventListener("pointermove", (event) => {
+    const box = svg.getBoundingClientRect();
+    const t =
+      since +
+      (((event.clientX - box.left) * (width / box.width) - pad.left) / plotW) *
+        (until - since);
+    const near = stamps.reduce((best, q) =>
+      Math.abs(q - t) < Math.abs(best - t) ? q : best,
+    );
+    crosshair.setAttribute("x1", x(near));
+    crosshair.setAttribute("x2", x(near));
+    crosshair.setAttribute("visibility", "visible");
+    tooltip.show(event, ...tip(near));
+  });
+  hit.addEventListener("pointerleave", () => {
+    crosshair.setAttribute("visibility", "hidden");
+    tooltip.hide();
+  });
+}
+
+/** Value of `points` at `t`, or null. */
+const valueAt = (points, t) => points.find(([pt]) => pt === t)?.[1] ?? null;
+
+/**
+ * A table whose column headers sort it; `columns` are `{ key, label, fmt,
+ * text }` (`text` columns sort by name, ascending first).
+ */
+function sortableTable(columns, rows, sortKey) {
+  let key = sortKey;
+  let desc = true;
+  const wrap = h("div", { class: "table-wrap" });
+  const render = () => {
+    const col = columns.find((c) => c.key === key);
+    const sorted = [...rows].sort((a, b) => {
+      const c = col.text
+        ? String(a[key]).localeCompare(String(b[key]))
+        : (a[key] ?? -Infinity) - (b[key] ?? -Infinity);
+      return desc ? -c : c;
+    });
+    fill(
+      wrap,
+      h(
+        "table",
+        { class: "data-table" },
+        h(
+          "thead",
+          {},
+          h(
+            "tr",
+            {},
+            columns.map((c) =>
+              h(
+                "th",
+                {
+                  scope: "col",
+                  "aria-sort":
+                    c.key === key
+                      ? desc
+                        ? "descending"
+                        : "ascending"
+                      : "none",
+                },
+                h("button", {
+                  type: "button",
+                  text: c.label,
+                  onclick: () => {
+                    if (key === c.key) desc = !desc;
+                    else {
+                      key = c.key;
+                      desc = !c.text;
+                    }
+                    render();
+                  },
+                }),
+              ),
+            ),
+          ),
+        ),
+        h(
+          "tbody",
+          {},
+          sorted.map((row) =>
+            h(
+              "tr",
+              {},
+              columns.map((c, i) =>
+                h(i ? "td" : "th", {
+                  scope: i ? null : "row",
+                  text: c.fmt ? c.fmt(row[c.key], row) : row[c.key],
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  };
+  render();
+  return wrap;
+}
+
+// Parallel
+
+function parallelSection(data, width) {
+  const p = data.parallel;
+  const avg = p.busy_ms ? p.working_ms / p.busy_ms : 0;
+  const queue = p.waiting_ms ? p.queued_ms / p.waiting_ms : 0;
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile(
+      "Most at once",
+      p.peak_working ? plural(p.peak_working, "session") : "–",
+      "working at the same time",
+    ),
+    statTile(
+      "Average at once",
+      p.busy_ms ? avg.toFixed(1) : "–",
+      "sessions working, while any did",
+    ),
+    statTile(
+      "Claude busy",
+      fmtDuration(p.busy_ms),
+      "at least one session working",
+    ),
+    statTile(
+      "All waiting on you",
+      fmtDuration(p.blocked_ms),
+      "sessions waiting, none working",
+    ),
+    statTile(
+      "Waiting at once",
+      p.waiting_ms ? queue.toFixed(1) : "–",
+      p.peak_waiting ? `on average; ${p.peak_waiting} at most` : "no waits",
+    ),
+  );
+
+  const over = chartFigure(
+    "Sessions at once",
+    "Average working and waiting on you, per point",
+    roleLegend([
+      ["working", "Working"],
+      ["your_turn", "Waiting on you"],
+    ]),
+  );
+  const working = p.series.map(([t, w]) => [t, w]);
+  const waiting = p.series.map(([t, , , q]) => [t, q]);
+  const bySlot = new Map(p.series.map((row) => [row[0], row]));
+  multiLineChart(over, {
+    series: [
+      { label: "Working", role: "working", points: working, area: true },
+      { label: "Waiting on you", role: "your_turn", points: waiting },
+    ],
+    since: data.since,
+    until: data.until,
+    width,
+    fmt: (v) => (Number.isInteger(v) ? String(v) : v.toFixed(1)),
+    tip: (t) => {
+      const [, w, wMax, q, qMax] = bySlot.get(t);
+      return [
+        `${w.toFixed(1)} working`,
+        `${q.toFixed(1)} waiting on you`,
+        `at most ${wMax} working, ${qMax} waiting`,
+        fmtStamp(t),
+      ];
+    },
+  });
+  over.append(
+    tableView(
+      ["Time", "Working", "Most working", "Waiting", "Most waiting"],
+      p.series
+        .filter(([, w, , q]) => w || q)
+        .map(([t, w, wMax, q, qMax]) => [
+          fmtStamp(t),
+          w.toFixed(2),
+          wMax,
+          q.toFixed(2),
+          qMax,
+        ]),
+    ),
+  );
+
+  const spread = chartFigure(
+    "How many worked at once",
+    "Time with exactly this many sessions working",
+  );
+  const rows = p.working_time
+    .map((ms, i) => ({
+      label: i === 5 ? "6 or more sessions" : plural(i + 1, "session"),
+      total: ms,
+      parts: [[ms, "working"]],
+    }))
+    .filter((r) => r.total > 0);
+  if (rows.length) {
+    barRows(
+      spread,
+      rows,
+      {
+        valueText: (row) =>
+          `${fmtDuration(row.total)} · ${pct((row.total / p.busy_ms) * 100)}`,
+        tipText: (row) => [fmtDuration(row.total), row.label],
+      },
+      width,
+    );
+    spread.append(
+      tableView(
+        ["Sessions working", "Time", "Share"],
+        rows.map((r) => [
+          r.label,
+          fmtDuration(r.total),
+          pct((r.total / p.busy_ms) * 100),
+        ]),
+      ),
+    );
+  } else {
+    spread.append(h("p", { class: "muted", text: "No work in this range." }));
+  }
+  return [
+    tiles,
+    over,
+    spread,
+    note(
+      `A wait counts for its first ${fmtDuration(p.wait_cap_ms)}: a session left longer is parked, not waiting on you.`,
+    ),
+  ];
+}
+
+// Limits
+
+const fmtWhen = (ts) => {
+  const d = new Date(ts);
+  const today = new Date(now());
+  return d.toDateString() === today.toDateString()
+    ? fmtTime(ts)
+    : `${dayFmt.format(ts)} ${fmtTime(ts)}`;
+};
+
+function paceText(f) {
+  const lately = f.recent_ms >= 86_400_000 ? "24 hours" : "hour";
+  if (f.pace_recent === null) return "not enough readings yet";
+  const avg =
+    f.pace_avg === null ? "" : `; ${f.pace_avg.toFixed(1)}%/h on average`;
+  return `${f.pace_recent.toFixed(1)}%/h over the last ${lately}${avg}`;
+}
+
+function forecastTiles(name, f) {
+  if (!f) {
+    return [statTile(`${name} limit`, "–", "no live reading yet")];
+  }
+  const ahead =
+    f.full_at !== null
+      ? statTile(
+          "By the reset",
+          "full",
+          `at ${fmtWhen(f.full_at)}; ${paceText(f)}`,
+        )
+      : statTile(
+          "By the reset",
+          f.at_reset_recent === null ? "–" : pct(f.at_reset_recent),
+          `at ${paceText(f)}`,
+        );
+  return [
+    statTile(
+      `${name} limit`,
+      pct(f.used_pct),
+      `resets ${fmtWhen(f.resets_at)}`,
+    ),
+    ahead,
+  ];
+}
+
+function limitsSection(data, width, half) {
+  const l = data.limits;
+  const week = l.seven_day;
+  const tiles = [...forecastTiles("7-day", week)];
+  if (week) {
+    const days = (week.resets_at - data.now) / 86_400_000;
+    tiles.push(
+      statTile(
+        "Daily budget",
+        days > 0
+          ? `${((100 - week.used_pct) / Math.max(days, 1)).toFixed(1)}%`
+          : "–",
+        "a day, to last until the reset",
+      ),
+    );
+  }
+  tiles.push(...forecastTiles("5-hour", l.five_hour));
+  const hot = l.windows.filter((w) => w.peak >= 90).length;
+  tiles.push(
+    statTile(
+      "Windows near the limit",
+      l.windows.length ? `${hot} of ${l.windows.length}` : "–",
+      "5-hour windows that passed 90% in this range",
+    ),
+  );
+
+  const weekFigure = chartFigure(
+    "This week's limit",
+    week
+      ? "7-day limit used, with the recent pace carried on to the reset"
+      : "7-day limit used over the last 7 days",
+  );
+  const since = week
+    ? week.resets_at - week.window_ms
+    : data.now - 7 * 86_400_000;
+  const until = week ? week.resets_at : data.now;
+  if (l.week.length) {
+    multiLineChart(weekFigure, {
+      series: [{ label: "7-day", role: "working", points: l.week, area: true }],
+      since,
+      until,
+      width,
+      max: 100,
+      fmt: (v) => `${v}%`,
+      extra: (svg, x, y) => {
+        svg.append(
+          s("line", {
+            class: "limit-line",
+            x1: x(since),
+            x2: x(until),
+            y1: y(100),
+            y2: y(100),
+          }),
+        );
+        if (!week || week.pace_recent === null) return;
+        const end = week.full_at ?? week.resets_at;
+        const value = week.full_at ? 100 : week.at_reset_recent;
+        svg.append(
+          s("path", {
+            class: "line projection",
+            "data-activity": "working",
+            d: `M${x(data.now).toFixed(1)},${y(week.used_pct).toFixed(1)}L${x(end).toFixed(1)},${y(value).toFixed(1)}`,
+          }),
+          s("text", {
+            x: x(end) - 4,
+            y: y(value) - 6,
+            "text-anchor": "end",
+            text: week.full_at
+              ? `full ${fmtWhen(end)}`
+              : `${pct(value)} at reset`,
+          }),
+        );
+      },
+      tip: (t) => [pct(valueAt(l.week, t)), fmtStamp(t)],
+    });
+    weekFigure.append(
+      tableView(
+        ["Hour", "7-day limit"],
+        l.week.map(([t, v]) => [fmtStamp(t), pct(v)]),
+      ),
+    );
+  } else {
+    weekFigure.append(
+      h("p", { class: "muted", text: "No statusline readings yet." }),
+    );
+  }
+
+  const windows = chartFigure(
+    "5-hour windows",
+    "Highest reading in each window, in this range",
+  );
+  if (l.windows.length) {
+    columnChart(
+      windows,
+      l.windows.map((w) => ({
+        label: hourly(data) ? fmtTime(w.start) : shortDay.format(w.start),
+        w,
+        parts: [[w.peak, null]],
+      })),
+      {
+        width: half,
+        height: 170,
+        fmtY: (v) => `${v}%`,
+        tip: (col) => [
+          pct(col.w.peak),
+          `${fmtStamp(col.w.start)} – ${fmtTime(col.w.end)}`,
+        ],
+      },
+    );
+    windows.append(
+      tableView(
+        ["Window", "Highest"],
+        l.windows.map((w) => [
+          `${fmtStamp(w.start)} – ${fmtTime(w.end)}`,
+          pct(w.peak),
+        ]),
+      ),
+    );
+  } else {
+    windows.append(
+      h("p", { class: "muted", text: "No readings in this range." }),
+    );
+  }
+
+  const shares = chartFigure(
+    "This week by workspace",
+    "API-equivalent cost since the 7-day window opened, a stand-in for the share of the limit",
+  );
+  const total = l.shares.reduce((n, sh) => n + sh.cost_usd, 0);
+  if (total > 0) {
+    const rows = l.shares.map((sh) => ({
+      label: sh.workspace ?? "Outside the workspaces",
+      cost: sh.cost_usd,
+      total: sh.cost_usd,
+      parts: [[sh.cost_usd, null]],
+    }));
+    barRows(
+      shares,
+      rows,
+      {
+        valueText: (row) =>
+          `${pct((row.cost / total) * 100)} · ${fmtUsd(row.cost)}`,
+        tipText: (row) => [fmtUsd(row.cost), row.label],
+      },
+      half,
+    );
+    shares.append(
+      tableView(
+        ["Workspace", "Cost", "Share"],
+        rows.map((r) => [r.label, fmtUsd(r.cost), pct((r.cost / total) * 100)]),
+      ),
+    );
+  } else {
+    shares.append(h("p", { class: "muted", text: "No cost data this week." }));
+  }
+
+  return [
+    h("div", { class: "tiles" }, tiles),
+    weekFigure,
+    h("div", { class: "chart-pair" }, windows, shares),
+    note(
+      "Limits are account-wide: the workspace filter doesn't apply, and only the 5-hour windows follow the time range.",
+    ),
+  ];
+}
+
+// Projects
+
+function projectsSection(data, width, half) {
+  const by = new Map();
+  for (const p of data.projects) {
+    const key = place(p.cwd);
+    const row = by.get(key) || {
+      project: key,
+      sessions: 0,
+      working: 0,
+      waiting: 0,
+      permission_ms: 0,
+      your_turn_ms: 0,
+      prompts: 0,
+      cost: 0,
+      added: 0,
+      removed: 0,
+      tools: 0,
+      failures: 0,
+      compactions: 0,
+      tokens: 0,
+      cpu: 0,
+    };
+    row.sessions += p.sessions;
+    row.working += p.working_ms;
+    row.permission_ms += p.permission_ms;
+    row.your_turn_ms += p.your_turn_ms;
+    row.waiting += p.permission_ms + p.your_turn_ms;
+    row.prompts += p.prompts;
+    row.cost += p.cost_usd;
+    row.added += p.lines_added;
+    row.removed += p.lines_removed;
+    row.tools += p.tools;
+    row.failures += p.tool_failures;
+    row.compactions += p.compactions;
+    row.tokens += p.tokens;
+    row.cpu += p.cpu_secs;
+    by.set(key, row);
+  }
+  const rows = [...by.values()].filter(
+    (r) => r.working || r.waiting || r.prompts || r.cost || r.tools,
+  );
+  if (!rows.length) {
+    return [
+      h("p", { class: "muted", text: "No project activity in this range." }),
+    ];
+  }
+  rows.forEach((r) => (r.lines = r.added + r.removed));
+  const columns = [
+    { key: "project", label: "Project", text: true },
+    { key: "working", label: "Working", fmt: fmtDuration },
+    { key: "waiting", label: "Waited", fmt: fmtDuration },
+    { key: "prompts", label: "Prompts" },
+    { key: "cost", label: "Cost", fmt: fmtUsd },
+    {
+      key: "lines",
+      label: "Lines",
+      fmt: (_, r) =>
+        `+${compact.format(r.added)} −${compact.format(r.removed)}`,
+    },
+    {
+      key: "tools",
+      label: "Tool calls",
+      fmt: (v, r) => (r.failures ? `${v} (${r.failures} failed)` : String(v)),
+    },
+    { key: "compactions", label: "Compactions" },
+    { key: "sessions", label: "Sessions" },
+  ];
+  if (data.telemetry) {
+    columns.push({ key: "tokens", label: "Tokens", fmt: fmtTokens });
+  }
+  columns.push({
+    key: "cpu",
+    label: "CPU",
+    fmt: (v) =>
+      v >= 3600
+        ? `${(v / 3600).toFixed(1)} core-h`
+        : `${Math.round(v / 60)} core-min`,
+  });
+  const table = chartFigure(
+    "Projects",
+    "Per directory; select a column to sort by it",
+    sortableTable(columns, rows, "working"),
+  );
+
+  const top = (key) =>
+    [...rows]
+      .sort((a, b) => b[key] - a[key])
+      .filter((r) => r[key] > 0)
+      .slice(0, 8);
+  const time = chartFigure(
+    "Time by project",
+    "Working and waiting on you",
+    stateLegend(STATES),
+  );
+  const timeRows = top("working").map((r) => ({
+    ...r,
+    label: r.project,
+    total: r.working + r.waiting,
+    parts: [
+      [r.working, "working"],
+      [r.permission_ms, "permission"],
+      [r.your_turn_ms, "your_turn"],
+    ],
+  }));
+  barRows(
+    time,
+    timeRows,
+    {
+      valueText: (row) => fmtDuration(row.total),
+      tipText: (row, value, activity) => [
+        fmtDuration(value),
+        `${ACTIVITY[activity].label} · ${row.label}`,
+      ],
+    },
+    half,
+  );
+  const cost = chartFigure(
+    "Cost by project",
+    "API-equivalent, from statusline totals",
+  );
+  const costRows = top("cost").map((r) => ({
+    ...r,
+    label: r.project,
+    total: r.cost,
+    parts: [[r.cost, null]],
+  }));
+  if (costRows.length) {
+    barRows(
+      cost,
+      costRows,
+      {
+        valueText: (row) => fmtUsd(row.cost),
+        tipText: (row) => [
+          fmtUsd(row.cost),
+          row.label,
+          plural(row.prompts, "prompt"),
+        ],
+      },
+      half,
+    );
+  } else {
+    cost.append(
+      h("p", { class: "muted", text: "No cost data in this range." }),
+    );
+  }
+  return [
+    table,
+    h("div", { class: "chart-pair" }, time, cost),
+    note(
+      `Waits count for their first ${fmtDuration(data.parallel.wait_cap_ms)}, as in Parallel: a session left longer is parked.`,
+    ),
+  ];
+}
+
+// Turns
+
+function toolStatRows(stats, label) {
+  return stats.map((t) => ({
+    ...t,
+    label: label(t.name),
+    total: t.total_ms,
+    parts: [[t.total_ms, null]],
+  }));
+}
+
+function toolStatChart(title, sub, stats, label, width) {
+  const figure = chartFigure(title, sub);
+  if (!stats.length) {
+    figure.append(
+      h("p", { class: "muted", text: "Nothing ran in this range." }),
+    );
+    return figure;
+  }
+  barRows(
+    figure,
+    toolStatRows(stats, label),
+    {
+      valueText: (row) =>
+        `${fmtDuration(row.total_ms)} · ${plural(row.calls, "call")}`,
+      tipText: (row) => [
+        fmtDuration(row.total_ms),
+        row.label,
+        `median ${fmtDuration(row.p50_ms ?? 0)}, 95% under ${fmtDuration(row.p95_ms ?? 0)}`,
+        row.failed ? `${row.failed} failed` : null,
+      ],
+    },
+    width,
+  );
+  figure.append(
+    tableView(
+      ["Name", "Calls", "Failed", "Total", "Median", "95%", "Longest"],
+      stats.map((t) => [
+        label(t.name),
+        t.calls,
+        t.failed,
+        fmtDuration(t.total_ms),
+        fmtDuration(t.p50_ms ?? 0),
+        fmtDuration(t.p95_ms ?? 0),
+        fmtDuration(t.max_ms ?? 0),
+      ]),
+    ),
+  );
+  return figure;
+}
+
+function turnsSection(data, width, half) {
+  const a = data.anatomy;
+  const total = a.claude_ms + a.tools_ms + a.permission_ms;
+  const share = (ms) => (total ? pct((ms / total) * 100) : "–");
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile("Turns", a.turns, "finished in this range"),
+    statTile(
+      "Median turn",
+      data.turns.median_ms === null ? "–" : fmtDuration(data.turns.median_ms),
+      "prompt to reply",
+    ),
+    statTile(
+      "Claude",
+      share(a.claude_ms),
+      `${fmtDuration(a.claude_ms)} thinking and writing`,
+    ),
+    statTile("Tools", share(a.tools_ms), `${fmtDuration(a.tools_ms)} running`),
+    statTile(
+      "Permission prompts",
+      share(a.permission_ms),
+      `${fmtDuration(a.permission_ms)} waiting on you`,
+    ),
+  );
+
+  const split = chartFigure(
+    "Where turn time goes",
+    `Finished turns, by the ${hourly(data) ? "hour" : "day"} they started`,
+    roleLegend([
+      ["tools", "Tools"],
+      ["working", "Claude"],
+      ["permission", "Permission prompt"],
+    ]),
+  );
+  columnChart(
+    split,
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
+      day: d,
+      parts: [
+        [d.turn_tools_ms / 3_600_000, "tools"],
+        [d.turn_claude_ms / 3_600_000, "working"],
+        [d.turn_permission_ms / 3_600_000, "permission"],
+      ],
+    })),
+    {
+      width,
+      fmtY: (v) =>
+        v === 0 ? "0" : v >= 1 ? `${v}h` : `${Math.round(v * 60)}m`,
+      brush: bucketBrush(data),
+      tip: (col, value, role) => [
+        fmtDuration(value * 3_600_000),
+        `${{ tools: "Tools", working: "Claude", permission: "Permission prompt" }[role]} · ${bucketName(data, col.day.start)}`,
+        plural(col.day.turns, "turn"),
+      ],
+    },
+  );
+  split.append(
+    tableView(
+      ["Day", "Turns", "Claude", "Tools", "Permission"],
+      data.buckets.map((d) => [
+        bucketName(data, d.start),
+        d.turns,
+        fmtDuration(d.turn_claude_ms),
+        fmtDuration(d.turn_tools_ms),
+        fmtDuration(d.turn_permission_ms),
+      ]),
+    ),
+  );
+
+  const slowest = chartFigure(
+    "Slowest calls",
+    "Single tool calls that took longest",
+  );
+  slowest.append(
+    a.slowest.length
+      ? h(
+          "ol",
+          { class: "call-list" },
+          a.slowest.map((c) =>
+            h(
+              "li",
+              {},
+              h("span", { class: "call-time", text: fmtDuration(c.ms) }),
+              h(
+                "span",
+                { class: "call-what" },
+                h("code", { text: c.summary || toolName(c.tool) }),
+                h(
+                  "span",
+                  { class: "muted" },
+                  `${toolName(c.tool)}${c.ok ? "" : " · failed"} · `,
+                  sessionRef(c.session, c.label),
+                  ` · ${fmtStamp(c.ts)}`,
+                ),
+              ),
+            ),
+          ),
+        )
+      : h("p", { class: "muted", text: "No tool calls in this range." }),
+  );
+
+  const failing = chartFigure(
+    "Commands that fail most",
+    "Shell commands by failed runs",
+  );
+  failing.append(
+    a.failing.length
+      ? sortableTable(
+          [
+            { key: "name", label: "Command", text: true },
+            { key: "failed", label: "Failed" },
+            { key: "calls", label: "Runs" },
+            {
+              key: "rate",
+              label: "Rate",
+              fmt: (v) => pct(v * 100),
+            },
+            {
+              key: "last_failed_at",
+              label: "Last failed",
+              fmt: (v) => (v ? fmtStamp(v) : "–"),
+            },
+          ],
+          a.failing.map((c) => ({ ...c, rate: c.failed / c.calls })),
+          "failed",
+        )
+      : h("p", { class: "muted", text: "No failed commands in this range." }),
+  );
+
+  return [
+    tiles,
+    split,
+    h(
+      "div",
+      { class: "chart-pair" },
+      toolStatChart(
+        "Tools by total time",
+        "Main conversation",
+        a.tools,
+        toolName,
+        half,
+      ),
+      toolStatChart(
+        "Commands by total time",
+        "Shell commands, wrappers like direnv exec left out",
+        a.commands,
+        (n) => n,
+        half,
+      ),
+    ),
+    slowest,
+    failing,
+    note(
+      "Claude's share is a turn's time outside tools and permission prompts: thinking, writing, and waiting on the API.",
+    ),
+  ];
+}
+
+// Context
+
+const PEAK_LABELS = ["<25%", "25–50%", "50–75%", "75–90%", "≥90%"];
+
+function contextSection(data, width, half) {
+  const c = data.context;
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile("Compactions", c.compactions, `${c.compactions_auto} automatic`),
+    statTile(
+      "Sessions compacted",
+      c.compacted_sessions,
+      "compacted at least once",
+    ),
+    statTile(
+      "Median peak context",
+      c.median_peak === null ? "–" : pct(c.median_peak),
+      "highest use a session reached",
+    ),
+    statTile("Past 90%", c.peaks[4], "sessions that nearly filled the window"),
+  );
+
+  const per = chartFigure(
+    hourly(data) ? "Compactions per hour" : "Compactions per day",
+    "Automatic and manual (/compact)",
+  );
+  columnChart(
+    per,
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
+      day: d,
+      parts: [[d.compactions, null]],
+    })),
+    {
+      width: half,
+      height: 170,
+      fmtY: fmtCount,
+      brush: bucketBrush(data),
+      tip: (col) => [
+        plural(col.day.compactions, "compaction"),
+        `${col.day.compactions_auto} automatic · ${bucketName(data, col.day.start)}`,
+      ],
+    },
+  );
+  per.append(
+    tableView(
+      ["Day", "Compactions", "Automatic"],
+      data.buckets.map((d) => [
+        bucketName(data, d.start),
+        d.compactions,
+        d.compactions_auto,
+      ]),
+    ),
+  );
+
+  const peaks = chartFigure(
+    "Peak context per session",
+    "Sessions by the highest context use they reached",
+  );
+  columnChart(
+    peaks,
+    c.peaks.map((n, i) => ({ label: PEAK_LABELS[i], parts: [[n, "working"]] })),
+    {
+      width: half,
+      height: 170,
+      fmtY: fmtCount,
+      tip: (col, value) => [plural(value, "session"), col.label],
+    },
+  );
+  peaks.append(
+    tableView(
+      ["Peak context", "Sessions"],
+      c.peaks.map((n, i) => [PEAK_LABELS[i], n]),
+    ),
+  );
+
+  const sessions = chartFigure(
+    "Sessions that compacted most",
+    "Then the fullest",
+  );
+  sessions.append(
+    c.sessions.length
+      ? sortableTable(
+          [
+            { key: "label", label: "Session", text: true },
+            { key: "where", label: "Project", text: true },
+            { key: "compactions", label: "Compactions" },
+            {
+              key: "peak",
+              label: "Peak",
+              fmt: (v) => (v === null ? "–" : pct(v)),
+            },
+          ],
+          c.sessions.map((x) => ({
+            ...x,
+            where: place(x.cwd),
+            peak: x.peak_pct,
+          })),
+          "compactions",
+        )
+      : h("p", { class: "muted", text: "No sessions in this range." }),
+  );
+  return [tiles, h("div", { class: "chart-pair" }, per, peaks), sessions];
+}
+
+// Tokens
+
+function tokensSection(data, width, half) {
+  const t = data.telemetry;
+  if (!t) {
+    return [
+      h(
+        "div",
+        { class: "callout" },
+        h("strong", { text: "Turn on Claude Code's OpenTelemetry export" }),
+        h("p", {
+          text: "Tokens, cache hits, API latency, commits, pull requests and edit decisions come from it. With the Home Manager module:",
+        }),
+        h("pre", {
+          text: "services.ccdash.claudeCode.telemetry.enable = true;",
+        }),
+        h("p", {
+          class: "muted",
+          text: "Sessions started after the switch report; data goes only to ccdash on this machine.",
+        }),
+      ),
+    ];
+  }
+  const read = t.tokens_cache_read;
+  const fresh = t.tokens_input + t.tokens_cache_write;
+  const all = read + fresh + t.tokens_output;
+  const hit = read + fresh ? (read / (read + fresh)) * 100 : null;
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile("Tokens", fmtTokens(all), plural(t.requests, "API request")),
+    statTile(
+      "Cache hit rate",
+      hit === null ? "–" : pct(hit),
+      "input read from the prompt cache",
+    ),
+    statTile(
+      "Output tokens",
+      fmtTokens(t.tokens_output),
+      `${fmtTokens(t.tokens_cache_write)} written to the cache`,
+    ),
+    statTile("Commits", t.commits, plural(t.pull_requests, "pull request")),
+    statTile(
+      "Your active time",
+      fmtDuration(t.active_user_secs * 1000),
+      `Claude: ${fmtDuration(t.active_cli_secs * 1000)}`,
+    ),
+    statTile(
+      "API errors",
+      t.errors,
+      t.errors
+        ? t.errors_by_status.map(([s, n]) => `${s}: ${n}`).join(", ")
+        : "none",
+    ),
+  );
+
+  const per = chartFigure(
+    hourly(data) ? "Tokens per hour" : "Tokens per day",
+    "Fresh input, cache writes and output; cache reads show as the hit rate",
+    roleLegend([
+      ["input", "Input"],
+      ["cache_write", "Cache writes"],
+      ["output", "Output"],
+    ]),
+  );
+  columnChart(
+    per,
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
+      day: d,
+      parts: [
+        [d.tokens_input, "input"],
+        [d.tokens_cache_write, "cache_write"],
+        [d.tokens_output, "output"],
+      ],
+    })),
+    {
+      width,
+      fmtY: (v) => fmtTokens(v),
+      brush: bucketBrush(data),
+      tip: (col, value, role) => [
+        fmtTokens(value),
+        `${{ input: "Input", cache_write: "Cache writes", output: "Output" }[role]} · ${bucketName(data, col.day.start)}`,
+        `${fmtTokens(col.day.tokens_cache_read)} read from the cache`,
+      ],
+    },
+  );
+  per.append(
+    tableView(
+      ["Day", "Input", "Cache writes", "Cache reads", "Output", "Requests"],
+      data.buckets.map((d) => [
+        bucketName(data, d.start),
+        d.tokens_input,
+        d.tokens_cache_write,
+        d.tokens_cache_read,
+        d.tokens_output,
+        d.api_requests,
+      ]),
+    ),
+  );
+
+  const hits = chartFigure(
+    hourly(data) ? "Cache hit rate per hour" : "Cache hit rate per day",
+    "Share of input read from the prompt cache",
+  );
+  const hitOf = (d) => {
+    const inbound = d.tokens_input + d.tokens_cache_write + d.tokens_cache_read;
+    return inbound ? (d.tokens_cache_read / inbound) * 100 : 0;
+  };
+  columnChart(
+    hits,
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
+      day: d,
+      parts: [[hitOf(d), null]],
+    })),
+    {
+      width: half,
+      height: 170,
+      fmtY: (v) => `${v}%`,
+      tip: (col) => [pct(hitOf(col.day)), bucketName(data, col.day.start)],
+    },
+  );
+
+  const active = chartFigure(
+    hourly(data) ? "Active time per hour" : "Active time per day",
+    "You at the keyboard, and Claude working",
+    roleLegend([
+      ["your_turn", "You"],
+      ["working", "Claude"],
+    ]),
+  );
+  const you = data.buckets.map((d) => [d.start, d.active_user_secs / 3600]);
+  const cli = data.buckets.map((d) => [d.start, d.active_cli_secs / 3600]);
+  multiLineChart(active, {
+    series: [
+      { label: "You", role: "your_turn", points: you },
+      { label: "Claude", role: "working", points: cli },
+    ],
+    since: data.buckets[0].start,
+    until: data.buckets.at(-1).start + data.bucket_ms,
+    width: half,
+    fmt: (v) => fmtDuration(v * 3_600_000),
+    tip: (ts) => [
+      `You ${fmtDuration(valueAt(you, ts) * 3_600_000)}`,
+      `Claude ${fmtDuration(valueAt(cli, ts) * 3_600_000)}`,
+      bucketName(data, ts),
+    ],
+  });
+
+  const models = chartFigure(
+    "By model",
+    "All tokens; latency is the whole request",
+  );
+  const modelRows = t.models.map((m) => ({
+    ...m,
+    label: m.model,
+    all:
+      m.tokens_input +
+      m.tokens_output +
+      m.tokens_cache_read +
+      m.tokens_cache_write,
+  }));
+  if (modelRows.length) {
+    barRows(
+      models,
+      modelRows.map((m) => ({ ...m, total: m.all, parts: [[m.all, null]] })),
+      {
+        valueText: (row) => `${fmtTokens(row.all)} · ${fmtUsd(row.cost_usd)}`,
+        tipText: (row) => [
+          fmtTokens(row.all),
+          row.label,
+          plural(row.requests, "request"),
+          `median ${fmtDuration(row.p50_ms ?? 0)}, first token ${fmtDuration(row.ttft_p50_ms ?? 0)}`,
+        ],
+      },
+      half,
+    );
+    models.append(
+      tableView(
+        [
+          "Model",
+          "Requests",
+          "Input",
+          "Cache writes",
+          "Cache reads",
+          "Output",
+          "Cost",
+          "Median",
+          "95%",
+          "First token",
+        ],
+        modelRows.map((m) => [
+          m.model,
+          m.requests,
+          fmtTokens(m.tokens_input),
+          fmtTokens(m.tokens_cache_write),
+          fmtTokens(m.tokens_cache_read),
+          fmtTokens(m.tokens_output),
+          fmtUsd(m.cost_usd),
+          fmtDuration(m.p50_ms ?? 0),
+          fmtDuration(m.p95_ms ?? 0),
+          fmtDuration(m.ttft_p50_ms ?? 0),
+        ]),
+      ),
+    );
+  } else {
+    models.append(
+      h("p", { class: "muted", text: "No API requests in this range." }),
+    );
+  }
+
+  const sources = chartFigure(
+    "By source",
+    "Main conversation, subagents, background work",
+  );
+  if (t.sources.length) {
+    barRows(
+      sources,
+      t.sources.map((sr) => ({
+        ...sr,
+        label: sr.source,
+        total: sr.tokens,
+        parts: [[sr.tokens, null]],
+      })),
+      {
+        valueText: (row) =>
+          `${fmtTokens(row.tokens)} · ${plural(row.requests, "request")}`,
+        tipText: (row) => [fmtTokens(row.tokens), row.label],
+      },
+      half,
+    );
+  } else {
+    sources.append(
+      h("p", { class: "muted", text: "No API requests in this range." }),
+    );
+  }
+
+  const commits = chartFigure(
+    hourly(data) ? "Commits per hour" : "Commits per day",
+    "Made by Claude Code",
+  );
+  columnChart(
+    commits,
+    data.buckets.map((d) => ({
+      label: bucketLabel(data, d.start),
+      day: d,
+      parts: [[d.commits, null]],
+    })),
+    {
+      width: half,
+      height: 170,
+      fmtY: fmtCount,
+      tip: (col) => [
+        plural(col.day.commits, "commit"),
+        `${plural(col.day.pull_requests, "pull request")} · ${bucketName(data, col.day.start)}`,
+      ],
+    },
+  );
+
+  const edits = chartFigure(
+    "Edits by language",
+    "Accepted and rejected file edits",
+  );
+  if (t.edits.length) {
+    barRows(
+      edits,
+      t.edits.slice(0, 8).map((e) => ({
+        ...e,
+        label: e.language,
+        total: e.accepted + e.rejected,
+        parts: [[e.accepted + e.rejected, null]],
+      })),
+      {
+        valueText: (row) =>
+          `${row.accepted} accepted${row.rejected ? ` · ${row.rejected} rejected` : ""}`,
+        tipText: (row) => [plural(row.total, "edit"), row.label],
+      },
+      half,
+    );
+  } else {
+    edits.append(h("p", { class: "muted", text: "No edits in this range." }));
+  }
+
+  return [
+    tiles,
+    per,
+    h("div", { class: "chart-pair" }, hits, active),
+    h("div", { class: "chart-pair" }, models, sources),
+    h("div", { class: "chart-pair" }, commits, edits),
+    note(
+      `From Claude Code's OpenTelemetry export; last received ${fmtStamp(t.last_at)}.`,
+    ),
+  ];
+}
+
+// Permissions
+
+const DECISION_SOURCES = {
+  config: "Settings or auto mode",
+  hook: "A hook",
+  user_permanent: "You, for good",
+  user_temporary: "You, once",
+  user_reject: "You refused",
+  user_abort: "Interrupted",
+};
+
+function permissionsSection(data, width, half) {
+  const p = data.permissions;
+  const blocked = p.blocked.reduce((n, [, c]) => n + c, 0);
+  const tiles = h(
+    "div",
+    { class: "tiles" },
+    statTile(
+      "Permission prompts",
+      p.asks,
+      `${p.allowed} allowed, ${p.denied} not`,
+    ),
+    statTile(
+      "Answer time",
+      p.median_answer_ms === null ? "–" : fmtDuration(p.median_answer_ms),
+      "median, prompt to answer",
+    ),
+    statTile(
+      "Questions",
+      p.questions,
+      p.median_question_ms === null
+        ? "Claude asked you"
+        : `answered in ${fmtDuration(p.median_question_ms)} (median)`,
+    ),
+    statTile(
+      "Blocked by auto mode",
+      blocked,
+      blocked
+        ? p.blocked
+            .slice(0, 3)
+            .map(([tool, n]) => `${toolName(tool)} ${n}`)
+            .join(", ")
+        : "nothing",
+    ),
+  );
+  if (p.plans) {
+    tiles.append(statTile("Plans", p.plans, `${p.plans_approved} approved`));
+  }
+
+  const rules = chartFigure(
+    "What asks you most",
+    "Grouped by the allow rule that would cover it",
+  );
+  rules.append(
+    p.rules.length
+      ? sortableTable(
+          [
+            { key: "rule", label: "Rule", text: true },
+            { key: "asks", label: "Asked" },
+            { key: "allowed", label: "Allowed" },
+            { key: "denied", label: "Not" },
+            {
+              key: "median_answer_ms",
+              label: "Answer",
+              fmt: (v) => (v === null ? "–" : fmtDuration(v)),
+            },
+            { key: "last_at", label: "Last", fmt: (v) => fmtStamp(v) },
+            {
+              key: "candidate",
+              label: "Allow?",
+              fmt: (v) => (v ? "candidate" : ""),
+            },
+          ],
+          p.rules.map((r) => ({
+            ...r,
+            candidate: r.asks >= 3 && !r.denied ? 1 : 0,
+          })),
+          "asks",
+        )
+      : h("p", {
+          class: "muted",
+          text: "No permission prompts in this range.",
+        }),
+  );
+
+  const parts = [tiles, rules];
+  const decisions = data.telemetry?.decisions ?? [];
+  if (decisions.length) {
+    const how = chartFigure(
+      "How tool calls were let through",
+      "Every tool call, from Claude Code's OpenTelemetry export",
+    );
+    barRows(
+      how,
+      decisions.map((d) => ({
+        ...d,
+        label: `${DECISION_SOURCES[d.source] ?? d.source}${d.decision === "reject" ? " (refused)" : ""}`,
+        total: d.count,
+        parts: [[d.count, null]],
+      })),
+      {
+        valueText: (row) => String(row.count),
+        tipText: (row) => [plural(row.count, "call"), row.label],
+      },
+      width,
+    );
+    parts.push(how);
+  }
+  parts.push(
+    note(
+      "Answers are inferred: a prompt counts as allowed when the tool ran right after it. Check a rule before adding it to permissions.allow in settings.json; candidates were asked 3 or more times and never refused.",
+    ),
+  );
+  return parts;
 }
 
 // --- chrome -----------------------------------------------------------------

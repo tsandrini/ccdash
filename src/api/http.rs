@@ -324,10 +324,17 @@ async fn analytics(
 ) -> Result<Json<Analytics>, ApiError> {
     let scope = query.scope(&app.workspaces, 7 * DAY_MS)?;
     let tz = query.tz.unwrap_or(0).clamp(-14 * 60, 14 * 60);
-    let live = app.hub.snapshot().await?.sessions;
-    let store = app.store.clone();
+    let snapshot = app.hub.snapshot().await?;
+    let (store, workspaces) = (app.store.clone(), app.workspaces.clone());
     let analytics = tokio::task::spawn_blocking(move || {
-        analytics::analytics(&store.reader()?, &scope, tz, &live)
+        analytics::analytics(
+            &store.reader()?,
+            &scope,
+            tz,
+            &snapshot.sessions,
+            snapshot.rate_limits.as_ref(),
+            &workspaces,
+        )
     })
     .await
     .map_err(anyhow::Error::from)??;

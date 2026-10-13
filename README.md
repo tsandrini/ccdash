@@ -27,8 +27,9 @@ niri window events ────────────────┘
   tab. Clicking a session focuses its terminal window in niri.
 
 Only public Claude Code interfaces are used (`claude agents --json`, hooks,
-the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference));
-no internal state files.
+the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
+[OpenTelemetry](https://code.claude.com/docs/en/monitoring-usage)); no
+internal state files.
 
 ## Usage
 
@@ -77,9 +78,26 @@ The web UI lives on the HTTP port:
   processes with CPU and memory, and totals.
 - **History:** activity timeline, time per project, most used tools and
   5-hour limit usage.
-- **Analytics:** daily activity, when you prompt (weekday × hour), how long
-  Claude works per prompt and how long sessions wait for you, cost per day
-  and per model, lines changed, memory and CPU per project.
+- **Analytics**, in sections:
+  - _Overview:_ daily activity, when you prompt (weekday × hour), how long
+    Claude works per prompt and how long sessions wait for you, cost per day
+    and per model, lines changed, memory and CPU per project.
+  - _Parallel:_ how many sessions worked or waited on you at once, and how
+    long everything waited on you with nothing working.
+  - _Limits:_ the 5-hour and 7-day limits with their pace and where they
+    end up at the reset, the peak of each 5-hour window, and each
+    workspace's share of the week.
+  - _Projects:_ a sortable table of time, prompts, cost, lines, tool calls,
+    compactions and CPU per directory.
+  - _Turns:_ what fills a turn (Claude, tools, permission prompts), tools and
+    shell commands by total time, the slowest calls and the commands that
+    fail most.
+  - _Context:_ compactions and how full sessions got.
+  - _Tokens:_ tokens by type, cache hit rate, API latency per model,
+    commits, pull requests, edits by language, and your active time against
+    Claude's (needs telemetry, below).
+  - _Permissions:_ what asks you most, grouped by the allow rule that would
+    cover it, how you answered and how fast, and what auto mode blocked.
 
 History and Analytics share a time range picker: quick ranges or an exact
 from–to, `‹ ›` to step by the range's length, `⊖` to double it, and
@@ -92,6 +110,14 @@ browser keeps it, so it is a one-time step per device. The token lives in
 `~/.local/state/ccdash/token` and survives reboots; delete it and restart
 ccdash to lock every device out. The DMS plugin adds it to the links it
 opens by itself.
+
+The Tokens section, and the approval sources under Permissions, come from
+Claude Code's OpenTelemetry export. `claudeCode.telemetry.enable = true` sets
+the `OTEL_*` variables in `programs.claude-code.settings.env` and starts an
+OTLP/HTTP receiver in the daemon on `127.0.0.1:7839`. It takes no token, so
+ccdash refuses to bind it anywhere but loopback, and it keeps only counts and
+timings: prompt text stays redacted, as Claude Code sends it by default.
+Sessions started after the switch report.
 
 Sessions can be renamed from the web UI and the DMS plugin. ccdash shows the
 new name at once and hands it to Claude Code at the session's next prompt
@@ -177,6 +203,7 @@ Everything stays on the machine running the daemon:
 | Web token  | `~/.local/state/ccdash/token`, owner-only                   |
 | Config     | `~/.config/ccdash/config.toml`                              |
 | Sockets    | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)      |
+| Telemetry  | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled             |
 
 The database keeps 30 days (`store.retention_days`) of:
 
@@ -188,6 +215,9 @@ The database keeps 30 days (`store.retention_days`) of:
   cost, rate limits, model, lines changed)
 - `proc_samples`: once a minute per session (CPU, memory, process count)
 - `sessions`: id, directory, title, kind, start and end
+- `telemetry` (with telemetry on): API requests (model, tokens, cost,
+  latency), API errors, tool approval decisions, commits, pull requests,
+  edit decisions and active time
 
 Nothing is sent anywhere; the HTTP API serves it to your browser with the
 token. Delete the database to start over.

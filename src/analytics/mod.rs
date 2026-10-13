@@ -1,17 +1,31 @@
 //! Trends for the analytics view: activity, prompts, turn lengths, cost,
 //! lines changed and resource use, in day buckets (hour buckets for spans of
-//! two days or less) of the viewer's time zone.
+//! two days or less) of the viewer's time zone. Each section past the
+//! overview has its own module.
+
+mod context;
+mod limits;
+mod parallel;
+mod permissions;
+mod telemetry;
+mod turns;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use rusqlite::{Connection, named_params};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     history::{Transition, lanes},
-    model::{Activity, Session},
-    workspace::{IN_SCOPE, Scope},
+    model::{Activity, RateLimits, Session},
+    workspace::{IN_SCOPE, Scope, Workspaces},
+};
+
+pub use self::{
+    context::ContextHealth, limits::Limits, parallel::Parallel, permissions::Permissions,
+    telemetry::Telemetry, turns::Anatomy,
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -41,10 +55,20 @@ pub struct Analytics {
     /// How long a session waited on you before you answered.
     pub responses: Histogram,
     pub models: Vec<ModelCost>,
+    /// Per working directory, most working time first.
     pub projects: Vec<ProjectUse>,
     /// Memory of all session process trees together.
     pub memory: Vec<(i64, u64)>,
     pub sessions: usize,
+    pub parallel: Parallel,
+    /// Account-wide; neither the range nor the workspace applies.
+    pub limits: Limits,
+    /// What filled the turns: Claude, tools, permission waits.
+    pub anatomy: Anatomy,
+    pub context: ContextHealth,
+    pub permissions: Permissions,
+    /// None until Claude Code has sent OpenTelemetry data at all.
+    pub telemetry: Option<Telemetry>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -60,6 +84,23 @@ pub struct Bucket {
     pub lines_removed: i64,
     pub cpu_secs: f64,
     pub peak_mem_bytes: u64,
+    /// Finished turns started in the bucket, split by what filled them.
+    pub turns: u32,
+    pub turn_claude_ms: i64,
+    pub turn_tools_ms: i64,
+    pub turn_permission_ms: i64,
+    pub compactions: u32,
+    pub compactions_auto: u32,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
+    pub api_requests: u32,
+    pub api_errors: u32,
+    pub commits: u32,
+    pub pull_requests: u32,
+    pub active_user_secs: f64,
+    pub active_cli_secs: f64,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize)]
@@ -75,11 +116,56 @@ pub struct ModelCost {
     pub sessions: usize,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct ProjectUse {
     pub cwd: String,
+    pub sessions: u32,
+    pub working_ms: i64,
+    /// Waits count for their first `parallel::WAIT_CAP_MS`, as in `parallel`.
+    pub permission_ms: i64,
+    pub your_turn_ms: i64,
+    pub prompts: u32,
+    pub cost_usd: f64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub tools: u32,
+    pub tool_failures: u32,
+    pub compactions: u32,
+    pub tokens: u64,
     pub cpu_secs: f64,
     pub peak_mem_bytes: u64,
+}
+
+type Projects = BTreeMap<String, ProjectUse>;
+
+fn project<'a>(projects: &'a mut Projects, cwd: &str) -> &'a mut ProjectUse {
+    projects
+        .entry(cwd.to_owned())
+        .or_insert_with(|| ProjectUse {
+            cwd: cwd.to_owned(),
+            ..ProjectUse::default()
+        })
+}
+
+/// One recorded event of a session.
+pub(crate) struct Ev {
+    pub ts: i64,
+    pub kind: String,
+    pub data: Value,
+}
+
+/// A session's events in the scope, oldest first.
+pub(crate) struct SessionEvents {
+    pub id: String,
+    pub cwd: String,
+    pub label: String,
+    pub events: Vec<Ev>,
+}
+
+/// Percentile of sorted values, nearest rank.
+fn percentile(sorted: &[i64], pct: usize) -> Option<i64> {
+    let last = sorted.len().checked_sub(1)?;
+    sorted.get((sorted.len() * pct / 100).min(last)).copied()
 }
 
 /// Local calendar math for a fixed offset (`tz_min` minutes east of UTC).
@@ -115,11 +201,15 @@ impl Clock {
     }
 }
 
+/// Everything the analytics view shows for `scope`. `limits` is the live
+/// rate-limit reading; `workspaces` names the shares of the week's usage.
 pub fn analytics(
     conn: &Connection,
     scope: &Scope,
     tz_min: i64,
     live: &[Session],
+    limits: Option<&RateLimits>,
+    workspaces: &Workspaces,
 ) -> Result<Analytics> {
     let bucket_ms = if scope.until - scope.since <= HOURLY_UP_TO_MS {
         HOUR_MS
@@ -142,26 +232,20 @@ pub fn analytics(
         })
         .collect();
     clock.count = buckets.len();
-    let mut out = Analytics {
-        since: scope.since,
-        until: scope.until,
-        now: scope.now,
-        bucket_ms,
-        buckets: Vec::new(),
-        heatmap: [[0; 24]; 7],
-        bounds_ms: BOUNDS_MS,
-        turns: Histogram::default(),
-        responses: Histogram::default(),
-        models: Vec::new(),
-        projects: Vec::new(),
-        memory: Vec::new(),
-        sessions: 0,
-    };
+    let mut projects = Projects::new();
 
     let lanes = lanes(conn, scope, live)?;
-    out.sessions = lanes.len();
     for lane in &lanes {
+        let project = project(&mut projects, &lane.cwd);
+        project.sessions += 1;
         for &(from, to, activity) in &lane.segments {
+            let waited = (to - from).min(parallel::WAIT_CAP_MS);
+            match activity {
+                Activity::Working => project.working_ms += to - from,
+                Activity::Permission => project.permission_ms += waited,
+                Activity::YourTurn => project.your_turn_ms += waited,
+                Activity::Idle | Activity::Gone => {}
+            }
             split_buckets(&clock, from, to, |i, ms| {
                 let bucket = &mut buckets[i];
                 match activity {
@@ -174,6 +258,7 @@ pub fn analytics(
         }
     }
 
+    let mut heatmap = [[0; 24]; 7];
     let mut turn_lengths = Vec::new();
     let mut open: HashMap<String, i64> = HashMap::new();
     let mut stmt = conn.prepare_cached(&format!(
@@ -197,18 +282,120 @@ pub fn analytics(
         if kind == "prompt" {
             buckets[clock.index(ts)].prompts += 1;
             let (weekday, hour) = clock.slot(ts);
-            out.heatmap[weekday][hour] += 1;
+            heatmap[weekday][hour] += 1;
             open.insert(session, ts);
         } else if let Some(started) = open.remove(&session) {
             turn_lengths.push(ts - started);
         }
     }
-    out.turns = histogram(turn_lengths);
-    out.responses = histogram(response_times(conn, scope)?);
 
-    sample_deltas(conn, scope, &clock, &mut buckets, &mut out)?;
-    resources(conn, scope, &clock, &mut buckets, &mut out)?;
-    out.buckets = buckets;
+    let events = session_events(conn, scope, live)?;
+    for session in &events {
+        let project = project(&mut projects, &session.cwd);
+        for ev in &session.events {
+            match ev.kind.as_str() {
+                "prompt" => project.prompts += 1,
+                "compact" => project.compactions += 1,
+                "tool" => {
+                    project.tools += 1;
+                    if ev.data["ok"] == false {
+                        project.tool_failures += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let anatomy = turns::anatomy(&events, &clock, &mut buckets);
+    let context = context::context(conn, scope, &events, &clock, &mut buckets)?;
+    let telemetry = telemetry::telemetry(conn, scope, &clock, &mut buckets, &mut projects)?;
+    let permissions = permissions::permissions(&events);
+    let models = sample_deltas(conn, scope, &clock, &mut buckets, &mut projects)?;
+    let memory = resources(conn, scope, &clock, &mut buckets, &mut projects)?;
+
+    let mut projects: Vec<ProjectUse> = projects.into_values().collect();
+    projects.sort_by(|a, b| {
+        (b.working_ms + b.permission_ms + b.your_turn_ms)
+            .cmp(&(a.working_ms + a.permission_ms + a.your_turn_ms))
+            .then_with(|| b.cost_usd.total_cmp(&a.cost_usd))
+    });
+    Ok(Analytics {
+        since: scope.since,
+        until: scope.until,
+        now: scope.now,
+        bucket_ms,
+        buckets,
+        heatmap,
+        bounds_ms: BOUNDS_MS,
+        turns: histogram(turn_lengths),
+        responses: histogram(response_times(conn, scope)?),
+        models,
+        projects,
+        memory,
+        sessions: lanes.len(),
+        parallel: parallel::parallel(&lanes, scope.since, scope.until),
+        limits: limits::limits(conn, scope, limits, workspaces)?,
+        anatomy,
+        context,
+        permissions,
+        telemetry,
+    })
+}
+
+/// The events the sections read, grouped by session; labels prefer the
+/// live title.
+fn session_events(
+    conn: &Connection,
+    scope: &Scope,
+    live: &[Session],
+) -> Result<Vec<SessionEvents>> {
+    let titles: HashMap<&str, &str> = live
+        .iter()
+        .filter_map(|s| Some((s.id.as_str(), s.title.as_deref().or(s.name.as_deref())?)))
+        .collect();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT e.session, coalesce(x.cwd, '?'), coalesce(x.title, x.name), e.ts, e.kind, e.data
+            FROM events e LEFT JOIN sessions x ON x.id = e.session
+            WHERE e.ts >= :since AND e.ts < :until AND {IN_SCOPE}
+                AND e.kind IN ('prompt', 'reply', 'error', 'tool', 'permission', 'activity',
+                    'compact', 'denied')
+            ORDER BY e.session, e.ts, e.rowid"
+    ))?;
+    let rows = stmt.query_map(
+        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+    let mut out: Vec<SessionEvents> = Vec::new();
+    for row in rows {
+        let (id, cwd, title, ts, kind, data) = row?;
+        let ev = Ev {
+            ts,
+            kind,
+            data: serde_json::from_str(&data).unwrap_or(Value::Null),
+        };
+        match out.last_mut() {
+            Some(last) if last.id == id => last.events.push(ev),
+            _ => out.push(SessionEvents {
+                label: titles
+                    .get(id.as_str())
+                    .map(|t| (*t).to_owned())
+                    .or(title)
+                    .unwrap_or_else(|| id.chars().take(8).collect()),
+                id,
+                cwd,
+                events: vec![ev],
+            }),
+        }
+    }
     Ok(out)
 }
 
@@ -277,11 +464,12 @@ fn sample_deltas(
     scope: &Scope,
     clock: &Clock,
     buckets: &mut [Bucket],
-    out: &mut Analytics,
-) -> Result<()> {
+    projects: &mut Projects,
+) -> Result<Vec<ModelCost>> {
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT s.session, s.ts, s.cost_usd, s.lines_added, s.lines_removed,
-                coalesce(s.model, 'unknown'), coalesce(x.started_at, 0) >= :since
+                coalesce(s.model, 'unknown'), coalesce(x.started_at, 0) >= :since,
+                coalesce(x.cwd, '?')
             FROM samples s LEFT JOIN sessions x ON x.id = s.session
             WHERE s.ts >= :since AND s.ts < :until AND {IN_SCOPE}
             ORDER BY s.session, s.ts"
@@ -296,12 +484,13 @@ fn sample_deltas(
             r.get::<_, Option<i64>>(4)?,
             r.get::<_, String>(5)?,
             r.get::<_, bool>(6)?,
+            r.get::<_, String>(7)?,
         ))
     })?;
     let mut prev: Option<(String, Totals)> = None;
     let mut models: BTreeMap<String, (f64, HashSet<String>)> = BTreeMap::new();
     for row in rows {
-        let (session, ts, cost, added, removed, model, started_in_range) = row?;
+        let (session, ts, cost, added, removed, model, started_in_range, cwd) = row?;
         let now = Totals {
             cost,
             added: added.map(|n| n as f64),
@@ -319,9 +508,15 @@ fn sample_deltas(
         };
         let bucket = &mut buckets[clock.index(ts)];
         let cost_delta = increase(now.cost, then.cost);
+        let added_delta = increase(now.added, then.added) as i64;
+        let removed_delta = increase(now.removed, then.removed) as i64;
         bucket.cost_usd += cost_delta;
-        bucket.lines_added += increase(now.added, then.added) as i64;
-        bucket.lines_removed += increase(now.removed, then.removed) as i64;
+        bucket.lines_added += added_delta;
+        bucket.lines_removed += removed_delta;
+        let project = project(projects, &cwd);
+        project.cost_usd += cost_delta;
+        project.lines_added += added_delta;
+        project.lines_removed += removed_delta;
         let entry = models.entry(model).or_default();
         entry.0 += cost_delta;
         entry.1.insert(session.clone());
@@ -334,7 +529,7 @@ fn sample_deltas(
             },
         ));
     }
-    out.models = models
+    let mut models: Vec<ModelCost> = models
         .into_iter()
         .map(|(model, (cost_usd, sessions))| ModelCost {
             model,
@@ -342,8 +537,8 @@ fn sample_deltas(
             sessions: sessions.len(),
         })
         .collect();
-    out.models.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd));
-    Ok(())
+    models.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd));
+    Ok(models)
 }
 
 /// Statusline running totals of one session.
@@ -361,13 +556,14 @@ fn increase(now: Option<f64>, then: Option<f64>) -> f64 {
     }
 }
 
+/// CPU and memory per bucket and project; returns memory over time.
 fn resources(
     conn: &Connection,
     scope: &Scope,
     clock: &Clock,
     buckets: &mut [Bucket],
-    out: &mut Analytics,
-) -> Result<()> {
+    projects: &mut Projects,
+) -> Result<Vec<(i64, u64)>> {
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT p.ts, p.cpu_pct, p.mem_bytes, coalesce(x.cwd, '?')
             FROM proc_samples p LEFT JOIN sessions x ON x.id = p.session
@@ -383,16 +579,15 @@ fn resources(
         ))
     })?;
     let mut per_minute: BTreeMap<i64, u64> = BTreeMap::new();
-    let mut projects: BTreeMap<String, (f64, u64)> = BTreeMap::new();
     for row in rows {
         let (ts, cpu_pct, rss, cwd) = row?;
         let rss = u64::try_from(rss).unwrap_or(0);
         let cpu_secs = cpu_pct / 100.0 * (PROC_SAMPLE_MS / 1000) as f64;
         buckets[clock.index(ts)].cpu_secs += cpu_secs;
         *per_minute.entry(ts / MINUTE_MS).or_default() += rss;
-        let project = projects.entry(cwd).or_default();
-        project.0 += cpu_secs;
-        project.1 = project.1.max(rss);
+        let project = project(projects, &cwd);
+        project.cpu_secs += cpu_secs;
+        project.peak_mem_bytes = project.peak_mem_bytes.max(rss);
     }
     for (&minute, &rss) in &per_minute {
         let bucket = &mut buckets[clock.index(minute * MINUTE_MS)];
@@ -407,21 +602,10 @@ fn resources(
         entry.0 += rss;
         entry.1 += 1;
     }
-    out.memory = buckets
+    Ok(buckets
         .into_iter()
         .map(|(ts, (sum, n))| (ts, sum / n.max(1)))
-        .collect();
-    out.projects = projects
-        .into_iter()
-        .map(|(cwd, (cpu_secs, peak_mem_bytes))| ProjectUse {
-            cwd,
-            cpu_secs,
-            peak_mem_bytes,
-        })
-        .collect();
-    out.projects
-        .sort_by(|a, b| b.cpu_secs.total_cmp(&a.cpu_secs));
-    Ok(())
+        .collect())
 }
 
 #[cfg(test)]
@@ -492,11 +676,19 @@ mod tests {
             now: t0 + 4 * DAY_MS,
             dir: dir.map(str::to_owned),
         };
-        let all = analytics(&conn, &scope(None), 0, &[]).unwrap();
+        let all = analytics(&conn, &scope(None), 0, &[], None, &Workspaces::default()).unwrap();
         assert_eq!((all.bucket_ms, all.buckets.len()), (DAY_MS, 4));
         let prompts: Vec<u32> = all.buckets.iter().map(|b| b.prompts).collect();
         assert_eq!(prompts, [2, 0, 0, 1]);
-        let one = analytics(&conn, &scope(Some("/ws/one")), 0, &[]).unwrap();
+        let one = analytics(
+            &conn,
+            &scope(Some("/ws/one")),
+            0,
+            &[],
+            None,
+            &Workspaces::default(),
+        )
+        .unwrap();
         let prompts: Vec<u32> = one.buckets.iter().map(|b| b.prompts).collect();
         assert_eq!(prompts, [1, 0, 0, 1]);
     }
@@ -565,7 +757,7 @@ mod tests {
             now: t0 + 300_000,
             dir: None,
         };
-        let a = analytics(&conn, &scope, 0, &[]).unwrap();
+        let a = analytics(&conn, &scope, 0, &[], None, &Workspaces::default()).unwrap();
         assert_eq!((a.bucket_ms, a.buckets.len()), (HOUR_MS, 1));
         let day = &a.buckets[0];
         assert_eq!(day.prompts, 2);

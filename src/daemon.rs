@@ -19,7 +19,7 @@ use crate::{
     api::{http, unix},
     config::Config,
     hub::{Cmd, Hub, Input},
-    niri, paths, procs,
+    niri, otlp, paths, procs,
     state::State,
     store::Store,
     util::now_ms,
@@ -74,6 +74,17 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
             token.clone(),
             workspaces.clone(),
         ));
+    }
+
+    for addr in &cfg.telemetry.listen {
+        if !addr.ip().is_loopback() {
+            bail!("telemetry.listen takes loopback addresses only (it has no token): {addr}");
+        }
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding telemetry {addr}"))?;
+        info!("telemetry listening on {addr}");
+        tokio::spawn(otlp::serve(listener, store.clone()));
     }
 
     tokio::spawn(ingest_loop(ingest, hub.sender()));

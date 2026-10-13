@@ -23,6 +23,9 @@
   --seq-4: #3987e5;
   --seq-5: #256abf;
   --seq-6: #184f95;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
   --radius: 10px;
@@ -51,6 +54,9 @@
     --seq-4: #5598e7;
     --seq-5: #86b6ef;
     --seq-6: #b7d3f6;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
   }
 }
 
@@ -76,6 +82,9 @@
   --seq-4: #5598e7;
   --seq-5: #86b6ef;
   --seq-6: #b7d3f6;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
 }
 
 * {
@@ -411,6 +420,19 @@ main {
 
 [data-activity="gone"] {
   --state-color: transparent;
+}
+
+[data-activity="tools"],
+[data-activity="input"] {
+  --state-color: var(--series-4);
+}
+
+[data-activity="cache_write"] {
+  --state-color: var(--series-5);
+}
+
+[data-activity="output"] {
+  --state-color: var(--series-6);
 }
 
 [data-activity="finished"] {
@@ -2051,4 +2073,148 @@ dl.ask-preview {
   .range-trigger {
     flex: 1;
   }
+}
+
+/* --- analytics sections --- */
+
+.section-tabs {
+  max-width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.section-tabs button {
+  white-space: nowrap;
+}
+
+.section-note {
+  margin: 12px 2px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.chart svg .line[data-activity] {
+  stroke: var(--state-color);
+}
+
+.chart svg .area[data-activity] {
+  fill: var(--state-color);
+}
+
+.chart svg .end-dot[data-activity] {
+  fill: var(--state-color);
+}
+
+.chart svg .projection {
+  stroke-width: 1.5;
+  stroke-dasharray: 6 5;
+}
+
+.chart svg .limit-line {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-table th,
+.data-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--grid);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.data-table thead th {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.data-table thead th:first-child,
+.data-table tbody th {
+  text-align: left;
+}
+
+.data-table tbody th {
+  position: sticky;
+  left: 0;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--surface-1);
+  font-weight: 500;
+}
+
+.data-table thead button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.data-table th[aria-sort="descending"] button::after {
+  content: " ↓";
+}
+
+.data-table th[aria-sort="ascending"] button::after {
+  content: " ↑";
+}
+
+.call-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.call-list li {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--grid);
+}
+
+.call-time {
+  min-width: 6ch;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.call-what {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.call-what code {
+  overflow: hidden;
+  font: 12px var(--mono);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.call-what .muted {
+  font-size: 12px;
+}
+
+.link-btn {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
 }

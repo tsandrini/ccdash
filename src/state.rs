@@ -113,6 +113,13 @@ pub enum StoreMsg {
         started_at: i64,
         ended_at: Option<i64>,
     },
+    /// One OpenTelemetry metric point or event Claude Code exported.
+    Telemetry {
+        ts: i64,
+        session: String,
+        name: &'static str,
+        data: Value,
+    },
 }
 
 /// What an input changed; the hub turns this into broadcasts and writes.
@@ -498,6 +505,17 @@ impl State {
                 }
             }
             "PermissionDenied" => {
+                record(
+                    store,
+                    ts,
+                    id,
+                    "denied",
+                    json!({
+                        "tool": tool_name,
+                        "summary": tool_summary(tool_name, tool_input, &s.cwd),
+                        "reason": str_of(p, "reason"),
+                    }),
+                );
                 if agent_id.is_none() {
                     s.tool = None;
                 }

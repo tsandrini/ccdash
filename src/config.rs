@@ -17,6 +17,7 @@ pub struct Config {
     pub workspaces: Workspaces,
     pub attach: Attach,
     pub store: Store,
+    pub telemetry: Telemetry,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +64,14 @@ pub struct Procs {
 pub struct Attach {
     /// Opens a background session; `{id}` is replaced with its short id.
     pub command: Vec<String>,
+}
+
+/// OTLP/HTTP (JSON) receiver for Claude Code's OpenTelemetry export. It
+/// takes no token, so only loopback addresses are accepted; empty is off.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Telemetry {
+    pub listen: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

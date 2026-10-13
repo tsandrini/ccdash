@@ -158,6 +158,23 @@ in
         };
       };
 
+      telemetry = {
+        enable = mkEnableOption ''
+          Claude Code's OpenTelemetry export to ccdash, for tokens, cache
+          hits, API latency, commits, pull requests and edit decisions in
+          the analytics view. Sets the `OTEL_*` variables in
+          {option}`programs.claude-code.settings.env` and a loopback-only
+          receiver in the daemon; nothing leaves the machine, and prompt
+          text stays redacted
+        '';
+
+        port = mkOption {
+          type = types.port;
+          default = 7839;
+          description = "Loopback port of the OTLP/HTTP receiver.";
+        };
+      };
+
       statusLine = {
         enable = mkEnableOption ''
           the statusline wrapper that feeds model, context, cost and
@@ -220,6 +237,22 @@ in
       ];
       home.packages = [ (hiPrio claudeWrapper) ];
     })
+    (mkIf cfg.claudeCode.telemetry.enable (
+      let
+        endpoint = "127.0.0.1:${toString cfg.claudeCode.telemetry.port}";
+      in
+      {
+        services.ccdash.settings.telemetry.listen = [ endpoint ];
+        programs.claude-code.settings.env = {
+          CLAUDE_CODE_ENABLE_TELEMETRY = "1";
+          OTEL_METRICS_EXPORTER = "otlp";
+          OTEL_LOGS_EXPORTER = "otlp";
+          OTEL_EXPORTER_OTLP_PROTOCOL = "http/json";
+          OTEL_EXPORTER_OTLP_ENDPOINT = "http://${endpoint}";
+          OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE = "delta";
+        };
+      }
+    ))
     (mkIf cfg.dms.enable {
       xdg.configFile."DankMaterialShell/plugins/ccdash".source = "${cfg.package}/share/ccdash/dms-plugin";
     })
