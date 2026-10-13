@@ -125,9 +125,12 @@ programs.ccdash.channel.allow = true;
 
 Without the allowlist entry, `claudeCode.channel.devFlag = true` loads the
 channel with `--dangerously-load-development-channels` instead, and Claude
-Code then asks for confirmation at every launch. Sessions started before
-this (or without the wrapper) show how to restart them. Team and Enterprise
-accounts also need an admin to enable channels for the organization.
+Code then asks for confirmation at every launch. Claude Code's startup
+notice still lists `plugin:ccdash@inline · plugin not installed`: it only
+counts plugins installed from a marketplace, and the channel works anyway.
+Sessions started before this (or without the wrapper) show how to restart
+them. Team and Enterprise accounts also need an admin to enable channels for
+the organization.
 
 Anyone holding the token can now prompt your sessions and approve their
 tool calls, so treat it like an SSH key: keep the port on your LAN or VPN,

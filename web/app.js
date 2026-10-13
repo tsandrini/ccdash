@@ -2125,6 +2125,16 @@ function zoomOut(range, t = now()) {
   return { kind: "absolute", from: end - span, to: end };
 }
 
+/** From `from` to now: "last N days" when it starts at a local midnight. */
+function untilNow(from, t = now()) {
+  const start = new Date(from);
+  const today = new Date(t);
+  today.setHours(0, 0, 0, 0);
+  if (start.getHours() || start.getMinutes())
+    return { kind: "absolute", from, to: t };
+  return { kind: "days", days: Math.round((today - start) / 86_400_000) + 1 };
+}
+
 const pad2 = (n) => String(n).padStart(2, "0");
 
 /** A moment as `<input type="datetime-local">` text, local time. */
@@ -2275,7 +2285,11 @@ function openRangeForm(anchor, value, quick, onapply) {
       error.hidden = false;
       return;
     }
-    apply({ kind: "absolute", from, to });
+    apply(
+      to >= Math.floor(now() / MINUTE) * MINUTE
+        ? untilNow(from)
+        : { kind: "absolute", from, to },
+    );
   };
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const absolute = h(
@@ -2329,7 +2343,10 @@ function openRangeForm(anchor, value, quick, onapply) {
       touch ? [presets, absolute] : [absolute, presets],
     ),
   );
-  dialog.onclick = (event) => event.target === dialog && close();
+  // NOTE: a handler property returning false cancels the click (and Apply)
+  dialog.onclick = (event) => {
+    if (event.target === dialog) close();
+  };
   dialog.showModal();
   if (!touch) {
     const box = anchor.getBoundingClientRect();
@@ -2452,6 +2469,8 @@ const HISTORY_QUICK = [
 const ANALYTICS_QUICK = [
   { kind: "days", days: 1 },
   { kind: "relative", minutes: 1440 },
+  { kind: "days", days: 2 },
+  { kind: "days", days: 3 },
   { kind: "days", days: 7 },
   { kind: "days", days: 14 },
   { kind: "days", days: 30 },
