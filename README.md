@@ -14,6 +14,7 @@ on the phone as a web page.
 Claude Code hooks ──► ccdash emit ─┐
 statusline ─────────► ccdash tee ──┼──► ccdash daemon ──┬──► web UI (LAN / VPN)
 claude agents --json ──────────────┤    (per host)      └──► DMS plugin
+claude -p /usage ──────────────────┤
 niri window events ────────────────┘
 ```
 
@@ -28,8 +29,16 @@ niri window events ────────────────┘
 
 Only public Claude Code interfaces are used (`claude agents --json`, hooks,
 the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
-[OpenTelemetry](https://code.claude.com/docs/en/monitoring-usage)); no
-internal state files.
+[OpenTelemetry](https://code.claude.com/docs/en/monitoring-usage), the
+`/usage` report); no internal state files.
+
+The statusline carries only the 5-hour and 7-day limits. For per-model
+weekly limits such as Fable's, the daemon runs `claude -p /usage` every 10
+minutes (`usage.interval_secs`) in safe mode: no model request, no hooks,
+plugins or memory, nothing saved; about a second of CPU. It reads the
+structured report (`SDKUsageReport` in the
+[Agent SDK reference](https://code.claude.com/docs/en/agent-sdk/typescript),
+experimental). `usage.command = []` turns it off.
 
 ## Usage
 
@@ -93,9 +102,10 @@ The web UI lives on the HTTP port:
     late.
   - _Parallel:_ how many sessions worked or waited on you at once, and how
     long everything waited on you with nothing working.
-  - _Limits:_ the 5-hour and 7-day limits with their pace and where they
-    end up at the reset, the peak of each 5-hour window, and each
-    workspace's share of the week.
+  - _Limits:_ the 5-hour and 7-day limits, and per-model weekly limits
+    such as Fable's, with their pace and where they end up at the reset,
+    the peak of each 5-hour window, and each workspace's share of the
+    week.
   - _Projects:_ a sortable table of time, prompts, cost, lines, tool calls,
     compactions and CPU per directory.
   - _Turns:_ what fills a turn (Claude, tools, permission prompts), tools and
@@ -224,6 +234,7 @@ The database keeps 30 days (`store.retention_days`) of:
   cost, rate limits, model, lines changed)
 - `proc_samples`: once a minute per session (CPU, memory, process count)
 - `sessions`: id, directory, title, kind, start and end
+- `limit_samples`: per-model weekly limits from each `/usage` poll
 - `telemetry` (with telemetry on): API requests (model, tokens, cost,
   latency), API errors, tool approval decisions, commits, pull requests,
   edit decisions and active time

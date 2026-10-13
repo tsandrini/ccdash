@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use crate::{
     model::{
         Activity, Kind, Limit, PARKED_AFTER_MS, PermissionAsk, ProcInfo, RateLimits, Resources,
-        Session, Snapshot, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
+        ScopedLimit, Session, Snapshot, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
+        WindowRef,
     },
     util::{pid_alive, tail, truncate},
     wire::{Envelope, Source},
@@ -113,6 +114,8 @@ pub enum StoreMsg {
         started_at: i64,
         ended_at: Option<i64>,
     },
+    /// A scoped limit read from `/usage`.
+    Limit { ts: i64, limit: ScopedLimit },
     /// One OpenTelemetry metric point or event Claude Code exported.
     Telemetry {
         ts: i64,
@@ -714,11 +717,11 @@ impl State {
         let (context_pct, cost_usd, model) = (s.context_pct, s.cost_usd, s.model.clone());
         let (lines_added, lines_removed) = (s.lines_added, s.lines_removed);
 
-        if let Some(limits) = parse_rate_limits(p, ts) {
-            let changed = self.rate_limits.as_ref().is_none_or(|old| {
-                old.five_hour != limits.five_hour || old.seven_day != limits.seven_day
-            });
-            fx.rate_limits |= changed;
+        if let Some(mut limits) = parse_rate_limits(p, ts) {
+            let old = self.rate_limits.take().unwrap_or_default();
+            fx.rate_limits |=
+                old.five_hour != limits.five_hour || old.seven_day != limits.seven_day;
+            limits.scoped = old.scoped;
             self.rate_limits = Some(limits);
         }
 
@@ -1017,6 +1020,22 @@ impl State {
             }
         }
         self.match_titles(fx);
+    }
+
+    /// Takes the scoped limits (Fable's, say) a `/usage` poll read.
+    pub fn usage(&mut self, scoped: Vec<ScopedLimit>, now: i64, fx: &mut Effects) {
+        let limits = self.rate_limits.get_or_insert_with(RateLimits::default);
+        let same = |a: &ScopedLimit, b: &ScopedLimit| {
+            (&a.label, a.used_pct, a.resets_at, &a.severity)
+                == (&b.label, b.used_pct, b.resets_at, &b.severity)
+        };
+        fx.rate_limits |= limits.scoped.len() != scoped.len()
+            || limits.scoped.iter().zip(&scoped).any(|(a, b)| !same(a, b));
+        fx.store.extend(scoped.iter().map(|limit| StoreMsg::Limit {
+            ts: now,
+            limit: limit.clone(),
+        }));
+        limits.scoped = scoped;
     }
 
     /// Parks long-waiting sessions, marks sessions whose process died as gone
@@ -1517,6 +1536,7 @@ fn parse_rate_limits(p: &Value, ts: i64) -> Option<RateLimits> {
         five_hour: limit("five_hour"),
         seven_day: limit("seven_day"),
         updated_at: ts,
+        scoped: Vec::new(),
     })
 }
 
@@ -2003,6 +2023,38 @@ mod tests {
         st.tick(2 + GONE_RETENTION_MS + 1, &mut fx);
         assert_eq!(fx.removed, vec![SID]);
         assert!(st.session(SID).is_none());
+    }
+
+    #[test]
+    fn scoped_limits_survive_statusline_updates() {
+        let mut st = state();
+        let fable = ScopedLimit {
+            label: "Fable".into(),
+            used_pct: 91.0,
+            resets_at: 1_792_026_000,
+            severity: "critical".into(),
+            read_at: 500,
+        };
+        let mut fx = Effects::default();
+        st.usage(vec![fable.clone()], 500, &mut fx);
+        assert!(fx.rate_limits);
+        assert!(matches!(&fx.store[..], [StoreMsg::Limit { ts: 500, .. }]));
+
+        statusline(&mut st, 1_000, "Fix the parser");
+        let limits = st.rate_limits().unwrap();
+        assert_eq!((limits.scoped.len(), limits.updated_at), (1, 1_000));
+
+        // The same reading again changes nothing to publish.
+        let mut fx = Effects::default();
+        st.usage(
+            vec![ScopedLimit {
+                read_at: 900,
+                ..fable
+            }],
+            900,
+            &mut fx,
+        );
+        assert!(!fx.rate_limits);
     }
 
     #[test]

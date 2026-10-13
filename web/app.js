@@ -489,6 +489,9 @@ function renderSessions() {
     ),
     limitTile("5-hour limit", state.rateLimits?.five_hour),
     limitTile("7-day limit", state.rateLimits?.seven_day),
+    (state.rateLimits?.scoped ?? []).map((l) =>
+      limitTile(`${l.label} limit`, l),
+    ),
   );
 
   const groups = [];
@@ -4468,27 +4471,45 @@ const fmtWhen = (ts) => {
 
 function paceText(f) {
   const lately = f.recent_ms >= 86_400_000 ? "24 hours" : "hour";
-  if (f.pace_recent === null) return "not enough readings yet";
+  if (f.pace_recent === null) {
+    return f.pace_avg === null
+      ? "not enough readings yet"
+      : `${f.pace_avg.toFixed(1)}%/h, the average so far`;
+  }
   const avg =
     f.pace_avg === null ? "" : `; ${f.pace_avg.toFixed(1)}%/h on average`;
   return `${f.pace_recent.toFixed(1)}%/h over the last ${lately}${avg}`;
+}
+
+/** Where a limit is heading: the recent pace, else the average so far. */
+function outlook(f) {
+  if (f.pace_recent !== null) {
+    return { at_reset: f.at_reset_recent, full_at: f.full_at };
+  }
+  const pace = f.pace_avg;
+  const full =
+    pace > 0 && f.used_pct < 100 && f.at_reset_avg > 100
+      ? now() + ((100 - f.used_pct) / pace) * 3_600_000
+      : null;
+  return { at_reset: f.at_reset_avg, full_at: full };
 }
 
 function forecastTiles(name, f) {
   if (!f) {
     return [statTile(`${name} limit`, "–", "no live reading yet")];
   }
+  const o = outlook(f);
   const ahead =
-    f.full_at !== null
+    o.full_at !== null
       ? statTile(
           "By the reset",
           "full",
-          `at ${fmtWhen(f.full_at)}; ${paceText(f)}`,
+          `at ${fmtWhen(o.full_at)}; ${paceText(f)}`,
         )
       : statTile(
           "By the reset",
-          f.at_reset_recent === null ? "–" : pct(f.at_reset_recent),
-          `at ${paceText(f)}`,
+          o.at_reset === null ? "–" : pct(o.at_reset),
+          o.at_reset === null ? paceText(f) : `at ${paceText(f)}`,
         );
   return [
     statTile(
@@ -4516,6 +4537,8 @@ function limitsSection(data, width, half) {
       ),
     );
   }
+  for (const sc of l.scoped)
+    tiles.push(...forecastTiles(sc.label, sc.forecast));
   tiles.push(...forecastTiles("5-hour", l.five_hour));
   const hot = l.windows.filter((w) => w.peak >= 90).length;
   tiles.push(
@@ -4526,67 +4549,24 @@ function limitsSection(data, width, half) {
     ),
   );
 
-  const weekFigure = chartFigure(
+  const weekFigure = weekChart(
     "This week's limit",
-    week
-      ? "7-day limit used, with the recent pace carried on to the reset"
-      : "7-day limit used over the last 7 days",
+    "7-day",
+    week,
+    l.week,
+    data,
+    width,
   );
-  const since = week
-    ? week.resets_at - week.window_ms
-    : data.now - 7 * 86_400_000;
-  const until = week ? week.resets_at : data.now;
-  if (l.week.length) {
-    multiLineChart(weekFigure, {
-      series: [{ label: "7-day", role: "working", points: l.week, area: true }],
-      since,
-      until,
+  const scoped = l.scoped.map((sc) =>
+    weekChart(
+      `${sc.label} this week`,
+      sc.label,
+      sc.forecast,
+      sc.week,
+      data,
       width,
-      max: 100,
-      fmt: (v) => `${v}%`,
-      extra: (svg, x, y) => {
-        svg.append(
-          s("line", {
-            class: "limit-line",
-            x1: x(since),
-            x2: x(until),
-            y1: y(100),
-            y2: y(100),
-          }),
-        );
-        if (!week || week.pace_recent === null) return;
-        const end = week.full_at ?? week.resets_at;
-        const value = week.full_at ? 100 : week.at_reset_recent;
-        svg.append(
-          s("path", {
-            class: "line projection",
-            "data-activity": "working",
-            d: `M${x(data.now).toFixed(1)},${y(week.used_pct).toFixed(1)}L${x(end).toFixed(1)},${y(value).toFixed(1)}`,
-          }),
-          s("text", {
-            x: x(end) - 4,
-            y: y(value) - 6,
-            "text-anchor": "end",
-            text: week.full_at
-              ? `full ${fmtWhen(end)}`
-              : `${pct(value)} at reset`,
-          }),
-        );
-      },
-      tip: (t) => [pct(valueAt(l.week, t)), fmtStamp(t)],
-    });
-    weekFigure.append(
-      tableView(
-        ["Hour", "7-day limit"],
-        l.week.map(([t, v]) => [fmtStamp(t), pct(v)]),
-      ),
-    );
-  } else {
-    weekFigure.append(
-      h("p", { class: "muted", text: "No statusline readings yet." }),
-    );
-  }
-
+    ),
+  );
   const windows = chartFigure(
     "5-hour windows",
     "Highest reading in each window, in this range",
@@ -4659,11 +4639,73 @@ function limitsSection(data, width, half) {
   return [
     h("div", { class: "tiles" }, tiles),
     weekFigure,
+    scoped,
     h("div", { class: "chart-pair" }, windows, shares),
     note(
-      "Limits are account-wide: the workspace filter doesn't apply, and only the 5-hour windows follow the time range.",
+      `Limits are account-wide: the workspace filter doesn't apply, and only the 5-hour windows follow the time range.${l.scoped.length ? ` ${l.scoped.map((sc) => sc.label).join(" and ")} readings come from /usage every 10 minutes.` : ""}`,
     ),
   ];
+}
+
+/** A weekly limit since its window opened, with the recent pace carried on
+ * to the reset when there is one. */
+function weekChart(title, name, f, points, data, width) {
+  const figure = chartFigure(
+    title,
+    f
+      ? `${name} limit used, with its pace carried on to the reset`
+      : `${name} limit used over the last 7 days`,
+  );
+  if (!points.length) {
+    figure.append(h("p", { class: "muted", text: "No readings yet." }));
+    return figure;
+  }
+  const since = f ? f.resets_at - f.window_ms : data.now - 7 * 86_400_000;
+  const until = f ? f.resets_at : data.now;
+  multiLineChart(figure, {
+    series: [{ label: name, role: "working", points, area: true }],
+    since,
+    until,
+    width,
+    max: 100,
+    fmt: (v) => `${v}%`,
+    extra: (svg, x, y) => {
+      svg.append(
+        s("line", {
+          class: "limit-line",
+          x1: x(since),
+          x2: x(until),
+          y1: y(100),
+          y2: y(100),
+        }),
+      );
+      const o = f && outlook(f);
+      if (!o || o.at_reset === null) return;
+      const end = o.full_at ?? f.resets_at;
+      const value = o.full_at ? 100 : o.at_reset;
+      svg.append(
+        s("path", {
+          class: "line projection",
+          "data-activity": "working",
+          d: `M${x(data.now).toFixed(1)},${y(f.used_pct).toFixed(1)}L${x(end).toFixed(1)},${y(value).toFixed(1)}`,
+        }),
+        s("text", {
+          x: x(end) - 4,
+          y: y(value) - 6,
+          "text-anchor": "end",
+          text: o.full_at ? `full ${fmtWhen(end)}` : `${pct(value)} at reset`,
+        }),
+      );
+    },
+    tip: (t) => [pct(valueAt(points, t)), fmtStamp(t)],
+  });
+  figure.append(
+    tableView(
+      ["Hour", `${name} limit`],
+      points.map(([t, v]) => [fmtStamp(t), pct(v)]),
+    ),
+  );
+  return figure;
 }
 
 // Projects

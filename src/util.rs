@@ -93,9 +93,69 @@ pub fn qr_svg(data: &str) -> Result<String> {
         .build())
 }
 
+/// Milliseconds since the epoch of an RFC 3339 timestamp such as
+/// `2026-10-15T00:59:59.823512+00:00`.
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let num = |range: std::ops::Range<usize>| s.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !matches!(s.get(10..11)?, "T" | "t" | " ") || !(1..=12).contains(&month) {
+        return None;
+    }
+    let rest = &s[19..];
+    let digits = rest
+        .strip_prefix('.')
+        .map_or(0, |r| r.bytes().take_while(u8::is_ascii_digit).count());
+    let millis = match digits {
+        0 => 0,
+        n => format!("{:0<3}", &rest[1..=n.min(3)]).parse::<i64>().ok()?,
+    };
+    let zone = &rest[if digits > 0 { digits + 1 } else { 0 }..];
+    let offset_min = match zone {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match zone.get(..1)? {
+                "+" => 1,
+                "-" => -1,
+                _ => return None,
+            };
+            let h = zone.get(1..3)?.parse::<i64>().ok()?;
+            let m = zone.get(4..6)?.parse::<i64>().ok()?;
+            sign * (h * 60 + m)
+        }
+    };
+    // NOTE: days from civil, http://howardhinnant.github.io/date_algorithms.html
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_min * 60;
+    Some(secs * 1_000 + millis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_timestamps() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339("2026-10-15T00:59:59.823512+00:00"),
+            Some(1_792_025_999_823)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-15T02:59:59+02:00"),
+            Some(1_792_025_999_000)
+        );
+        assert_eq!(
+            parse_rfc3339("2024-02-29T12:00:00.5Z"),
+            Some(1_709_208_000_500)
+        );
+        assert_eq!(parse_rfc3339("yesterday"), None);
+    }
 
     #[test]
     fn tail_respects_char_boundaries() {

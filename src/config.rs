@@ -18,6 +18,7 @@ pub struct Config {
     pub attach: Attach,
     pub store: Store,
     pub telemetry: Telemetry,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +67,17 @@ pub struct Attach {
     pub command: Vec<String>,
 }
 
+/// Polls Claude Code's `/usage` report for the per-model weekly limits the
+/// statusline doesn't carry, such as Fable's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Usage {
+    /// The Claude Code executable and any leading arguments; ccdash adds the
+    /// `-p /usage` ones. Empty turns the poll off.
+    pub command: Vec<String>,
+    pub interval_secs: u64,
+}
+
 /// OTLP/HTTP (JSON) receiver for Claude Code's OpenTelemetry export. It
 /// takes no token, so only loopback addresses are accepted; empty is off.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -95,6 +107,15 @@ impl Default for Agents {
         Self {
             command: ["claude", "agents", "--json"].map(String::from).to_vec(),
             interval_secs: 5,
+        }
+    }
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self {
+            command: vec!["claude".into()],
+            interval_secs: 600,
         }
     }
 }

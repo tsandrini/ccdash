@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::{
     channel::{Behavior, FromChannel, ToChannel},
-    model::{Activity, PermissionAsk, Session, Snapshot, Update},
+    model::{Activity, PermissionAsk, ScopedLimit, Session, Snapshot, Update},
     paths,
     state::{AgentEntry, Effects, NiriEvent, ProcPoll, State},
     store::{self, Store},
@@ -25,6 +25,7 @@ pub enum Input {
     Agents(Vec<AgentEntry>, i64),
     Niri(NiriEvent),
     Procs(Vec<ProcPoll>, i64),
+    Usage(Vec<ScopedLimit>, i64),
     Tick(i64),
 }
 
@@ -279,6 +280,7 @@ async fn run(
             Input::Agents(list, now) => state.agents(&list, now, &mut fx),
             Input::Niri(event) => state.niri(event, &mut fx),
             Input::Procs(polls, now) => state.resources(polls, now, &mut fx),
+            Input::Usage(limits, now) => state.usage(limits, now, &mut fx),
             Input::Tick(now) => state.tick(now, &mut fx),
         }
         flush(

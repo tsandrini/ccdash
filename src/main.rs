@@ -19,6 +19,7 @@ mod paths;
 mod procs;
 mod state;
 mod store;
+mod usage;
 mod util;
 mod waits;
 mod wire;

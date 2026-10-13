@@ -152,11 +152,28 @@ pub struct Limit {
     pub resets_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RateLimits {
     pub five_hour: Option<Limit>,
     pub seven_day: Option<Limit>,
+    /// When the statusline last reported the two above.
     pub updated_at: i64,
+    /// Weekly limits of one model or surface, such as Fable's, from `/usage`.
+    #[serde(default)]
+    pub scoped: Vec<ScopedLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopedLimit {
+    /// The server's label for the model or surface, e.g. `Fable`.
+    pub label: String,
+    pub used_pct: f64,
+    /// Unix seconds; 0 when unknown.
+    pub resets_at: i64,
+    /// The server's rating: `normal`, `warning` or `critical`.
+    pub severity: String,
+    /// When `/usage` was read, in ms.
+    pub read_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

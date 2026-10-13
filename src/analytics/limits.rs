@@ -1,5 +1,6 @@
-//! Where the 5-hour and 7-day limits are heading. Rate limits are
-//! account-wide, so only the 5-hour window peaks follow the selected range.
+//! Where the 5-hour and 7-day limits, and the weekly limits of one model
+//! (Fable's, say), are heading. Rate limits are account-wide, so only the
+//! 5-hour window peaks follow the selected range.
 
 use std::collections::BTreeMap;
 
@@ -33,6 +34,19 @@ pub struct Limits {
     /// API-equivalent cost per workspace since the 7-day window opened: a
     /// stand-in for each workspace's share of the limit.
     pub shares: Vec<Share>,
+    /// Weekly limits of one model or surface, from `/usage`.
+    pub scoped: Vec<ScopedForecast>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ScopedForecast {
+    /// The server's label, e.g. `Fable`.
+    pub label: String,
+    /// The server's rating: `normal`, `warning` or `critical`.
+    pub severity: String,
+    pub forecast: Option<Forecast>,
+    /// Readings since its window opened, hourly peaks.
+    pub week: Vec<(i64, f64)>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -100,16 +114,31 @@ pub fn limits(
             )
         });
     }
-    let week_start = out
-        .seven_day
-        .as_ref()
-        .map_or(now - SEVEN_DAYS_MS, |f| f.resets_at - f.window_ms);
-    let mut week: BTreeMap<i64, f64> = BTreeMap::new();
-    for &(ts, v) in seven.iter().filter(|r| r.0 >= week_start) {
-        let peak = week.entry(ts / HOUR_MS * HOUR_MS).or_insert(v);
-        *peak = peak.max(v);
+    let window_start =
+        |f: Option<&Forecast>| f.map_or(now - SEVEN_DAYS_MS, |f| f.resets_at - f.window_ms);
+    let week_start = window_start(out.seven_day.as_ref());
+    out.week = hourly_peaks(&seven, week_start);
+    for limit in live.map_or(&[][..], |l| &l.scoped) {
+        let readings = scoped_readings(conn, &limit.label, now - SEVEN_DAYS_MS, now)?;
+        // NOTE: scoped rows are weekly ones (`weekly_scoped` in `/usage`)
+        let forecast = forecast(
+            &Limit {
+                used_pct: limit.used_pct,
+                resets_at: limit.resets_at,
+            },
+            limit.read_at,
+            now,
+            SEVEN_DAYS_MS,
+            RECENT_SEVEN_DAY_MS,
+            &readings,
+        );
+        out.scoped.push(ScopedForecast {
+            label: limit.label.clone(),
+            severity: limit.severity.clone(),
+            week: hourly_peaks(&readings, window_start(forecast.as_ref())),
+            forecast,
+        });
     }
-    out.week = week.into_iter().collect();
     let in_range: Vec<(i64, f64)> = readings(conn, scope.since, scope.until)?
         .into_iter()
         .filter_map(|r| Some((r.0, r.1?)))
@@ -117,6 +146,33 @@ pub fn limits(
     out.windows = windows(&in_range);
     out.shares = shares(conn, week_start, now, workspaces)?;
     Ok(out)
+}
+
+/// Highest reading per hour from `from` on.
+fn hourly_peaks(readings: &[(i64, f64)], from: i64) -> Vec<(i64, f64)> {
+    let mut peaks: BTreeMap<i64, f64> = BTreeMap::new();
+    for &(ts, v) in readings.iter().filter(|r| r.0 >= from) {
+        let peak = peaks.entry(ts / HOUR_MS * HOUR_MS).or_insert(v);
+        *peak = peak.max(v);
+    }
+    peaks.into_iter().collect()
+}
+
+/// `(minute, percent)` of one scoped limit, highest per minute.
+fn scoped_readings(
+    conn: &Connection,
+    label: &str,
+    since: i64,
+    until: i64,
+) -> Result<Vec<(i64, f64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts / ?4 * ?4 AS minute, max(used_pct) FROM limit_samples
+            WHERE label = ?1 AND ts >= ?2 AND ts < ?3 GROUP BY minute ORDER BY minute",
+    )?;
+    let rows = stmt.query_map(params![label, since, until, MINUTE_MS], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// `(minute, 5-hour, 7-day)`, highest per minute.
@@ -270,6 +326,51 @@ mod tests {
             resets_at: (now - 1000) / 1000,
         };
         assert!(forecast(&stale, now, now, FIVE_HOURS_MS, HOUR_MS, &[]).is_none());
+    }
+
+    #[test]
+    fn scoped_limits_get_a_forecast_and_a_week() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::store::SCHEMA).unwrap();
+        let now = 1_000 * HOUR_MS;
+        // Opened 2 days ago, resets in 5; 40 % after 2 days, 30 % a day ago.
+        let resets_at = now + 5 * 24 * HOUR_MS;
+        for (ts, pct) in [(now - 24 * HOUR_MS, 30.0), (now, 40.0)] {
+            conn.execute(
+                "INSERT INTO limit_samples VALUES (?1, 'Fable', ?2, ?3)",
+                params![ts, pct, resets_at / 1000],
+            )
+            .unwrap();
+        }
+        let live = RateLimits {
+            scoped: vec![crate::model::ScopedLimit {
+                label: "Fable".into(),
+                used_pct: 40.0,
+                resets_at: resets_at / 1000,
+                severity: "normal".into(),
+                read_at: now,
+            }],
+            ..RateLimits::default()
+        };
+        let scope = Scope {
+            since: now - 24 * HOUR_MS,
+            until: now,
+            now,
+            dir: None,
+        };
+        let l = limits(&conn, &scope, Some(&live), &Workspaces::default()).unwrap();
+        let fable = &l.scoped[0];
+        let f = fable.forecast.as_ref().unwrap();
+        assert_eq!(
+            (f.pace_avg, f.pace_recent),
+            (Some(40.0 / 48.0), Some(10.0 / 24.0))
+        );
+        assert_eq!(f.at_reset_recent, Some(90.0));
+        assert_eq!(
+            fable.week.len(),
+            1,
+            "the reading at `now` is past the range"
+        );
     }
 
     #[test]

@@ -113,7 +113,7 @@ PluginComponent {
             id: popout
 
             headerText: "Claude Code"
-            detailsText: !root.st.connected ? "ccdash is not running" : [root.counts.needs + " need you", root.counts.working + " working", root.counts.agents ? root.counts.agents + " background" : "", root.st.rateLimits?.five_hour ? "5-hour limit " + Math.round(root.st.rateLimits.five_hour.used_pct) + "%" : ""].filter(p => p).join(" · ")
+            detailsText: !root.st.connected ? "ccdash is not running" : [root.counts.needs + " need you", root.counts.working + " working", root.counts.agents ? root.counts.agents + " background" : "", root.st.rateLimits?.five_hour ? "5-hour limit " + Math.round(root.st.rateLimits.five_hour.used_pct) + "%" : "", ...Cc.scopedLimits(root.st.rateLimits)].filter(p => p).join(" · ")
 
             Item {
                 width: parent.width

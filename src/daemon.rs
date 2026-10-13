@@ -22,6 +22,7 @@ use crate::{
     niri, otlp, paths, procs,
     state::State,
     store::Store,
+    usage,
     util::now_ms,
     wire::{self, Envelope},
     workspace::Workspaces,
@@ -94,6 +95,13 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         Duration::from_secs(cfg.agents.interval_secs.max(1)),
         hub.sender(),
     ));
+    if !cfg.usage.command.is_empty() {
+        tokio::spawn(usage::run(
+            cfg.usage.command.clone(),
+            Duration::from_secs(cfg.usage.interval_secs.max(60)),
+            hub.sender(),
+        ));
+    }
     if cfg.niri.enable {
         tokio::spawn(niri::run(hub.sender()));
     }

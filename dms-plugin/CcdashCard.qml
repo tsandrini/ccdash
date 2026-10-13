@@ -51,7 +51,7 @@ DashCardComponent {
 
         StyledText {
             width: parent.width
-            text: [root.counts.working + " working", root.counts.agents ? root.counts.agents + " background" : "", root.limit ? "5-hour " + Math.round(root.limit.used_pct) + "%" : ""].filter(p => p).join(" · ")
+            text: [root.counts.working + " working", root.counts.agents ? root.counts.agents + " background" : "", root.limit ? "5-hour " + Math.round(root.limit.used_pct) + "%" : "", ...Cc.scopedLimits(root.st.rateLimits)].filter(p => p).join(" · ")
             font.pixelSize: Theme.fontSizeSmall
             color: root.mutedColor
             elide: Text.ElideRight

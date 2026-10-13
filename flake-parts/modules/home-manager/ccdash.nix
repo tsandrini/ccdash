@@ -222,6 +222,8 @@ in
         "agents"
         "--json"
       ];
+      # NOTE: the real binary, not the channel wrapper; ccdash adds `-p /usage`
+      services.ccdash.settings.usage.command = mkDefault [ (getExe claudeCode.package) ];
     })
     (mkIf cfg.claudeCode.hooks.enable {
       programs.claude-code.settings.hooks = genAttrs hookEvents (event: [

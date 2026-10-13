@@ -185,6 +185,11 @@ function notifyText(s, kind) {
 }
 
 /** The web UI's state colors (light and dark steps of the same hues). */
+/** "Fable 91%" for each weekly limit of one model, such as Fable's. */
+function scopedLimits(limits) {
+    return ((limits && limits.scoped) || []).map(l => l.label + " " + Math.round(l.used_pct) + "%");
+}
+
 function stateColor(activity, light) {
     const colors = {
         working: light ? "#2a78d6" : "#3987e5",

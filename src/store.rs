@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS telemetry (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS telemetry_ts ON telemetry (ts);
+CREATE TABLE IF NOT EXISTS limit_samples (
+    ts INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    used_pct REAL NOT NULL,
+    resets_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS limit_samples_ts ON limit_samples (ts);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     host TEXT NOT NULL,
@@ -222,6 +229,12 @@ fn write_batch(conn: &mut Connection, host: &str, batch: &[StoreMsg]) -> Result<
                     params![ts, host, session, cpu_pct, *mem_bytes as i64, procs],
                 )?;
             }
+            StoreMsg::Limit { ts, limit } => {
+                tx.execute(
+                    "INSERT INTO limit_samples (ts, label, used_pct, resets_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![ts, limit.label, limit.used_pct, limit.resets_at],
+                )?;
+            }
             StoreMsg::Telemetry {
                 ts,
                 session,
@@ -267,6 +280,7 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
     conn.execute("DELETE FROM samples WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM proc_samples WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM telemetry WHERE ts < ?1", [cutoff])?;
+    conn.execute("DELETE FROM limit_samples WHERE ts < ?1", [cutoff])?;
     conn.execute(
         "DELETE FROM sessions WHERE started_at < ?1
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
