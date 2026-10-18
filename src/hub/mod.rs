@@ -22,7 +22,8 @@ use tracing::info;
 use crate::{
     config::HubConfig,
     hub::core::{Cmd, Hub, Notes},
-    notify::{self, Composer},
+    notify::{self, Composer, Delays},
+    push,
     store::Store,
     util::now_ms,
     workspace::Workspaces,
@@ -47,15 +48,35 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
     let store = Store::open(&cfg.store_path(), cfg.store.retention_days)?;
     let token = Arc::new(http::load_token(&cfg)?);
     let public_url = cfg.public_url();
-    let notes = (!cfg.notify.url.is_empty()).then(|| {
+    let push = cfg
+        .push
+        .enabled
+        .then(|| {
+            push::Keys::load_or_create(&cfg.push_key_file())
+                .map(|keys| push::Push::new(keys, store.clone(), &cfg.push, &public_url))
+        })
+        .transpose()
+        .context("web push")?;
+    let notes = (!cfg.notify.url.is_empty() || push.is_some()).then(|| {
         let web_url = cfg
             .notify
             .web_url
             .clone()
             .unwrap_or_else(|| public_url.clone());
-        info!("notifications to {} link to {web_url}", cfg.notify.url);
         let (tx, rx) = watch::channel(Vec::new());
-        tokio::spawn(notify::run(cfg.notify.clone(), rx));
+        let delays = Delays::from(&cfg.notify);
+        if !cfg.notify.url.is_empty() {
+            info!("notifications to {} link to {web_url}", cfg.notify.url);
+            tokio::spawn(notify::run(
+                delays,
+                rx,
+                notify::Ntfy::new(cfg.notify.clone(), web_url.clone()),
+            ));
+        }
+        if let Some(push) = &push {
+            info!("web push on, linking to {web_url}");
+            tokio::spawn(notify::run(delays, tx.subscribe(), push.clone()));
+        }
         Notes {
             composer: Composer::new(cfg.notify.clone(), web_url, now_ms()),
             tx,
@@ -86,6 +107,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             workspaces.clone(),
             tokens.clone(),
             public_url.clone(),
+            push.clone(),
         ));
     }
     tokio::spawn(ticker(hub.sender()));

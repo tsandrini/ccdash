@@ -1095,6 +1095,32 @@ dl.ask-preview {
   width: min(460px, 100vw - 32px);
 }
 
+.pair-push {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  margin-top: 6px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.pair-push h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.pair-devices {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+.pair-devices .bad {
+  color: var(--critical);
+}
+
 .detail-close {
   position: absolute;
   top: 10px;

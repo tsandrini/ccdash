@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -46,6 +46,7 @@ use crate::{
     knowledge::{self, Card, Filter, NoteKind, NoteOp, Status, Upsert},
     model::{Activity, Snapshot},
     paths,
+    push::{self, Push},
     store::Store,
     util::{self, now_ms},
     workspace::{Scope, Workspaces},
@@ -62,6 +63,8 @@ struct App {
     token: Arc<String>,
     /// Where phones open the UI.
     public_url: Arc<String>,
+    /// Web Push, when it is on.
+    push: Option<Arc<Push>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,6 +76,7 @@ pub async fn serve(
     workspaces: Workspaces,
     tokens: Tokens,
     public_url: String,
+    push: Option<Arc<Push>>,
 ) {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -88,6 +92,12 @@ pub async fn serve(
         .route("/notes", get(notes))
         .route("/notes/{workspace}/{slug}", get(note).put(put_note))
         .route("/notes/{workspace}/{slug}/op", post(note_op))
+        .route("/push", get(push_info))
+        .route(
+            "/push/subscriptions",
+            post(push_subscribe).delete(push_unsubscribe),
+        )
+        .route("/push/test", post(push_test))
         .layer(middleware::from_fn_with_state(token.clone(), auth));
     let app = Router::new()
         .route("/", get(web::index))
@@ -104,6 +114,7 @@ pub async fn serve(
             workspaces: Arc::new(workspaces),
             token,
             public_url: Arc::new(public_url),
+            push,
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -699,6 +710,88 @@ async fn note_op(
     let (written, notes) = result;
     app.hub.notes_changed(notes).await?;
     Ok(Json(json!({ "written": written })))
+}
+
+// --- web push ---------------------------------------------------------------
+
+impl App {
+    fn push(&self) -> Result<&Arc<Push>, ApiError> {
+        self.push.as_ref().ok_or(ApiError(
+            StatusCode::CONFLICT,
+            "web push is off in the hub's configuration".into(),
+        ))
+    }
+}
+
+/// Whether push is on, the key the browser subscribes with, and the
+/// devices subscribed so far.
+async fn push_info(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    let store = app.store.clone();
+    let subscriptions = tokio::task::spawn_blocking(move || push::subscriptions(&store.reader()?))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(json!({
+        "enabled": app.push.is_some(),
+        "key": app.push.as_ref().map(|p| p.public_key()),
+        "subscriptions": subscriptions,
+    })))
+}
+
+/// Stores the browser's `PushSubscription` (idempotent per endpoint).
+async fn push_subscribe(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<push::Subscribe>,
+) -> Result<Json<Value>, ApiError> {
+    app.push()?;
+    body.validate()
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| util::truncate(ua, 200));
+    let now = now_ms();
+    let subscription = app
+        .store
+        .exec(move |conn| push::subscribe(conn, &body, user_agent.as_deref(), now))
+        .await??;
+    Ok(Json(json!({ "subscription": subscription })))
+}
+
+#[derive(Deserialize)]
+struct Unsubscribe {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(app): State<App>,
+    Json(body): Json<Unsubscribe>,
+) -> Result<Json<Value>, ApiError> {
+    let removed = app
+        .store
+        .exec(move |conn| push::unsubscribe(conn, &body.endpoint))
+        .await??;
+    Ok(Json(json!({ "removed": removed })))
+}
+
+/// Sends a plain message to every subscribed device, right away.
+async fn push_test(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    let push = app.push()?;
+    let results = push
+        .send_all(&push::test_payload(&app.public_url), false, "test")
+        .await?;
+    push::log_failures(&results);
+    let results: Vec<Value> = results
+        .into_iter()
+        .map(|(sub, outcome)| {
+            let mut v = serde_json::to_value(outcome).unwrap_or_default();
+            v["id"] = sub.id.into();
+            v["endpoint"] = sub.endpoint.into();
+            v["user_agent"] = sub.user_agent.into();
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "results": results })))
 }
 
 struct ApiError(StatusCode, String);

@@ -20,6 +20,7 @@ mod otlp;
 mod paths;
 mod procs;
 mod protocol;
+mod push;
 mod state;
 mod store;
 mod usage;

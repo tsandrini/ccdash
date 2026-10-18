@@ -20,7 +20,7 @@ use tracing::warn;
 use crate::{
     knowledge,
     model::{Kind, Stamped, Turn},
-    paths,
+    paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
     util::{now_ms, truncate},
 };
@@ -195,6 +195,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(knowledge::SCHEMA)?;
+    conn.execute_batch(push::SCHEMA)?;
     migrate(&conn)?;
     Ok(conn)
 }

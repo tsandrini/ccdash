@@ -21,6 +21,7 @@ pub struct HubConfig {
     pub store: Store,
     pub workspaces: Workspaces,
     pub notify: Notify,
+    pub push: Push,
     pub knowledge: Knowledge,
 }
 
@@ -202,6 +203,23 @@ pub struct Notify {
     pub workspaces: Vec<String>,
 }
 
+/// Web Push (RFC 8030) to the panel installed on phones, next to ntfy.
+/// Subscriptions come from the panel's pairing dialog; the hub signs
+/// (VAPID) and encrypts every message itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Push {
+    pub enabled: bool,
+    /// VAPID contact (`mailto:` or `https:` URL) push services may use to
+    /// reach the operator; defaults to `http.public_url`.
+    pub subject: Option<String>,
+    /// How long a push service keeps an undelivered message, in seconds.
+    pub ttl_secs: u64,
+    /// PKCS#8 file holding the VAPID key pair; generated on first start
+    /// (in the state dir when unset). `$VAR` and `${VAR}` expand.
+    pub key_file: Option<PathBuf>,
+}
+
 /// OTLP/HTTP (JSON) receiver for Claude Code's OpenTelemetry export. It
 /// takes no token, so only loopback addresses are accepted; empty is off.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -271,6 +289,17 @@ impl Default for Notify {
     }
 }
 
+impl Default for Push {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            subject: None,
+            ttl_secs: 3600,
+            key_file: None,
+        }
+    }
+}
+
 impl Default for Niri {
     fn default() -> Self {
         Self {
@@ -331,6 +360,14 @@ impl HubConfig {
             .path
             .clone()
             .unwrap_or_else(|| paths::state_dir().join("ccdash.db"))
+    }
+
+    pub fn push_key_file(&self) -> PathBuf {
+        self.push
+            .key_file
+            .as_ref()
+            .map(|p| PathBuf::from(crate::util::expand_env(&p.to_string_lossy())))
+            .unwrap_or_else(|| paths::state_dir().join("vapid.p8"))
     }
 
     /// The web UI's address for phones: `http.public_url`, else the LAN

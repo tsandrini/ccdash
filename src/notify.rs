@@ -1,8 +1,10 @@
-//! Phone notifications through ntfy (docs.ntfy.sh/publish). An open prompt
-//! or a finished turn notifies after a short wait unless it ends first,
-//! and its notification is deleted once it ends. Prompt notifications carry
-//! buttons that answer through `/act/{key}/{action}` on this daemon, so the
-//! phone (or a watch mirroring it) answers without opening anything.
+//! Phone notifications. An open prompt or a finished turn notifies after a
+//! short wait unless it ends first, and its notification is taken down once
+//! it ends. Prompt notifications carry buttons that answer through
+//! `/act/{key}/{action}` on the hub, so the phone (or a watch mirroring it)
+//! answers without opening anything. The [`Composer`] turns the live state
+//! into backend-neutral notes; a [`Sink`] delivers them: ntfy
+//! (docs.ntfy.sh/publish) here, Web Push in `push`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -11,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::warn;
@@ -24,19 +27,49 @@ use crate::{
 
 const BODY_LEN: usize = 400;
 const LABEL_LEN: usize = 40;
-/// ntfy shows at most three buttons.
+/// ntfy shows at most three buttons; the service worker fits the phone's
+/// own limit from the same list.
 const MAX_BUTTONS: usize = 3;
 
 /// A notification that is due once its wait passes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
-    /// ntfy sequence id; the delete addresses it.
+    /// Identifies the notification across backends (ntfy sequence id, push
+    /// tag); the delete addresses it.
     pub seq: String,
     pub opened_at: i64,
     /// The session's window has keyboard focus.
     pub focused: bool,
-    /// The ntfy JSON message without `topic` and `sequence_id`.
-    pub message: Value,
+    pub content: Content,
+}
+
+/// What every backend shows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Content {
+    pub title: String,
+    pub body: String,
+    /// The session the notification is about.
+    pub session: String,
+    /// Deep link into the panel (`#session=`).
+    pub url: String,
+    /// The ask's button key, when the prompt answers from a button.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub buttons: Vec<Button>,
+    /// More answers than buttons: offer opening the panel.
+    pub more: bool,
+    /// A prompt, as opposed to a finished turn.
+    pub urgent: bool,
+    /// ntfy emoji tag.
+    #[serde(skip)]
+    pub icon: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Button {
+    pub label: String,
+    /// The `/act` action: `allow`, `deny`, `always`, `o<n>`.
+    pub action: String,
 }
 
 /// Turns the live state into notification candidates.
@@ -76,7 +109,7 @@ impl Composer {
                     seq: format!("ask-{}", ask.id),
                     opened_at: ask.at,
                     focused,
-                    message: self.ask_message(s, ask, key),
+                    content: self.ask_content(s, ask, key),
                 });
             }
             // NOTE: hooked only: unhooked turns come from the agents poll, which flaps
@@ -92,7 +125,7 @@ impl Composer {
                     seq: format!("turn-{}-{}", s.id, s.activity_since),
                     opened_at: s.activity_since,
                     focused,
-                    message: self.turn_message(s),
+                    content: self.turn_content(s),
                 });
             }
         }
@@ -119,21 +152,15 @@ impl Composer {
         format!("{}/#session={}", self.web_url, s.id)
     }
 
-    fn button(&self, key: &str, label: &str, action: &str) -> Value {
-        json!({
-            "action": "http",
-            "label": truncate(label, LABEL_LEN),
-            "url": format!("{}/act/{key}/{action}", self.web_url),
-            "method": "POST",
-            "clear": true,
-        })
-    }
-
-    fn ask_message(&self, s: &Session, ask: &Ask, key: Option<&str>) -> Value {
+    fn ask_content(&self, s: &Session, ask: &Ask, key: Option<&str>) -> Content {
         let label = label(s);
-        let mut buttons: Vec<(String, String)> = Vec::new();
+        let mut buttons: Vec<Button> = Vec::new();
         let mut more = false;
-        let (title, body, tag) = match &ask.kind {
+        let button = |label: &str, action: &str| Button {
+            label: truncate(label, LABEL_LEN),
+            action: action.to_owned(),
+        };
+        let (title, body, icon) = match &ask.kind {
             AskKind::Tool {
                 tool,
                 description,
@@ -153,10 +180,10 @@ impl Composer {
                     .filter(|t| !t.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
-                buttons.push(("Allow".into(), "allow".into()));
-                buttons.push(("Deny".into(), "deny".into()));
+                buttons.push(button("Allow", "allow"));
+                buttons.push(button("Deny", "deny"));
                 if always.is_some() {
-                    buttons.push(("Always".into(), "always".into()));
+                    buttons.push(button("Always", "always"));
                 }
                 (format!("{label}: allow {tool}?"), body, "key")
             }
@@ -179,7 +206,7 @@ impl Composer {
                         let fits = q.options.len() <= MAX_BUTTONS;
                         let shown = if fits { MAX_BUTTONS } else { MAX_BUTTONS - 1 };
                         for (i, o) in q.options.iter().take(shown).enumerate() {
-                            buttons.push((o.label.clone(), format!("o{i}")));
+                            buttons.push(button(&o.label, &format!("o{i}")));
                         }
                         more = !fits;
                     }
@@ -188,49 +215,44 @@ impl Composer {
                 (format!("{label} asks"), body, "question")
             }
             AskKind::Plan { plan } => {
-                buttons.push(("Approve".into(), "allow".into()));
-                buttons.push(("Keep planning".into(), "deny".into()));
+                buttons.push(button("Approve", "allow"));
+                buttons.push(button("Keep planning", "deny"));
                 (format!("{label}: plan ready"), plan.clone(), "clipboard")
             }
         };
-        let mut actions: Vec<Value> = match key {
-            Some(key) => buttons
-                .iter()
-                .map(|(text, action)| self.button(key, text, action))
-                .collect(),
-            None => Vec::new(),
-        };
-        if more {
-            actions.push(json!({
-                "action": "view",
-                "label": "Answer",
-                "url": self.click(s),
-                "clear": true,
-            }));
+        if key.is_none() {
+            buttons.clear();
         }
-        json!({
-            "title": title,
-            "message": truncate(&body, BODY_LEN),
-            "priority": 4,
-            "tags": [tag],
-            "click": self.click(s),
-            "actions": actions,
-        })
+        Content {
+            title,
+            body: truncate(&body, BODY_LEN),
+            session: s.id.clone(),
+            url: self.click(s),
+            key: key.map(str::to_owned),
+            buttons,
+            more,
+            urgent: true,
+            icon,
+        }
     }
 
-    fn turn_message(&self, s: &Session) -> Value {
+    fn turn_content(&self, s: &Session) -> Content {
         let body = match (&s.waiting_for, &s.reply) {
             (Some(error), _) if error.starts_with("error:") => error.clone(),
             (_, Some(reply)) if !reply.text.trim().is_empty() => reply.text.clone(),
             _ => "Claude finished.".into(),
         };
-        json!({
-            "title": format!("{}: your turn", label(s)),
-            "message": truncate(&body, BODY_LEN),
-            "priority": 3,
-            "tags": ["speech_balloon"],
-            "click": self.click(s),
-        })
+        Content {
+            title: format!("{}: your turn", label(s)),
+            body: truncate(&body, BODY_LEN),
+            session: s.id.clone(),
+            url: self.click(s),
+            key: None,
+            buttons: Vec::new(),
+            more: false,
+            urgent: false,
+            icon: "speech_balloon",
+        }
     }
 }
 
@@ -248,8 +270,32 @@ fn label(s: &Session) -> String {
     truncate(&label, LABEL_LEN)
 }
 
-/// Publishes notes once their wait passes and deletes the ones that ended.
-pub async fn run(cfg: Notify, mut rx: watch::Receiver<Vec<Note>>) {
+/// A notification backend.
+pub trait Sink: Send + 'static {
+    const NAME: &'static str;
+    fn publish(&self, note: &Note) -> impl Future<Output = Result<()>> + Send;
+    fn delete(&self, seq: &str) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// How long a note waits before it shows, in seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct Delays {
+    pub normal: u64,
+    pub focused: u64,
+}
+
+impl From<&Notify> for Delays {
+    fn from(cfg: &Notify) -> Self {
+        Self {
+            normal: cfg.delay_secs,
+            focused: cfg.focused_delay_secs,
+        }
+    }
+}
+
+/// Publishes notes to `sink` once their wait passes and deletes the ones
+/// that ended.
+pub async fn run<S: Sink>(delays: Delays, mut rx: watch::Receiver<Vec<Note>>, sink: S) {
     let mut shown: HashSet<String> = HashSet::new();
     let mut last_error = None;
     loop {
@@ -263,7 +309,7 @@ pub async fn run(cfg: Notify, mut rx: watch::Receiver<Vec<Note>>) {
             .collect();
         for seq in ended {
             shown.remove(&seq);
-            report(delete(&cfg, &seq).await, &mut last_error);
+            report::<S>(sink.delete(&seq).await, &mut last_error);
         }
         let mut next = None::<i64>;
         for note in &notes {
@@ -271,14 +317,14 @@ pub async fn run(cfg: Notify, mut rx: watch::Receiver<Vec<Note>>) {
                 continue;
             }
             let wait = if note.focused {
-                cfg.focused_delay_secs
+                delays.focused
             } else {
-                cfg.delay_secs
+                delays.normal
             };
             let due = note.opened_at + 1000 * i64::try_from(wait).unwrap_or(i64::MAX / 2000);
             if due <= now {
                 shown.insert(note.seq.clone());
-                report(publish(&cfg, note).await, &mut last_error);
+                report::<S>(sink.publish(note).await, &mut last_error);
             } else {
                 next = Some(next.map_or(due, |n| n.min(due)));
             }
@@ -294,49 +340,117 @@ pub async fn run(cfg: Notify, mut rx: watch::Receiver<Vec<Note>>) {
 }
 
 /// Logs each new kind of failure once.
-fn report(result: Result<()>, last_error: &mut Option<String>) {
+fn report<S: Sink>(result: Result<()>, last_error: &mut Option<String>) {
     match result {
         Ok(()) => *last_error = None,
         Err(e) => {
             let message = format!("{e:#}");
             if last_error.as_ref() != Some(&message) {
-                warn!("ntfy: {message}");
+                warn!("{}: {message}", S::NAME);
                 *last_error = Some(message);
             }
         }
     }
 }
 
-async fn publish(cfg: &Notify, note: &Note) -> Result<()> {
-    let mut body = note.message.clone();
-    body["topic"] = cfg.topic.clone().into();
-    body["sequence_id"] = note.seq.clone().into();
-    let (url, token) = (cfg.url.trim_end_matches('/').to_owned(), token(cfg)?);
-    blocking(move || {
-        let mut request = agent()
-            .post(&url)
-            .header("Content-Type", "application/json");
-        if let Some(token) = &token {
-            request = request.header("Authorization", &format!("Bearer {token}"));
-        }
-        request.send(body.to_string()).map(drop)
-    })
-    .await
-    .context("publishing")
+// --- ntfy -------------------------------------------------------------------
+
+/// JSON publishes to an ntfy topic, with `http` buttons for the answers.
+pub struct Ntfy {
+    cfg: Notify,
+    web_url: String,
 }
 
-async fn delete(cfg: &Notify, seq: &str) -> Result<()> {
-    let url = format!("{}/{}/{seq}", cfg.url.trim_end_matches('/'), cfg.topic);
-    let token = token(cfg)?;
-    blocking(move || {
-        let mut request = agent().delete(&url);
-        if let Some(token) = &token {
-            request = request.header("Authorization", &format!("Bearer {token}"));
+impl Ntfy {
+    pub fn new(cfg: Notify, web_url: String) -> Self {
+        Self {
+            cfg,
+            web_url: web_url.trim_end_matches('/').to_owned(),
         }
-        request.call().map(drop)
-    })
-    .await
-    .context("deleting")
+    }
+
+    /// The ntfy JSON message without `topic` and `sequence_id`.
+    fn message(&self, note: &Note) -> Value {
+        let c = &note.content;
+        let mut actions: Vec<Value> = match &c.key {
+            Some(key) => c
+                .buttons
+                .iter()
+                .map(|b| {
+                    json!({
+                        "action": "http",
+                        "label": b.label,
+                        "url": format!("{}/act/{key}/{}", self.web_url, b.action),
+                        "method": "POST",
+                        "clear": true,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        if c.more {
+            actions.push(json!({
+                "action": "view",
+                "label": "Answer",
+                "url": c.url,
+                "clear": true,
+            }));
+        }
+        let mut message = json!({
+            "title": c.title,
+            "message": c.body,
+            "priority": if c.urgent { 4 } else { 3 },
+            "tags": [c.icon],
+            "click": c.url,
+        });
+        if !actions.is_empty() {
+            message["actions"] = actions.into();
+        }
+        message
+    }
+}
+
+impl Sink for Ntfy {
+    const NAME: &'static str = "ntfy";
+
+    async fn publish(&self, note: &Note) -> Result<()> {
+        let mut body = self.message(note);
+        body["topic"] = self.cfg.topic.clone().into();
+        body["sequence_id"] = note.seq.clone().into();
+        let (url, token) = (
+            self.cfg.url.trim_end_matches('/').to_owned(),
+            token(&self.cfg)?,
+        );
+        blocking(move || {
+            let mut request = agent()
+                .post(&url)
+                .header("Content-Type", "application/json");
+            if let Some(token) = &token {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.send(body.to_string()).map(drop)
+        })
+        .await
+        .context("publishing")
+    }
+
+    async fn delete(&self, seq: &str) -> Result<()> {
+        let url = format!(
+            "{}/{}/{seq}",
+            self.cfg.url.trim_end_matches('/'),
+            self.cfg.topic
+        );
+        let token = token(&self.cfg)?;
+        blocking(move || {
+            let mut request = agent().delete(&url);
+            if let Some(token) = &token {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.call().map(drop)
+        })
+        .await
+        .context("deleting")
+    }
 }
 
 async fn blocking(call: impl FnOnce() -> Result<(), ureq::Error> + Send + 'static) -> Result<()> {
@@ -421,8 +535,14 @@ mod tests {
         }
     }
 
+    const WEB: &str = "http://10.0.0.2:7837/";
+
     fn composer() -> Composer {
-        Composer::new(Notify::default(), "http://10.0.0.2:7837/".into(), 1_000)
+        Composer::new(Notify::default(), WEB.into(), 1_000)
+    }
+
+    fn ntfy() -> Ntfy {
+        Ntfy::new(Notify::default(), WEB.into())
     }
 
     #[test]
@@ -435,10 +555,19 @@ mod tests {
             panic!("{notes:?}")
         };
         assert_eq!((note.seq.as_str(), note.opened_at), ("ask-a1", 2_000));
-        let m = &note.message;
+        let c = &note.content;
+        assert_eq!(c.title, "repo: allow Bash?");
+        assert_eq!(c.body, "List files\nls");
+        assert_eq!(c.url, format!("http://10.0.0.2:7837/#session={SID}"));
+        assert_eq!((c.session.as_str(), c.key.as_deref()), (SID, Some("k3y")));
+        assert!(c.urgent && !c.more);
+        let actions: Vec<&str> = c.buttons.iter().map(|b| b.action.as_str()).collect();
+        assert_eq!(actions, ["allow", "deny", "always"]);
+
+        let m = ntfy().message(note);
         assert_eq!(m["title"], "repo: allow Bash?");
-        assert_eq!(m["message"], "List files\nls");
-        assert_eq!(m["click"], format!("http://10.0.0.2:7837/#session={SID}"));
+        assert_eq!(m["priority"], 4);
+        assert_eq!(m["tags"], json!(["key"]));
         let urls: Vec<&str> = m["actions"]
             .as_array()
             .unwrap()
@@ -453,6 +582,19 @@ mod tests {
                 "http://10.0.0.2:7837/act/k3y/always",
             ]
         );
+        // The push payload carries the same, for the service worker to lay out.
+        let payload = serde_json::to_value(c).unwrap();
+        assert_eq!(payload["key"], "k3y");
+        assert_eq!(
+            payload["buttons"][1],
+            json!({"label": "Deny", "action": "deny"})
+        );
+        assert!(payload.get("icon").is_none());
+
+        // Without a key there is nothing to press.
+        let notes = composer().notes(&st, &HashMap::new(), 3_000);
+        assert!(notes[0].content.buttons.is_empty() && notes[0].content.key.is_none());
+        assert!(ntfy().message(&notes[0]).get("actions").is_none());
 
         // Nothing from before the daemon started; nothing for turned-off kinds.
         let late = Composer::new(Notify::default(), "http://x".into(), 5_000);
@@ -496,7 +638,7 @@ mod tests {
         let labels = |options, multi| -> Vec<String> {
             let st = session(options, multi);
             let notes = composer().notes(&st, &HashMap::from([("q", "k")]), 3_000);
-            notes[0].message["actions"]
+            ntfy().message(&notes[0])["actions"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -525,8 +667,12 @@ mod tests {
         st.apply(&env, &mut fx);
         let notes = composer().notes(&st, &HashMap::new(), 5_000);
         assert_eq!(notes[0].seq, format!("turn-{SID}-4000"));
-        assert_eq!(notes[0].message["message"], "All done.");
-        assert!(notes[0].message.get("actions").is_none());
+        assert_eq!(notes[0].content.body, "All done.");
+        assert!(!notes[0].content.urgent);
+        let m = ntfy().message(&notes[0]);
+        assert_eq!(m["message"], "All done.");
+        assert_eq!(m["priority"], 3);
+        assert!(m.get("actions").is_none());
 
         let elsewhere = Composer::new(
             Notify {
@@ -593,9 +739,22 @@ mod tests {
             seq: "ask-1".into(),
             opened_at: 0,
             focused: false,
-            message: json!({"title": "x"}),
+            content: Content {
+                title: "x".into(),
+                body: "b".into(),
+                session: SID.into(),
+                url: "http://x/#session=1".into(),
+                key: None,
+                buttons: Vec::new(),
+                more: false,
+                urgent: false,
+                icon: "speech_balloon",
+            },
         };
-        publish(&cfg, &note).await.unwrap();
+        Ntfy::new(cfg.clone(), WEB.into())
+            .publish(&note)
+            .await
+            .unwrap();
         let request = server.join().unwrap();
         assert!(request.starts_with("POST / HTTP/1.1"), "{request}");
         assert!(
@@ -605,12 +764,13 @@ mod tests {
         let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(
             body,
-            json!({"title": "x", "topic": "t", "sequence_id": "ask-1"})
+            json!({"title": "x", "message": "b", "priority": 3, "tags": ["speech_balloon"],
+                "click": "http://x/#session=1", "topic": "t", "sequence_id": "ask-1"})
         );
 
         let (url, server) = capture();
         let cfg = Notify { url, ..cfg };
-        delete(&cfg, "ask-1").await.unwrap();
+        Ntfy::new(cfg, WEB.into()).delete("ask-1").await.unwrap();
         let request = server.join().unwrap();
         assert!(request.starts_with("DELETE /t/ask-1 HTTP/1.1"), "{request}");
         std::fs::remove_dir_all(dir).unwrap();

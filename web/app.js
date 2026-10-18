@@ -292,6 +292,15 @@ const postJson = async (path, body) =>
 
 const getJson = async (path) => (await api(path)).json();
 
+const deleteJson = async (path, body) =>
+  (
+    await api(path, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  ).json();
+
 function askToken() {
   setConn("offline", "token needed");
   $("#login-error").hidden = !token();
@@ -1482,6 +1491,7 @@ async function openPair() {
     fill(body, h("p", { text: e.message }));
     return;
   }
+  const pushBox = h("div", { class: "pair-push" });
   const copy = h("button", {
     class: "btn btn-quiet",
     type: "button",
@@ -1513,7 +1523,175 @@ async function openPair() {
       class: "muted",
       text: "The token survives reboots. To lock every device out, delete ~/.local/state/ccdash/token and restart ccdash.",
     }),
+    pushBox,
   );
+  renderPush(pushBox);
+}
+
+// --- service worker, install, push ------------------------------------------
+
+/** The browser's deferred install prompt (Chromium), until used. */
+let installPrompt = null;
+
+const pushSupported = () =>
+  "serviceWorker" in navigator &&
+  "PushManager" in window &&
+  "Notification" in window;
+
+/** Registers the worker; it caches the shell and shows push notifications. */
+async function registerWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.addEventListener("message", (event) => {
+    if (event.data?.type !== "session") return;
+    state.pendingSession = event.data.id;
+    openPendingSession();
+  });
+  try {
+    await navigator.serviceWorker.register("sw.js");
+  } catch (e) {
+    console.warn("service worker:", e);
+    return;
+  }
+  syncSubscription();
+}
+
+/** Re-sends this device's subscription, so a renewed endpoint reaches the hub. */
+async function syncSubscription() {
+  if (!pushSupported() || !token()) return;
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const sub = await registration.pushManager.getSubscription();
+    if (sub) await postJson("push/subscriptions", sub.toJSON());
+  } catch {}
+}
+
+/** `applicationServerKey` from the hub's base64url VAPID public key. */
+const keyBytes = (b64) =>
+  Uint8Array.from(atob(b64.replace(/-/g, "+").replace(/_/g, "/")), (c) =>
+    c.charCodeAt(0),
+  );
+
+/** A device's row in the pairing dialog's list. */
+function deviceRow(sub, mine) {
+  const agent = (sub.user_agent || "unknown device").match(
+    /(Firefox|Chrome|Safari)\/[\d.]+|Android|iPhone|Linux|Windows|Mac/g,
+  );
+  const when = sub.last_failure_at
+    ? `failed ${fmtDuration(now() - sub.last_failure_at)} ago: ${sub.last_failure}`
+    : sub.last_success_at
+      ? `sent ${fmtDuration(now() - sub.last_success_at)} ago`
+      : "nothing sent yet";
+  return h(
+    "li",
+    { class: sub.last_failure_at ? "bad" : null },
+    h("span", { text: agent ? agent.join(" ") : "unknown device" }),
+    mine ? h("span", { class: "muted", text: " (this device)" }) : null,
+    h("span", { class: "muted", text: ` · ${when}` }),
+  );
+}
+
+/** Install hint and the push toggle for this device, inside `box`. */
+async function renderPush(box) {
+  fill(box, h("h3", { text: "This device" }));
+  const note = (text) => {
+    box.append(h("p", { class: "muted", text }));
+  };
+  const installed = matchMedia("(display-mode: standalone)").matches;
+  if (installPrompt) {
+    const install = h("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Install as an app",
+      onclick: async () => {
+        installPrompt.prompt();
+        await installPrompt.userChoice;
+        installPrompt = null;
+        renderPush(box);
+      },
+    });
+    box.append(install);
+  } else if (!installed) {
+    note("Installable from the browser menu (Add to Home screen).");
+  }
+  if (!pushSupported()) return note("This browser has no Web Push.");
+  if (!isSecureContext) return note("Push notifications need HTTPS.");
+  let info;
+  try {
+    info = await getJson("push");
+  } catch (e) {
+    if (e instanceof Unauthorized) return askToken();
+    return note(e.message);
+  }
+  if (!info.enabled) return note("Push is off in the hub's configuration.");
+  if (Notification.permission === "denied")
+    return note("Notifications are blocked for this site in the browser.");
+  const registration = await navigator.serviceWorker.ready;
+  const sub = await registration.pushManager.getSubscription();
+  const status = h("p", { class: "muted", role: "status" });
+  const toggle = h("button", {
+    class: "btn",
+    type: "button",
+    text: sub ? "Turn off push notifications" : "Turn on push notifications",
+    onclick: async () => {
+      toggle.disabled = true;
+      try {
+        if (sub) {
+          await deleteJson("push/subscriptions", { endpoint: sub.endpoint });
+          await sub.unsubscribe();
+        } else {
+          if ((await Notification.requestPermission()) !== "granted")
+            throw new Error("Notification permission was not granted.");
+          const fresh = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: keyBytes(info.key),
+          });
+          await postJson("push/subscriptions", fresh.toJSON());
+        }
+      } catch (e) {
+        if (e instanceof Unauthorized) return askToken();
+        status.textContent = e.message;
+        toggle.disabled = false;
+        return;
+      }
+      renderPush(box);
+    },
+  });
+  box.append(toggle);
+  if (sub) {
+    const test = h("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Send a test",
+      onclick: async () => {
+        test.disabled = true;
+        try {
+          const { results } = await postJson("push/test", {});
+          const mine = results.find((r) => r.endpoint === sub.endpoint);
+          status.textContent = !mine
+            ? "The hub does not know this device; turn push off and on."
+            : mine.outcome === "sent"
+              ? "Sent; it shows in a moment."
+              : `Failed: ${mine.error || mine.status}`;
+        } catch (e) {
+          status.textContent = e.message;
+        }
+        test.disabled = false;
+      },
+    });
+    box.append(test);
+  }
+  box.append(status);
+  if (info.subscriptions.length) {
+    box.append(
+      h(
+        "ul",
+        { class: "pair-devices" },
+        ...info.subscriptions.map((s) =>
+          deviceRow(s, Boolean(sub && s.endpoint === sub.endpoint)),
+        ),
+      ),
+    );
+  }
 }
 
 async function loadConversation(mode) {
@@ -6893,6 +7071,12 @@ function start() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") reconnectIfStale();
   });
+
+  addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    installPrompt = event;
+  });
+  registerWorker();
 
   showView(localStorage.getItem(VIEW_KEY) || "sessions");
   if (!token()) return askToken();

@@ -33,8 +33,9 @@ niri window events ────────────────┘          
   and (with the channel enabled) sends them messages. "Open in Claude"
   opens a session in the Claude app through Remote Control. Every view can
   be narrowed to one host.
-- **Notifications** through [ntfy](https://ntfy.sh) reach the phone (and a
-  watch mirroring it) with buttons that answer the prompt.
+- **Notifications** reach the phone (and a watch mirroring it) with
+  buttons that answer the prompt: through [ntfy](https://ntfy.sh), or as
+  Web Push to the web UI installed as an app, or both.
 - The **DMS plugin** on each workstation shows that machine's sessions
   (mirrored from the hub): a bar indicator, a quick list, and a full
   dashboard tab. Clicking a session focuses its terminal window in niri.
@@ -251,6 +252,30 @@ it on the same LAN or VPN costs nothing (the buttons need it anyway), and a
 short in-memory cache (`cache-duration`, no `cache-file`) keeps the text off
 its disk.
 
+### Web Push
+
+Served over HTTPS, the web UI installs as an app (the pairing dialog has
+the install button, else the browser's "Add to Home screen"), works
+offline for what it cached, and can take the same notifications as Web
+Push: "Connect a phone" → "Turn on push notifications" asks the browser
+for permission and hands the subscription to the hub; "Send a test" checks
+the way back. The notification shows the prompt with as many buttons as
+the platform allows (two on Android: Allow / Deny, or the first option and
+"Answer", which opens the panel); tapping it opens the session. It closes
+once the prompt is answered. Push is on by default; the hub generates its
+VAPID key pair at `push.key_file` on first start (the NixOS module keeps
+it in `/var/lib/ccdash-hub`), messages are encrypted for the device
+(RFC 8291) and go through the browser vendor's push service, which sees
+only ciphertext. Devices the service reports gone are forgotten.
+
+```nix
+services.ccdash-hub.settings.push = {
+  # enabled = false;
+  subject = "mailto:you@example.org"; # VAPID contact; default: public URL
+  # ttl_secs = 3600;  how long the service holds an undelivered message
+};
+```
+
 ### Replying from the phone
 
 With the channel enabled, the session sheet gets a message box. A message
@@ -403,7 +428,8 @@ Every row carries the host it came from. The database keeps 30 days
   edit decisions and active time
 
 The HTTP API serves it to your browser with the token. Nothing else leaves
-the hub, except notifications when `notify.url` is set. Delete the
+the hub, except notifications when `notify.url` is set or a device
+subscribed to push (encrypted; the push service sees only ciphertext). Delete the
 database to start over. `ccdash import db` brings the history of a
 pre-hub daemon (`~/.local/state/ccdash/ccdash.db` on the workstation)
 into the hub; it skips rows the hub already has, so it is safe to repeat.

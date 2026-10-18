@@ -10,10 +10,12 @@ repository = "https://github.com/tsandrini/ccdash"
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink"] }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+ring = { version = "0.17.14", features = ["std"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"

@@ -1,7 +1,8 @@
 # The ccdash hub: the one process that keeps every machine's Claude Code
-# history, serves the web UI and API, and sends notifications. Collectors
-# (the home-manager module) connect to its `/collect` endpoint, each with
-# its own token.
+# history, serves the web UI and API, and sends notifications (ntfy and
+# Web Push; the VAPID key pair is generated into the state directory on
+# first start). Collectors (the home-manager module) connect to its
+# `/collect` endpoint, each with its own token.
 { localFlake }:
 {
   config,
@@ -144,6 +145,7 @@ in
         };
         collect.tokens = cfg.collectors;
         store.path = mkDefault "${stateDir}/ccdash.db";
+        push.key_file = mkDefault "${stateDir}/vapid.p8";
       };
 
       users.users.ccdash = {

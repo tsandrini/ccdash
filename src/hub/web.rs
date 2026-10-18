@@ -1,5 +1,6 @@
-//! The web UI's static files, embedded in the binary. `CCDASH_WEB_DIR` serves
-//! them from disk instead, for live editing.
+//! The web UI's static files, embedded in the binary: the panel, its
+//! service worker and the PWA manifest with its icons. `CCDASH_WEB_DIR`
+//! serves them from disk instead, for live editing.
 
 use axum::{
     extract::Path,
@@ -41,6 +42,26 @@ const ASSETS: &[Asset] = &[
         name: "manifest.webmanifest",
         mime: "application/manifest+json",
         bytes: include_bytes!("../../web/manifest.webmanifest"),
+    },
+    Asset {
+        name: "sw.js",
+        mime: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../web/sw.js"),
+    },
+    Asset {
+        name: "icon-192.png",
+        mime: "image/png",
+        bytes: include_bytes!("../../web/icon-192.png"),
+    },
+    Asset {
+        name: "icon-512.png",
+        mime: "image/png",
+        bytes: include_bytes!("../../web/icon-512.png"),
+    },
+    Asset {
+        name: "icon-maskable-512.png",
+        mime: "image/png",
+        bytes: include_bytes!("../../web/icon-maskable-512.png"),
     },
 ];
 
