@@ -1,6 +1,7 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
-//! replying to them and answering their permission prompts.
-//! Every `/api` route needs `Authorization: Bearer <token>`.
+//! replying to them and answering their prompts.
+//! Every `/api` route needs `Authorization: Bearer <token>`. `/act/{key}/…`
+//! takes the one-time key of a notification button instead.
 
 use std::{
     convert::Infallible,
@@ -32,7 +33,7 @@ use tracing::warn;
 use super::web;
 use crate::{
     analytics::{self, Analytics},
-    channel::Behavior,
+    ask::Answer,
     config::Config,
     conversation,
     history::{self, History},
@@ -69,7 +70,7 @@ pub async fn serve(
         .route("/sessions/{id}", get(session))
         .route("/sessions/{id}/title", post(rename))
         .route("/sessions/{id}/reply", post(reply))
-        .route("/sessions/{id}/permission", post(permission))
+        .route("/sessions/{id}/asks/{ask}", post(answer))
         .route("/pair", get(pair))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
@@ -78,6 +79,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/", get(web::index))
         .route("/{asset}", get(web::asset))
+        .route("/act/{key}/{action}", post(button))
         .nest("/api/v1", api)
         .with_state(App {
             hub,
@@ -95,8 +97,9 @@ pub async fn serve(
 /// (creating it on first use).
 pub fn load_token(cfg: &Config) -> Result<String> {
     if let Some(path) = &cfg.http.token_file {
-        let token =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let path = std::path::PathBuf::from(util::expand_env(&path.to_string_lossy()));
+        let token = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         let token = token.trim();
         if token.is_empty() {
             bail!("{} is empty", path.display());
@@ -129,15 +132,11 @@ async fn auth(State(token): State<Arc<String>>, request: Request, next: Next) ->
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if given.is_some_and(|given| constant_time_eq(given.as_bytes(), token.as_bytes())) {
+    if given.is_some_and(|given| util::constant_time_eq(given.as_bytes(), token.as_bytes())) {
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn snapshot(State(app): State<App>) -> Result<Json<Snapshot>, ApiError> {
@@ -238,24 +237,32 @@ async fn reply(
     Ok(Json(json!({ "session": session })))
 }
 
-#[derive(Deserialize)]
-struct Verdict {
-    request_id: String,
-    behavior: Behavior,
-}
-
-/// Allows or denies the session's open permission prompt.
-async fn permission(
+/// Answers one of the session's open prompts; the terminal dialog closes
+/// with it.
+async fn answer(
     State(app): State<App>,
-    Path(id): Path<String>,
-    Json(body): Json<Verdict>,
+    Path((id, ask)): Path<(String, String)>,
+    Json(answer): Json<Answer>,
 ) -> Result<Json<Value>, ApiError> {
     let session = app
         .hub
-        .answer(&id, &body.request_id, body.behavior)
+        .answer(&id, &ask, answer)
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))
+}
+
+/// A notification button, sent by the phone's ntfy app: the key in the
+/// link is the ask's own secret, valid until the prompt closes.
+async fn button(
+    State(app): State<App>,
+    Path((key, action)): Path<(String, String)>,
+) -> Result<&'static str, ApiError> {
+    app.hub
+        .button(&key, &action)
+        .await?
+        .map_err(|e| ApiError(StatusCode::GONE, e))?;
+    Ok("done")
 }
 
 /// The address a phone on the LAN opens, token included, and its QR code.
@@ -275,7 +282,7 @@ struct RangeQuery {
     since: Option<i64>,
     /// Defaults to now; never later.
     until: Option<i64>,
-    /// Workspace name from the snapshot's list.
+    /// Comma-separated workspace names from the snapshot's list.
     workspace: Option<String>,
     /// Viewer's offset from UTC in minutes (east positive), for day buckets.
     tz: Option<i64>,
@@ -291,23 +298,25 @@ impl RangeQuery {
             .since
             .unwrap_or(until - default_ms)
             .clamp(oldest, until - 60_000);
-        let dir = match &self.workspace {
+        let dirs = match &self.workspace {
             None => None,
-            Some(name) => Some(
-                workspaces
-                    .dir(name)
-                    .ok_or(ApiError(
-                        StatusCode::BAD_REQUEST,
-                        "unknown workspace".into(),
-                    ))?
-                    .to_owned(),
+            Some(names) => Some(
+                names
+                    .split(',')
+                    .map(|name| {
+                        workspaces.dir(name).map(str::to_owned).ok_or(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            format!("unknown workspace {name:?}"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             ),
         };
         Ok(Scope {
             since,
             until,
             now,
-            dir,
+            dirs,
         })
     }
 }

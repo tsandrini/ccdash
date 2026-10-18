@@ -85,7 +85,7 @@ pub fn context(
             GROUP BY s.session"
     ))?;
     let peaks = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
     )?;
     let mut values = Vec::new();

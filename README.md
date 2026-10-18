@@ -12,18 +12,21 @@ on the phone as a web page.
 
 ```text
 Claude Code hooks ──► ccdash emit ─┐
+prompts ────────────► ccdash ask ──┤
 statusline ─────────► ccdash tee ──┼──► ccdash daemon ──┬──► web UI (LAN / VPN)
-claude agents --json ──────────────┤    (per host)      └──► DMS plugin
-claude -p /usage ──────────────────┤
+claude agents --json ──────────────┤    (per host)      ├──► DMS plugin
+claude -p /usage ──────────────────┤                    └──► ntfy (phone, watch)
 niri window events ────────────────┘
 ```
 
 - Every session reports through Claude Code hooks to a small daemon on the
   same machine. The daemon keeps live state in memory and history in SQLite.
-- The **web UI** is meant for the phone: it reads, renames sessions, and
-  (with the channel enabled) sends them messages and answers their
-  permission prompts. "Open in Claude" opens a session in the Claude app
-  through Remote Control.
+- The **web UI** is meant for the phone: it reads, renames sessions,
+  answers their permission prompts, questions and plans, and (with the
+  channel enabled) sends them messages. "Open in Claude" opens a session in
+  the Claude app through Remote Control.
+- **Notifications** through [ntfy](https://ntfy.sh) reach the phone (and a
+  watch mirroring it) with buttons that answer the prompt.
 - The **DMS plugin** adds a bar indicator, a quick list, and a full dashboard
   tab. Clicking a session focuses its terminal window in niri.
 
@@ -121,7 +124,9 @@ The web UI lives on the HTTP port:
 History and Analytics share a time range picker: quick ranges or an exact
 from–to, `‹ ›` to step by the range's length, `⊖` to double it, and
 drag across any time chart with a mouse to zoom in. With
-`workspaces.dirs` set, a workspace switch filters every view.
+`workspaces.dirs` set, a workspace filter narrows every view to one or
+several workspaces. It reads "All" (or what you picked) until you open it,
+so the other names stay out of sight; each browser remembers its choice.
 
 To connect a phone, scan `ccdash url --lan --qr` (or open "Connect a phone"
 in the web UI on the desktop). The address carries the access token; each
@@ -143,14 +148,64 @@ new name at once and hands it to Claude Code at the session's next prompt
 (or resume), through the `sessionTitle` output of its own hook, so the
 terminal title and Remote Control pick it up too.
 
+### Answering from the phone
+
+Tool approvals, questions (`AskUserQuestion`) and plans (`ExitPlanMode`)
+show up at the bottom of the session sheet while the terminal dialog stays
+open; whichever answer comes first wins:
+
+- **Tool calls:** Allow, Deny, and Always allow when Claude Code suggests a
+  rule (saved where the terminal's "don't ask again" saves it, usually the
+  project's `.claude/settings.local.json`). Deny stops Claude like the
+  terminal's No; "Deny with a note" lets it carry on with your note.
+- **Questions:** one button per option, several for multi-select, or your
+  own text.
+- **Plans:** Approve, or Keep planning (with a note).
+
+The PermissionRequest hook is `ccdash ask`: it hands the prompt to the
+daemon and holds it until ccdash answers or the prompt closes in the
+terminal. Claude Code runs it alongside the dialog (verified on 2.1.302;
+the [hooks reference](https://code.claude.com/docs/en/hooks) promises this
+only for SDK hosts, so recheck after updates).
+`claudeCode.asks.enable = false` makes the hook report prompts only.
+
+### Notifications
+
+The daemon can push prompts and finished turns to an
+[ntfy](https://docs.ntfy.sh) server; the ntfy app on the phone shows them
+with buttons (Allow / Deny / Always, up to three options of a question,
+Approve / Keep planning), which a watch mirroring the phone's notifications
+can press too. A notification waits 15 s (2 minutes while the session's
+window has focus), so a prompt answered at the desk never sends one, and it
+is deleted from the phone once the prompt is answered anywhere.
+
+```nix
+services.ccdash.settings.notify = {
+  url = "https://ntfy.example.org";
+  topic = "ccdash";
+  token_file = "/run/agenix/ccdash-ntfy-token"; # may publish to the topic
+  # how the phone reaches this daemon (buttons, taps); default: LAN address
+  web_url = "http://10.0.0.2:7837";
+  # turns = false;  questions, plans, permissions: per-kind switches
+  # workspaces = [ "work" ];  only these workspaces
+};
+```
+
+A button calls `POST /act/<key>/<action>` on the daemon with a random key
+that belongs to that one prompt and dies with it; the access token never
+goes into a notification. The phone needs to reach the daemon (LAN or
+VPN) for the buttons to work. Notifications carry session titles, commands
+and questions, so use an ntfy server you run, with access control. Keeping
+it on the same LAN or VPN costs nothing (the buttons need it anyway), and a
+short in-memory cache (`cache-duration`, no `cache-file`) keeps the text off
+its disk.
+
 ### Replying from the phone
 
-With the channel enabled, the session sheet gets a message box, and a
-permission prompt shows up above it with the tool, its arguments, and
-Allow/Deny. Whichever answer comes first, the terminal's or ccdash's, wins.
-A message sent while Claude works waits for its next turn. Messages reach
-Claude as `<channel source="plugin:ccdash:ccdash">` events (the terminal
-shows `← ccdash: …`), and ccdash marks them "sent from ccdash".
+With the channel enabled, the session sheet gets a message box. A message
+sent while Claude works waits for its next turn. Messages reach Claude as
+`<channel source="plugin:ccdash:ccdash">` events (the terminal shows
+`← ccdash: …`), and ccdash marks them "sent from ccdash".
 
 This uses Claude Code
 [channels](https://code.claude.com/docs/en/channels-reference), a research
@@ -177,9 +232,9 @@ Sessions started before this (or without the wrapper) show how to restart
 them. Team and Enterprise accounts also need an admin to enable channels for
 the organization.
 
-Anyone holding the token can now prompt your sessions and approve their
-tool calls, so treat it like an SSH key: keep the port on your LAN or VPN,
-and delete the token file if a device goes missing.
+Anyone holding the token can answer your sessions' prompts and, with the
+channel, prompt them, so treat it like an SSH key: keep the port on your LAN
+or VPN, and delete the token file if a device goes missing.
 
 Claude Code reads hooks when a session starts, so sessions that were already
 running when ccdash was installed only show busy/idle until you restart
@@ -192,9 +247,9 @@ its memory as PSS, so shared pages are not counted twice. Turn it off with
 `procs.enable = false`.
 
 The HTTP API needs the bearer token for everything (it can read sessions,
-rename them and, with the channel, prompt them and answer their permission
-prompts) (generated in
-`~/.local/state/ccdash/token` unless `http.token_file` is set). Keep the
+rename them, answer their prompts and, with the channel, prompt them),
+except the notification buttons' one-time links. The token is generated in
+`~/.local/state/ccdash/token` unless `http.token_file` is set. Keep the
 port behind your firewall or VPN.
 
 ## Desktop (DankMaterialShell)
@@ -213,7 +268,7 @@ Mod+Shift+C { spawn "dms" "ipc" "call" "ccdash" "focusWaiting"; }
 
 ## Data
 
-Everything stays on the machine running the daemon:
+Everything is stored on the machine running the daemon:
 
 | What       | Where                                                       |
 | ---------- | ----------------------------------------------------------- |
@@ -228,8 +283,8 @@ The database keeps 30 days (`store.retention_days`) of:
 
 - `events`: prompts (up to 8 KiB), Claude's messages and replies (up to
   32 KiB), tool calls (name, file path or first command line, duration),
-  permission requests, task changes, subagent results, compactions and
-  state changes
+  permission requests and how ccdash answered them, task changes, subagent
+  results, compactions and state changes
 - `samples`: once a minute per session from the statusline (context,
   cost, rate limits, model, lines changed)
 - `proc_samples`: once a minute per session (CPU, memory, process count)
@@ -239,8 +294,9 @@ The database keeps 30 days (`store.retention_days`) of:
   latency), API errors, tool approval decisions, commits, pull requests,
   edit decisions and active time
 
-Nothing is sent anywhere; the HTTP API serves it to your browser with the
-token. Delete the database to start over.
+The HTTP API serves it to your browser with the token. Nothing else leaves
+the machine, except notifications when `notify.url` is set. Delete the
+database to start over.
 
 ## Development
 

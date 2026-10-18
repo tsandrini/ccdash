@@ -868,6 +868,8 @@ dl.ask-preview {
 
 .ask-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
 }
@@ -875,6 +877,146 @@ dl.ask-preview {
 .ask-actions .btn {
   min-width: 88px;
   justify-content: center;
+}
+
+.ask-link {
+  margin-right: auto;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.ask-count,
+.ask-always,
+.ask-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.ask-always {
+  margin: 0;
+  text-align: right;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.ask-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ask-note[hidden] {
+  display: none;
+}
+
+.ask-note-input,
+.ask-other {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--axis);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+}
+
+.ask-note-input {
+  resize: vertical;
+}
+
+.ask-plan {
+  max-height: 40vh;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--surface-2);
+  font: 13px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ask-q {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ask-question {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ask-chip {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.ask-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 6px;
+}
+
+.ask-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: 40px;
+  padding: 6px 10px;
+  border: 1px solid var(--axis);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ask-option:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.ask-option[aria-pressed="true"] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.ask-option-label {
+  font-weight: 600;
+}
+
+.ask-option[aria-pressed="true"] .ask-option-label::before {
+  content: "✓ ";
+  color: var(--accent);
+}
+
+.ask-option-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.ask-option:focus-visible,
+.ask-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .msg-pending .bubble {
@@ -892,8 +1034,15 @@ dl.ask-preview {
   }
 
   /* NOTE: below 16px iOS zooms into focused inputs */
-  .composer-input {
+  .composer-input,
+  .ask-note-input,
+  .ask-other {
     font-size: 16px;
+  }
+
+  .ask-option,
+  .ask-actions .btn {
+    min-height: 44px;
   }
 
   .composer .btn {
@@ -1720,43 +1869,89 @@ dl.ask-preview {
 
 .scopebar {
   display: flex;
-  align-items: center;
-  gap: 2px;
-  width: max-content;
-  max-width: 100%;
   margin-bottom: 16px;
-  padding: 2px;
-  border-radius: 8px;
-  background: var(--surface-2);
-  overflow-x: auto;
 }
 
 .scopebar[hidden] {
   display: none;
 }
 
+.scope-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px var(--axis);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.scope-trigger:hover {
+  background: var(--surface-2);
+}
+
 .scope-label {
-  padding: 0 8px 0 6px;
   font-size: 13px;
   color: var(--text-muted);
   white-space: nowrap;
 }
 
-.scopebar button {
-  flex: none;
-  padding: 4px 12px;
-  border: 0;
+.scope-value {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-caret {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.scope-form {
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+}
+
+.scope-form h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.scope-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 0 6px;
   border-radius: 6px;
-  background: none;
-  color: var(--text-secondary);
   cursor: pointer;
 }
 
-.scopebar button[aria-checked="true"] {
-  background: var(--surface-1);
-  color: var(--text-primary);
-  font-weight: 600;
-  box-shadow: 0 0 0 1px var(--border);
+.scope-option:hover {
+  background: var(--surface-2);
+}
+
+.scope-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.scope-form .btn {
+  justify-content: center;
+  height: 48px;
+  margin-top: 12px;
 }
 
 .toolbar {
@@ -1796,7 +1991,7 @@ dl.ask-preview {
 }
 
 .range-picker button:focus-visible,
-.scopebar button:focus-visible,
+.scope-trigger:focus-visible,
 .range-quick button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -1826,13 +2021,15 @@ dl.ask-preview {
   color: var(--text-muted);
 }
 
-#range-dialog {
+#range-dialog,
+#workspace-dialog {
   width: auto;
   max-width: calc(100vw - 16px);
   padding: 12px;
 }
 
-#range-dialog.range-popover {
+#range-dialog.range-popover,
+#workspace-dialog.range-popover {
   position: fixed;
   right: auto;
   bottom: auto;
@@ -1840,11 +2037,13 @@ dl.ask-preview {
   margin: 0;
 }
 
-#range-dialog::backdrop {
+#range-dialog::backdrop,
+#workspace-dialog::backdrop {
   background: transparent;
 }
 
-#range-dialog.range-sheet::backdrop {
+#range-dialog.range-sheet::backdrop,
+#workspace-dialog.range-sheet::backdrop {
   background: rgba(0, 0, 0, 0.45);
 }
 
@@ -2018,10 +2217,12 @@ dl.ask-preview {
     border-radius: 0;
   }
 
-  #range-dialog.range-sheet {
+  #range-dialog.range-sheet,
+  #workspace-dialog.range-sheet {
     top: auto;
     bottom: 0;
     width: 100vw;
+    max-width: 100vw;
     height: auto;
     max-height: 90dvh;
     padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
@@ -2068,8 +2269,8 @@ dl.ask-preview {
     width: 100%;
   }
 
-  .scope-label {
-    display: none;
+  .range-sheet .scope-option {
+    min-height: 44px;
   }
 
   #pair-btn {

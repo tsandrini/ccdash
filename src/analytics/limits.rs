@@ -32,7 +32,8 @@ pub struct Limits {
     /// Each 5-hour window seen in the range, with its highest reading.
     pub windows: Vec<Window>,
     /// API-equivalent cost per workspace since the 7-day window opened: a
-    /// stand-in for each workspace's share of the limit.
+    /// stand-in for each workspace's share of the limit. With a workspace
+    /// filter, the workspaces it leaves out share one row.
     pub shares: Vec<Share>,
     /// Weekly limits of one model or surface, from `/usage`.
     pub scoped: Vec<ScopedForecast>,
@@ -76,8 +77,10 @@ pub struct Window {
 
 #[derive(Debug, PartialEq, Serialize)]
 pub struct Share {
-    /// None for sessions outside every workspace.
+    /// None for sessions outside every workspace, or for `other`.
     pub workspace: Option<String>,
+    /// Everything the workspace filter leaves out.
+    pub other: bool,
     pub cost_usd: f64,
 }
 
@@ -144,7 +147,7 @@ pub fn limits(
         .filter_map(|r| Some((r.0, r.1?)))
         .collect();
     out.windows = windows(&in_range);
-    out.shares = shares(conn, week_start, now, workspaces)?;
+    out.shares = shares(conn, scope, week_start, workspaces)?;
     Ok(out)
 }
 
@@ -257,8 +260,8 @@ fn windows(readings: &[(i64, f64)]) -> Vec<Window> {
 
 fn shares(
     conn: &Connection,
+    scope: &Scope,
     since: i64,
-    until: i64,
     workspaces: &Workspaces,
 ) -> Result<Vec<Share>> {
     let mut stmt = conn.prepare_cached(
@@ -267,7 +270,7 @@ fn shares(
             WHERE s.ts >= ?1 AND s.ts < ?2 AND s.cost_usd IS NOT NULL
             GROUP BY s.session",
     )?;
-    let rows = stmt.query_map(params![since, until], |r| {
+    let rows = stmt.query_map(params![since, scope.now], |r| {
         Ok((
             r.get::<_, f64>(0)?,
             r.get::<_, f64>(1)?,
@@ -275,17 +278,23 @@ fn shares(
             r.get::<_, String>(3)?,
         ))
     })?;
-    let mut by: BTreeMap<Option<String>, f64> = BTreeMap::new();
+    let mut by: BTreeMap<(bool, Option<String>), f64> = BTreeMap::new();
     for row in rows {
         let (min, max, started_at, cwd) = row?;
         let cost = if started_at >= since { max } else { max - min };
-        *by.entry(workspaces.of(&cwd)).or_default() += cost.max(0.0);
+        let key = if scope.contains(&cwd) {
+            (false, workspaces.of(&cwd))
+        } else {
+            (true, None)
+        };
+        *by.entry(key).or_default() += cost.max(0.0);
     }
     let mut out: Vec<Share> = by
         .into_iter()
         .filter(|(_, cost)| *cost > 0.0)
-        .map(|(workspace, cost_usd)| Share {
+        .map(|((other, workspace), cost_usd)| Share {
             workspace,
+            other,
             cost_usd,
         })
         .collect();
@@ -329,6 +338,55 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_filter_folds_the_rest_into_one_share() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::store::SCHEMA).unwrap();
+        let now = 1_000 * HOUR_MS;
+        for (id, cwd, cost) in [
+            ("a", "/ws/one/repo", 3.0),
+            ("b", "/ws/two", 2.0),
+            ("c", "/elsewhere", 1.0),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1, 'h', ?2, NULL, NULL, 'interactive', ?3, NULL)",
+                params![id, cwd, now - HOUR_MS],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO samples (ts, host, session, cost_usd) VALUES (?1, 'h', ?2, ?3)",
+                params![now - 1000, id, cost],
+            )
+            .unwrap();
+        }
+        let ws = Workspaces::new(&["/ws/one".into(), "/ws/two".into()], "/home/u");
+        let scope = |dirs: Option<Vec<String>>| Scope {
+            since: now - HOUR_MS,
+            until: now,
+            now,
+            dirs,
+        };
+        let rows = |dirs| {
+            shares(&conn, &scope(dirs), now - 2 * HOUR_MS, &ws)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.workspace, s.other, s.cost_usd))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(None),
+            [
+                (Some("one".into()), false, 3.0),
+                (Some("two".into()), false, 2.0),
+                (None, false, 1.0),
+            ]
+        );
+        assert_eq!(
+            rows(Some(vec!["/ws/one".into()])),
+            [(Some("one".into()), false, 3.0), (None, true, 3.0)]
+        );
+    }
+
+    #[test]
     fn scoped_limits_get_a_forecast_and_a_week() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::store::SCHEMA).unwrap();
@@ -356,7 +414,7 @@ mod tests {
             since: now - 24 * HOUR_MS,
             until: now,
             now,
-            dir: None,
+            dirs: None,
         };
         let l = limits(&conn, &scope, Some(&live), &Workspaces::default()).unwrap();
         let fable = &l.scoped[0];

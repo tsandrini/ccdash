@@ -1,7 +1,7 @@
 //! `ccdash channel`: the MCP server Claude Code starts in sessions launched
-//! with `--channels plugin:ccdash@inline`. It passes replies and permission
-//! verdicts from the daemon into the session, and the session's permission
-//! prompts back. Protocol: code.claude.com/docs/en/channels-reference.
+//! with `--channels plugin:ccdash@inline`. It passes replies from the
+//! daemon into the session; prompts are answered through `ccdash ask`
+//! instead. Protocol: code.claude.com/docs/en/channels-reference.
 
 use std::time::Duration;
 
@@ -20,34 +20,7 @@ use crate::paths;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToChannel {
-    Say {
-        text: String,
-    },
-    Verdict {
-        request_id: String,
-        behavior: Behavior,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Behavior {
-    Allow,
-    Deny,
-}
-
-/// What a channel sends the daemon: a permission prompt Claude Code relayed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum FromChannel {
-    PermissionRequest {
-        request_id: String,
-        tool_name: String,
-        #[serde(default)]
-        description: String,
-        #[serde(default)]
-        input_preview: String,
-    },
+    Say { text: String },
 }
 
 /// Protocol revisions with unsolicited notifications; Claude Code drops
@@ -70,7 +43,6 @@ pub fn run() -> Result<()> {
 /// alongside and reconnects on its own.
 async fn serve(pid: u32) -> Result<()> {
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(64);
-    let (up_tx, up_rx) = mpsc::channel::<FromChannel>(16);
     tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(msg) = out_rx.recv().await {
@@ -81,7 +53,7 @@ async fn serve(pid: u32) -> Result<()> {
             }
         }
     });
-    tokio::spawn(link(pid, out_tx.clone(), up_rx));
+    tokio::spawn(link(pid, out_tx.clone()));
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
@@ -90,16 +62,6 @@ async fn serve(pid: u32) -> Result<()> {
         };
         if let Some(reply) = respond(&msg) {
             out_tx.send(reply).await?;
-        } else if msg["method"] == "notifications/claude/channel/permission_request"
-            && let Ok(ask) = serde_json::from_value(json!({
-                "type": "permission_request",
-                "request_id": msg["params"]["request_id"],
-                "tool_name": msg["params"]["tool_name"],
-                "description": msg["params"]["description"],
-                "input_preview": msg["params"]["input_preview"],
-            }))
-        {
-            let _ = up_tx.try_send(ask);
         }
     }
     Ok(())
@@ -124,10 +86,7 @@ fn respond(msg: &Value) -> Option<Value> {
                 "result": {
                     "protocolVersion": version,
                     "capabilities": {
-                        "experimental": {
-                            "claude/channel": {},
-                            "claude/channel/permission": {},
-                        },
+                        "experimental": { "claude/channel": {} },
                     },
                     "serverInfo": { "name": "ccdash", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": INSTRUCTIONS,
@@ -144,10 +103,10 @@ fn respond(msg: &Value) -> Option<Value> {
     Some(reply)
 }
 
-async fn link(pid: u32, out: mpsc::Sender<Value>, mut up: mpsc::Receiver<FromChannel>) {
+async fn link(pid: u32, out: mpsc::Sender<Value>) {
     loop {
         if let Ok(stream) = UnixStream::connect(paths::api_socket()).await {
-            let _ = relay(stream, pid, &out, &mut up).await;
+            let _ = relay(stream, pid, &out).await;
         }
         if out.is_closed() {
             return;
@@ -156,35 +115,17 @@ async fn link(pid: u32, out: mpsc::Sender<Value>, mut up: mpsc::Receiver<FromCha
     }
 }
 
-async fn relay(
-    stream: UnixStream,
-    pid: u32,
-    out: &mpsc::Sender<Value>,
-    up: &mut mpsc::Receiver<FromChannel>,
-) -> Result<()> {
+async fn relay(stream: UnixStream, pid: u32, out: &mpsc::Sender<Value>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    write_line(&mut write, &json!({ "cmd": "channel", "pid": pid })).await?;
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { return Ok(()) };
-                if let Ok(msg) = serde_json::from_str::<ToChannel>(&line) {
-                    out.send(notification(msg)).await?;
-                }
-            }
-            ask = up.recv() => {
-                let Some(ask) = ask else { return Ok(()) };
-                write_line(&mut write, &serde_json::to_value(ask)?).await?;
-            }
+    let mut hello = serde_json::to_vec(&json!({ "cmd": "channel", "pid": pid }))?;
+    hello.push(b'\n');
+    write.write_all(&hello).await?;
+    while let Some(line) = lines.next_line().await? {
+        if let Ok(msg) = serde_json::from_str::<ToChannel>(&line) {
+            out.send(notification(msg)).await?;
         }
     }
-}
-
-async fn write_line(write: &mut tokio::net::unix::OwnedWriteHalf, value: &Value) -> Result<()> {
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
-    write.write_all(&line).await?;
     Ok(())
 }
 
@@ -194,14 +135,6 @@ fn notification(msg: ToChannel) -> Value {
             "jsonrpc": "2.0",
             "method": "notifications/claude/channel",
             "params": { "content": text },
-        }),
-        ToChannel::Verdict {
-            request_id,
-            behavior,
-        } => json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/claude/channel/permission",
-            "params": { "request_id": request_id, "behavior": behavior },
         }),
     }
 }
@@ -216,7 +149,9 @@ mod tests {
             "params": {"protocolVersion": "2026-07-28"}});
         let reply = respond(&modern).unwrap();
         assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
-        assert!(reply["result"]["capabilities"]["experimental"]["claude/channel"].is_object());
+        let experimental = &reply["result"]["capabilities"]["experimental"];
+        assert!(experimental["claude/channel"].is_object());
+        assert!(experimental.get("claude/channel/permission").is_none());
         let known = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
             "params": {"protocolVersion": "2025-11-25"}});
         assert_eq!(
@@ -235,15 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn verdicts_become_permission_notifications() {
-        let msg: ToChannel =
-            serde_json::from_str(r#"{"type":"verdict","request_id":"abcde","behavior":"deny"}"#)
-                .unwrap();
+    fn replies_become_channel_notifications() {
+        let msg: ToChannel = serde_json::from_str(r#"{"type":"say","text":"hi"}"#).unwrap();
         let note = notification(msg);
-        assert_eq!(note["method"], "notifications/claude/channel/permission");
-        assert_eq!(
-            note["params"],
-            json!({"request_id": "abcde", "behavior": "deny"})
-        );
+        assert_eq!(note["method"], "notifications/claude/channel");
+        assert_eq!(note["params"], json!({"content": "hi"}));
     }
 }

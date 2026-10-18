@@ -19,6 +19,7 @@ pub struct Config {
     pub store: Store,
     pub telemetry: Telemetry,
     pub usage: Usage,
+    pub notify: Notify,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,6 +27,7 @@ pub struct Config {
 pub struct Http {
     pub listen: Vec<SocketAddr>,
     /// File holding the bearer token; generated in the state dir when unset.
+    /// `$VAR` and `${VAR}` expand.
     pub token_file: Option<PathBuf>,
 }
 
@@ -78,6 +80,34 @@ pub struct Usage {
     pub interval_secs: u64,
 }
 
+/// Phone notifications through an ntfy server; prompt notifications carry
+/// buttons that answer them. Off while `url` is empty.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Notify {
+    /// The ntfy server, e.g. `https://ntfy.example.org`.
+    pub url: String,
+    pub topic: String,
+    /// File holding an ntfy access token that may publish to `topic`;
+    /// `$VAR` and `${VAR}` expand.
+    pub token_file: Option<PathBuf>,
+    /// How the phone reaches this daemon, for button and tap links.
+    /// Defaults to this machine's LAN address and the first HTTP port.
+    pub web_url: Option<String>,
+    /// Seconds a prompt or a finished turn waits before it notifies, so
+    /// one answered at the desk never does.
+    pub delay_secs: u64,
+    /// The wait while the session's window has focus.
+    pub focused_delay_secs: u64,
+    pub permissions: bool,
+    pub questions: bool,
+    pub plans: bool,
+    /// Finished turns of interactive sessions.
+    pub turns: bool,
+    /// Workspace names to notify for; empty notifies for every session.
+    pub workspaces: Vec<String>,
+}
+
 /// OTLP/HTTP (JSON) receiver for Claude Code's OpenTelemetry export. It
 /// takes no token, so only loopback addresses are accepted; empty is off.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -116,6 +146,24 @@ impl Default for Usage {
         Self {
             command: vec!["claude".into()],
             interval_secs: 600,
+        }
+    }
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            topic: "ccdash".into(),
+            token_file: None,
+            web_url: None,
+            delay_secs: 15,
+            focused_delay_secs: 120,
+            permissions: true,
+            questions: true,
+            plans: true,
+            turns: true,
+            workspaces: Vec::new(),
         }
     }
 }

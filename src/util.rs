@@ -28,6 +28,49 @@ pub fn pid_alive(pid: Option<u32>) -> bool {
     pid.is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
 }
 
+/// Expands `$NAME` and `${NAME}` from the environment, as in paths Home
+/// Manager's agenix hands out (`${XDG_RUNTIME_DIR}/agenix/…`). Unset
+/// variables stay as written.
+pub fn expand_env(s: &str) -> String {
+    expand_with(s, |name| std::env::var(name).ok())
+}
+
+fn expand_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let (name, len) = match after.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            },
+            None => {
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..end], end)
+            }
+        };
+        match lookup(name).filter(|_| !name.is_empty()) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[i..=i + len]),
+        }
+        rest = &rest[i + 1 + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `bytes` random bytes from the kernel, hex-encoded.
+pub fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Cuts `s` to at most `max` bytes on a char boundary, marking the cut with `…`.
 pub fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -67,12 +110,22 @@ pub fn lan_address() -> Option<IpAddr> {
 
 /// The web UI address with the access token in the fragment.
 pub fn web_url(host: &str, port: u16, token: &str) -> String {
+    format!("{}/#token={token}", base_url(host, port))
+}
+
+/// `http://host:port`, IPv6 addresses bracketed.
+pub fn base_url(host: &str, port: u16) -> String {
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
         host.to_owned()
     };
-    format!("http://{host}:{port}/#token={token}")
+    format!("http://{host}:{port}")
+}
+
+/// Compares secrets without an early exit.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// A QR code drawn with block characters, light on dark for dark terminals.
@@ -184,5 +237,18 @@ mod tests {
         let cut = truncate("příliš žluťoučký kůň", 10);
         assert!(cut.len() <= 10);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn env_references_expand() {
+        let env = |name: &str| (name == "XDG_RUNTIME_DIR").then(|| "/run/user/1".to_owned());
+        assert_eq!(
+            expand_with("${XDG_RUNTIME_DIR}/agenix/t", env),
+            "/run/user/1/agenix/t"
+        );
+        assert_eq!(expand_with("$XDG_RUNTIME_DIR/t", env), "/run/user/1/t");
+        assert_eq!(expand_with("/a/$NOPE/${NOPE}/b", env), "/a/$NOPE/${NOPE}/b");
+        assert_eq!(expand_with("/cost$", env), "/cost$");
+        assert_eq!(expand_with("/x/${broken", env), "/x/${broken");
     }
 }

@@ -83,6 +83,13 @@ pub enum Item {
         tool: String,
         summary: String,
     },
+    /// A prompt answered from ccdash (`via`: `web` or `notification`).
+    Answered {
+        at: i64,
+        tool: String,
+        action: String,
+        via: String,
+    },
     /// Text Claude wrote during a turn (between tool calls).
     Message {
         at: i64,
@@ -212,6 +219,12 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
             at,
             tool: text(data, "tool"),
             summary: text(data, "summary"),
+        },
+        "answered" => Item::Answered {
+            at,
+            tool: text(data, "tool"),
+            action: text(data, "action"),
+            via: text(data, "via"),
         },
         "message" => Item::Message {
             at,

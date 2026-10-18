@@ -63,19 +63,30 @@ pub struct Scope {
     pub since: i64,
     pub until: i64,
     pub now: i64,
-    /// Workspace directory; sessions outside it are left out.
-    pub dir: Option<String>,
+    /// Workspace directories; sessions outside all of them are left out.
+    /// None covers everything, sessions outside every workspace included.
+    pub dirs: Option<Vec<String>>,
 }
 
 impl Scope {
     pub fn contains(&self, cwd: &str) -> bool {
-        self.dir.as_deref().is_none_or(|dir| within(cwd, dir))
+        self.dirs
+            .as_ref()
+            .is_none_or(|dirs| dirs.iter().any(|dir| within(cwd, dir)))
+    }
+
+    /// The directories as a JSON array for [`IN_SCOPE`]'s `:dirs`.
+    pub fn dirs_param(&self) -> Option<String> {
+        self.dirs
+            .as_ref()
+            .map(|dirs| serde_json::to_string(dirs).unwrap_or_default())
     }
 }
 
-/// SQL condition on a `sessions` row aliased `x`, bound to `:dir`.
-pub const IN_SCOPE: &str =
-    "(:dir IS NULL OR x.cwd = :dir OR substr(x.cwd, 1, length(:dir) + 1) = :dir || '/')";
+/// SQL condition on a `sessions` row aliased `x`, bound to `:dirs`
+/// ([`Scope::dirs_param`]).
+pub const IN_SCOPE: &str = "(:dirs IS NULL OR EXISTS (SELECT 1 FROM json_each(:dirs) d
+    WHERE x.cwd = d.value OR substr(x.cwd, 1, length(d.value) + 1) = d.value || '/'))";
 
 #[cfg(test)]
 mod tests {
@@ -101,17 +112,29 @@ mod tests {
     #[test]
     fn sql_scope_matches_rust() {
         let conn = Connection::open_in_memory().unwrap();
-        let hit = |cwd: &str, dir: Option<&str>| -> bool {
-            conn.query_row(
-                &format!("SELECT {IN_SCOPE} FROM (SELECT :cwd AS cwd) x"),
-                named_params! {":cwd": cwd, ":dir": dir},
-                |r| r.get(0),
-            )
-            .unwrap()
+        let hit = |cwd: &str, dirs: Option<&[&str]>| -> bool {
+            let scope = Scope {
+                since: 0,
+                until: 0,
+                now: 0,
+                dirs: dirs.map(|d| d.iter().map(|d| (*d).to_owned()).collect()),
+            };
+            let sql: bool = conn
+                .query_row(
+                    &format!("SELECT {IN_SCOPE} FROM (SELECT :cwd AS cwd) x"),
+                    named_params! {":cwd": cwd, ":dirs": scope.dirs_param()},
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sql, scope.contains(cwd), "{cwd} in {dirs:?}");
+            sql
         };
-        assert!(hit("/a/b_c/d", Some("/a/b_c")));
-        assert!(!hit("/a/bxc/d", Some("/a/b_c")));
-        assert!(!hit("/a/b_cd", Some("/a/b_c")));
+        assert!(hit("/a/b_c/d", Some(&["/a/b_c"])));
+        assert!(!hit("/a/bxc/d", Some(&["/a/b_c"])));
+        assert!(!hit("/a/b_cd", Some(&["/a/b_c"])));
+        assert!(hit("/z/y", Some(&["/a/b_c", "/z"])));
+        assert!(!hit("/q", Some(&["/a/b_c", "/z"])));
+        assert!(!hit("/q", Some(&[])));
         assert!(hit("/anything", None));
     }
 }

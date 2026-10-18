@@ -2,11 +2,14 @@
 //!
 //! Requests: `{"cmd":"snapshot"}`, `{"cmd":"subscribe"}`, `{"cmd":"open","id":"…"}`,
 //! `{"cmd":"rename","id":"…","title":"…"}`, `{"cmd":"reply","id":"…","text":"…"}`,
-//! `{"cmd":"permission","id":"…","request_id":"…","behavior":"allow|deny"}`.
-//! Replies carry a `type`: `snapshot`, `session`, `removed`, `rate_limits`, `ok`, `error`.
+//! `{"cmd":"answer","id":"…","ask":"…","answer":{"action":"allow"}}` (see
+//! `crate::ask::Answer`). Replies carry a `type`: `snapshot`, `session`,
+//! `removed`, `rate_limits`, `ok`, `error`.
 //!
 //! `{"cmd":"channel","pid":N}` turns the connection into the link of a
-//! `ccdash channel` (see `crate::channel`).
+//! `ccdash channel` (see `crate::channel`); `{"cmd":"ask","envelope":{…}}`
+//! into a prompt held by `ccdash ask`, answered with one
+//! `{"type":"decision","decision":{…}}` line or closed without one.
 
 use std::sync::{
     Arc,
@@ -22,15 +25,16 @@ use tokio::{
         UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{broadcast::error::RecvError, mpsc},
+    sync::{broadcast::error::RecvError, mpsc, oneshot},
 };
 use tracing::debug;
 
 use crate::{
     actions,
-    channel::{Behavior, FromChannel},
+    ask::Answer,
     config::Config,
     hub::{Cmd, Hub},
+    wire::Envelope,
 };
 
 #[derive(Deserialize)]
@@ -49,13 +53,16 @@ enum Request {
         id: String,
         text: String,
     },
-    Permission {
+    Answer {
         id: String,
-        request_id: String,
-        behavior: Behavior,
+        ask: String,
+        answer: Answer,
     },
     Channel {
         pid: u32,
+    },
+    Ask {
+        envelope: Box<Envelope>,
     },
 }
 
@@ -98,15 +105,12 @@ async fn handle(stream: UnixStream, hub: Hub, cfg: Arc<Config>) -> Result<()> {
                 Ok(_) => json!({ "type": "ok", "message": "sent" }),
                 Err(e) => error(e),
             },
-            Ok(Request::Permission {
-                id,
-                request_id,
-                behavior,
-            }) => match hub.answer(&id, &request_id, behavior).await? {
+            Ok(Request::Answer { id, ask, answer }) => match hub.answer(&id, &ask, answer).await? {
                 Ok(_) => json!({ "type": "ok", "message": "answered" }),
                 Err(e) => error(e),
             },
             Ok(Request::Channel { pid }) => return channel(lines, write, hub, pid).await,
+            Ok(Request::Ask { envelope }) => return ask(lines, write, hub, envelope).await,
         };
         send(&mut write, &reply).await?;
     }
@@ -132,10 +136,8 @@ async fn channel(
                     send(&mut write, &serde_json::to_value(&msg)?).await?;
                 }
                 line = lines.next_line() => {
-                    let Some(line) = line? else { return Ok(()) };
-                    match serde_json::from_str::<FromChannel>(&line) {
-                        Ok(msg) => hub.send(Cmd::FromChannel(pid, msg)).await?,
-                        Err(e) => debug!("channel {pid}: {e}"),
+                    if line?.is_none() {
+                        return Ok(());
                     }
                 }
             }
@@ -144,6 +146,31 @@ async fn channel(
     .await;
     hub.send(Cmd::ChannelClosed(pid, conn)).await?;
     result
+}
+
+/// Holds a prompt for `ccdash ask` until ccdash answers it, the hub lets
+/// go of it, or the hook goes away.
+async fn ask(
+    mut lines: Lines<BufReader<OwnedReadHalf>>,
+    mut write: OwnedWriteHalf,
+    hub: Hub,
+    envelope: Box<Envelope>,
+) -> Result<()> {
+    let (shown, id) = oneshot::channel();
+    let (decide, decision) = oneshot::channel();
+    hub.send(Cmd::Ask(envelope, shown, decide)).await?;
+    let Ok(Some(id)) = id.await else {
+        return Ok(());
+    };
+    tokio::select! {
+        decision = decision => {
+            if let Ok(decision) = decision {
+                send(&mut write, &json!({ "type": "decision", "decision": decision })).await?;
+            }
+        }
+        _ = lines.next_line() => hub.send(Cmd::AskGone(id)).await?,
+    }
+    Ok(())
 }
 
 async fn subscribe(mut write: OwnedWriteHalf, hub: Hub) -> Result<()> {

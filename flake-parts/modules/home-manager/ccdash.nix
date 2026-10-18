@@ -62,6 +62,12 @@ let
     command = "${exe} emit";
     timeout = 5;
   };
+  # NOTE: holds the prompt until ccdash answers or it closes; exits early then
+  askHook = {
+    type = "command";
+    command = "${exe} ask";
+    timeout = 86400;
+  };
 
   channel = cfg.claudeCode.channel;
   # NOTE: `claude <subcommand>` parsers reject the channel flags (`rc` included)
@@ -134,12 +140,23 @@ in
         '';
       };
 
+      asks.enable = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether ccdash can answer prompts: the PermissionRequest hook
+          becomes `ccdash ask`, which holds each tool approval, question
+          and plan open so the web UI or a notification button can answer
+          it while the terminal dialog stays open. Otherwise the hook only
+          reports the prompt. Needs {option}`hooks.enable`.
+        '';
+      };
+
       channel = {
         enable = mkEnableOption ''
-          replying to sessions and answering their permission prompts from
-          ccdash, through a Claude Code channel. Puts a `claude` wrapper
-          first in `PATH` that starts interactive sessions with
-          `--channels plugin:ccdash@inline --plugin-dir …`; subcommands,
+          replying to sessions from ccdash, through a Claude Code channel.
+          Puts a `claude` wrapper first in `PATH` that starts interactive
+          sessions with `--channels plugin:ccdash@inline --plugin-dir …`; subcommands,
           `-p` and `--bg` run unchanged. Claude Code only loads the channel
           when it is allowlisted (the NixOS module's
           {option}`programs.ccdash.channel.allow`) or with
@@ -227,7 +244,14 @@ in
     })
     (mkIf cfg.claudeCode.hooks.enable {
       programs.claude-code.settings.hooks = genAttrs hookEvents (event: [
-        ({ hooks = [ hook ]; } // optionalAttrs (elem event toolEvents) { matcher = "*"; })
+        (
+          {
+            hooks = [
+              (if event == "PermissionRequest" && cfg.claudeCode.asks.enable then askHook else hook)
+            ];
+          }
+          // optionalAttrs (elem event toolEvents) { matcher = "*"; }
+        )
       ]);
     })
     (mkIf channel.enable {

@@ -48,7 +48,19 @@ fn send(source: Source, input: &[u8]) {
         Source::Hook => apply_pending_title(&payload),
         Source::Statusline => None,
     };
-    let env = Envelope {
+    let Some(bytes) = wire::encode(envelope(source, payload, applied_title)) else {
+        return;
+    };
+    if let Ok(socket) = UnixDatagram::unbound() {
+        let _ = socket.set_nonblocking(true);
+        let _ = socket.send_to(&bytes, paths::ingest_socket());
+    }
+}
+
+/// Wraps a hook or statusline payload with what Claude Code's environment
+/// tells about the session.
+pub fn envelope(source: Source, payload: Value, applied_title: Option<String>) -> Envelope {
+    Envelope {
         v: wire::VERSION,
         source,
         ts: now_ms(),
@@ -61,13 +73,6 @@ fn send(source: Source, input: &[u8]) {
             .filter(|id| !id.is_empty()),
         applied_title,
         payload,
-    };
-    let Some(bytes) = wire::encode(env) else {
-        return;
-    };
-    if let Ok(socket) = UnixDatagram::unbound() {
-        let _ = socket.set_nonblocking(true);
-        let _ = socket.send_to(&bytes, paths::ingest_socket());
     }
 }
 

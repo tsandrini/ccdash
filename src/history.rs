@@ -92,7 +92,7 @@ pub fn history(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<His
                 "SELECT count(*) FROM events e LEFT JOIN sessions x ON x.id = e.session
                     WHERE e.kind = 'prompt' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}"
             ),
-            named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+            named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
             |r| r.get(0),
         )?,
         tools: tools(conn, scope)?,
@@ -184,7 +184,7 @@ fn tools(conn: &Connection, scope: &Scope) -> Result<Vec<ToolCount>> {
             GROUP BY tool ORDER BY 2 DESC, tool LIMIT 12"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
         |r| {
             Ok(ToolCount {
                 name: r.get(0)?,
@@ -353,7 +353,7 @@ fn cost(conn: &Connection, scope: &Scope) -> Result<f64> {
             GROUP BY s.session"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
         |r| {
             Ok((
                 r.get::<_, f64>(0)?,
@@ -384,7 +384,7 @@ mod tests {
             since,
             until,
             now: until,
-            dir: None,
+            dirs: None,
         }
     }
 

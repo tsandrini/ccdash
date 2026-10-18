@@ -1,7 +1,8 @@
 const TOKEN_KEY = "ccdash.token";
 const THEME_KEY = "ccdash.theme";
 const VIEW_KEY = "ccdash.view";
-const WORKSPACE_KEY = "ccdash.workspace";
+const WORKSPACES_KEY = "ccdash.workspaces";
+const OLD_WORKSPACE_KEY = "ccdash.workspace";
 const HISTORY_RANGE_KEY = "ccdash.range.history";
 const ANALYTICS_RANGE_KEY = "ccdash.range.analytics";
 const STALE_STREAM_MS = 45_000;
@@ -37,7 +38,8 @@ const state = {
   aRange: { kind: "days", days: 7 },
   analytics: null,
   workspaces: [],
-  workspace: localStorage.getItem(WORKSPACE_KEY),
+  /** Workspaces the views are filtered to; empty shows everything. */
+  picked: loadPicked(),
   /** Session to open from `#session=…` once the snapshot has it. */
   pendingSession: null,
   pendingPair: false,
@@ -1042,26 +1044,28 @@ function renameForm(s) {
   return form;
 }
 
-/** The relayed permission prompt and the reply box, pinned under the sheet.
+/** The oldest open prompt and the reply box, pinned under the sheet.
  * Both slots re-render only when their content changes, so a half-typed
- * reply keeps its text and focus through live updates. */
+ * reply or answer keeps its text and focus through live updates. */
 function renderDetailFoot() {
   const foot = $("#detail .detail-foot");
   const s = state.sessions.get(state.detailId);
   if (!foot || !s) return;
-  foot.hidden =
-    s.activity === "gone" || isAgent(s) || (!s.hooked && !s.channel);
+  const asks = s.asks || [];
+  const replies = !isAgent(s) && (s.hooked || s.channel);
+  foot.hidden = s.activity === "gone" || (!asks.length && !replies);
   const askSlot = foot.querySelector(".foot-ask");
-  const ask = s.permission_ask;
-  if ((askSlot.dataset.request || "") !== (ask?.request_id || "")) {
+  const shownAsks = asks.map((a) => a.id).join();
+  if ((askSlot.dataset.asks || "") !== shownAsks) {
     const dialog = $("#detail");
     const atEnd =
       dialog.scrollHeight - dialog.scrollTop - dialog.clientHeight < 80;
-    askSlot.dataset.request = ask?.request_id || "";
-    fill(askSlot, ask ? permissionCard(s.id, ask) : null);
+    askSlot.dataset.asks = shownAsks;
+    fill(askSlot, asks.length ? askCard(s.id, asks[0], asks.length) : null);
     if (atEnd) scrollToEnd();
   }
   const replySlot = foot.querySelector(".foot-reply");
+  replySlot.hidden = !replies;
   const mode = s.channel ? "composer" : "hint";
   if (replySlot.dataset.mode !== mode) {
     replySlot.dataset.mode = mode;
@@ -1069,16 +1073,25 @@ function renderDetailFoot() {
   }
 }
 
-/** Allow/Deny for a permission prompt; the terminal dialog closes with it. */
-function permissionCard(id, ask) {
+const ASK_TITLES = {
+  tool: "Needs permission",
+  question: "Claude asks",
+  plan: "Plan ready",
+};
+
+/** An open prompt with its answers; the terminal dialog closes with it.
+ * Tool calls: Allow / Deny / Always allow. Questions: options, several for
+ * multi-select, or free text. Plans: Approve / Keep planning. A note turns
+ * a denial into feedback Claude carries on with. */
+function askCard(id, ask, count) {
   const error = h("p", { class: "range-error", role: "alert", hidden: true });
-  const answer = async (behavior) => {
-    const buttons = card.querySelectorAll("button");
-    for (const b of buttons) b.disabled = true;
+  const send = async (answer) => {
+    const controls = card.querySelectorAll("button, input, textarea");
+    for (const c of controls) c.disabled = true;
     try {
       const { session } = await postJson(
-        `sessions/${encodeURIComponent(id)}/permission`,
-        { request_id: ask.request_id, behavior },
+        `sessions/${encodeURIComponent(id)}/asks/${encodeURIComponent(ask.id)}`,
+        answer,
       );
       state.sessions.set(session.id, session);
       scheduleRender();
@@ -1086,62 +1099,228 @@ function permissionCard(id, ask) {
       if (e instanceof Unauthorized) return askToken();
       error.textContent = e.message;
       error.hidden = false;
-      for (const b of buttons) b.disabled = false;
+      for (const c of controls) c.disabled = false;
     }
   };
-  const card = h(
+  const button = (text, onclick, quiet = false) =>
+    h("button", {
+      class: quiet ? "btn btn-quiet" : "btn",
+      type: "button",
+      text,
+      onclick,
+    });
+  const note = h("textarea", {
+    class: "ask-note-input",
+    rows: 2,
+    maxlength: 2000,
+    placeholder: "What should Claude do instead?",
+    "aria-label": "Note for Claude",
+  });
+  const noteBox = h(
     "div",
-    { class: "ask", role: "group", "aria-label": "Permission request" },
-    h(
-      "div",
-      { class: "ask-head" },
-      badge("permission"),
-      h("strong", { class: "mono", text: toolName(ask.tool) }),
-      clock(ask.at),
-    ),
-    ask.description
-      ? h("p", { class: "ask-desc", text: ask.description })
-      : null,
-    askPreview(ask.preview),
+    { class: "ask-note", hidden: true },
+    note,
     h(
       "div",
       { class: "ask-actions" },
-      h("button", {
-        class: "btn btn-quiet",
-        type: "button",
-        text: "Deny",
-        onclick: () => answer("deny"),
-      }),
-      h("button", {
-        class: "btn",
-        type: "button",
-        text: "Allow",
-        onclick: () => answer("allow"),
-      }),
+      button(
+        "Send note",
+        () =>
+          note.value.trim() && send({ action: "deny", message: note.value }),
+      ),
     ),
+  );
+  const noteToggle = (text) =>
+    h("button", {
+      class: "ask-link",
+      type: "button",
+      text,
+      onclick: (event) => {
+        noteBox.hidden = false;
+        event.target.hidden = true;
+        note.focus();
+      },
+    });
+
+  let body;
+  if (ask.kind === "question") {
+    body = questionForm(ask, (answers) => send({ action: "answer", answers }));
+    body.push(
+      h(
+        "div",
+        { class: "ask-actions ask-actions-start" },
+        noteToggle("Skip with a note"),
+        button("Dismiss", () => send({ action: "deny" }), true),
+      ),
+    );
+  } else if (ask.kind === "plan") {
+    body = [
+      h("pre", { class: "ask-plan", text: ask.plan }),
+      h(
+        "div",
+        { class: "ask-actions" },
+        noteToggle("Keep planning with a note"),
+        button("Keep planning", () => send({ action: "deny" }), true),
+        button("Approve", () => send({ action: "allow" })),
+      ),
+    ];
+  } else {
+    body = [
+      ask.description
+        ? h("p", { class: "ask-desc", text: ask.description })
+        : null,
+      askPreview(ask.input),
+      h(
+        "div",
+        { class: "ask-actions" },
+        noteToggle("Deny with a note"),
+        button("Deny", () => send({ action: "deny" }), true),
+        ask.always
+          ? button("Always allow", () => send({ action: "always" }), true)
+          : null,
+        button("Allow", () => send({ action: "allow" })),
+      ),
+      ask.always
+        ? h("p", {
+            class: "ask-always",
+            text: `Always allow: ${ask.always}`,
+          })
+        : null,
+    ];
+  }
+  const card = h(
+    "div",
+    { class: "ask", role: "group", "aria-label": ASK_TITLES[ask.kind] },
+    h(
+      "div",
+      { class: "ask-head" },
+      ask.kind === "tool" ? badge("permission") : null,
+      h("strong", {
+        class: ask.kind === "tool" ? "mono" : null,
+        text: ask.kind === "tool" ? toolName(ask.tool) : ASK_TITLES[ask.kind],
+      }),
+      count > 1
+        ? h("span", { class: "ask-count", text: `1 of ${count}` })
+        : null,
+      clock(ask.at),
+    ),
+    body,
+    noteBox,
     error,
   );
   return card;
 }
 
-/** The tool's arguments, one row per field when they parse as JSON. */
-function askPreview(preview) {
-  if (!preview) return null;
-  let fields = null;
-  try {
-    const parsed = JSON.parse(preview);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
-      fields = Object.entries(parsed);
-  } catch {}
-  if (!fields) return h("pre", { class: "ask-preview", text: preview });
+/** One block per question: option buttons (toggles for multi-select) and
+ * a free-text "Other"; Answer sends once every question has one. */
+function questionForm(ask, onanswer) {
+  const picked = ask.questions.map(() => new Set());
+  const other = ask.questions.map(() => "");
+  const submit = h("button", {
+    class: "btn",
+    type: "button",
+    text: "Answer",
+    disabled: true,
+    onclick: () => {
+      const answers = {};
+      ask.questions.forEach((q, i) => {
+        const parts = q.options
+          .map((o) => o.label)
+          .filter((label) => picked[i].has(label));
+        if (other[i].trim()) parts.push(other[i].trim());
+        answers[q.question] = parts.join(", ");
+      });
+      onanswer(answers);
+    },
+  });
+  const update = () => {
+    submit.disabled = !ask.questions.every(
+      (_, i) => picked[i].size || other[i].trim(),
+    );
+  };
+  const blocks = ask.questions.map((q, i) => {
+    const options = q.options.map((o) => {
+      const el = h(
+        "button",
+        {
+          class: "ask-option",
+          type: "button",
+          "aria-pressed": "false",
+          onclick: () => {
+            const on = !picked[i].has(o.label);
+            if (!q.multi_select) {
+              picked[i].clear();
+              other[i] = "";
+              otherInput.value = "";
+              for (const b of list.children)
+                b.setAttribute("aria-pressed", "false");
+            }
+            if (on) picked[i].add(o.label);
+            else picked[i].delete(o.label);
+            el.setAttribute("aria-pressed", String(on));
+            update();
+          },
+        },
+        h("span", { class: "ask-option-label", text: o.label }),
+        o.description
+          ? h("span", { class: "ask-option-desc", text: o.description })
+          : null,
+      );
+      return el;
+    });
+    const list = h(
+      "div",
+      {
+        class: "ask-options",
+        role: "group",
+        "aria-label": q.header || q.question,
+      },
+      options,
+    );
+    const otherInput = h("input", {
+      class: "ask-other",
+      type: "text",
+      maxlength: 2000,
+      placeholder: q.multi_select ? "Something else too…" : "Something else…",
+      "aria-label": `Other answer to: ${q.question}`,
+      oninput: () => {
+        other[i] = otherInput.value;
+        if (!q.multi_select && other[i].trim()) {
+          picked[i].clear();
+          for (const b of list.children)
+            b.setAttribute("aria-pressed", "false");
+        }
+        update();
+      },
+    });
+    return h(
+      "div",
+      { class: "ask-q" },
+      h(
+        "p",
+        { class: "ask-question" },
+        q.header ? h("span", { class: "ask-chip", text: q.header }) : null,
+        h("span", { text: q.question }),
+        q.multi_select
+          ? h("span", { class: "ask-hint", text: "pick any" })
+          : null,
+      ),
+      list,
+      otherInput,
+    );
+  });
+  return [...blocks, h("div", { class: "ask-actions" }, submit)];
+}
+
+/** The tool's arguments, one row per field. */
+function askPreview(input) {
+  if (!input?.length) return null;
   return h(
     "dl",
     { class: "ask-preview" },
-    fields.map(([key, value]) => [
+    input.map(([key, value]) => [
       h("dt", { text: key }),
-      h("dd", {
-        text: typeof value === "string" ? value : JSON.stringify(value),
-      }),
+      h("dd", { text: value }),
     ]),
   );
 }
@@ -1476,7 +1655,7 @@ function lastReplyAt(exchanges) {
   return null;
 }
 
-const GROUPED = new Set(["tool", "permission", "task"]);
+const GROUPED = new Set(["tool", "permission", "answered", "task"]);
 
 function exchange(ex, lastReply) {
   const out = [];
@@ -1595,6 +1774,24 @@ function step(item) {
       h("span", {
         class: "step-text",
         text: `Asked permission: ${toolName(item.tool)}${item.summary ? ` ${item.summary}` : ""}`,
+      }),
+    );
+  }
+  if (item.kind === "answered") {
+    const what = {
+      allow: item.tool === "ExitPlanMode" ? "Approved the plan" : "Allowed",
+      always: "Always allowed",
+      deny: item.tool === "ExitPlanMode" ? "Kept planning" : "Denied",
+      answer: "Answered",
+    }[item.action];
+    return h(
+      "li",
+      { class: "step-ask" },
+      time,
+      h("span", { class: "step-icon", text: "✓" }),
+      h("span", {
+        class: "step-text",
+        text: `${what || "Answered"} from ${item.via === "notification" ? "a notification" : "ccdash"}`,
       }),
     );
   }
@@ -2437,36 +2634,121 @@ function attachBrush(svg, { x0, x1, from, to, snap = (t) => t, onselect }) {
 
 // --- workspaces ---------------------------------------------------------------
 
-const inWorkspace = (s) => !state.workspace || s.workspace === state.workspace;
+/** The remembered workspace filter; takes over the single pick of old versions. */
+function loadPicked() {
+  try {
+    const picked = JSON.parse(localStorage.getItem(WORKSPACES_KEY));
+    if (Array.isArray(picked))
+      return picked.filter((n) => typeof n === "string");
+  } catch {}
+  const old = localStorage.getItem(OLD_WORKSPACE_KEY);
+  localStorage.removeItem(OLD_WORKSPACE_KEY);
+  return old ? [old] : [];
+}
+
+const inWorkspace = (s) =>
+  !state.picked.length || state.picked.includes(s.workspace);
 const workspaceParam = () =>
-  state.workspace ? `&workspace=${encodeURIComponent(state.workspace)}` : "";
+  state.picked.length
+    ? `&workspace=${state.picked.map(encodeURIComponent).join(",")}`
+    : "";
+
+/** "All" until something is picked, so the closed control names nothing. */
+function pickedLabel() {
+  const picked = state.picked;
+  if (!picked.length) return "All";
+  return picked.length === 1 ? picked[0] : `${picked.length} workspaces`;
+}
 
 function renderScopebar() {
   const bar = $("#scopebar");
   const names = state.workspaces;
   bar.hidden = !names.length;
   if (!names.length) return;
-  if (state.workspace && !names.includes(state.workspace))
-    state.workspace = null;
-  fill(
-    bar,
+  const kept = state.picked.filter((n) => names.includes(n));
+  if (kept.length !== state.picked.length) setPicked(kept, false);
+  const trigger = h(
+    "button",
+    {
+      class: "scope-trigger",
+      type: "button",
+      "aria-haspopup": "dialog",
+      title: "Filter by workspace",
+      onclick: () => openWorkspaceForm(trigger),
+    },
     h("span", { class: "scope-label", text: "Workspace" }),
-    ...[null, ...names].map((name) =>
-      h("button", {
-        type: "button",
-        role: "radio",
-        "aria-checked": String(state.workspace === name),
-        text: name ?? "All",
-        onclick: () => setWorkspace(name),
-      }),
-    ),
+    h("span", { class: "scope-value", text: pickedLabel() }),
+    h("span", { class: "scope-caret", "aria-hidden": "true", text: "▾" }),
   );
+  fill(bar, trigger);
 }
 
-function setWorkspace(name) {
-  state.workspace = name;
-  if (name) localStorage.setItem(WORKSPACE_KEY, name);
-  else localStorage.removeItem(WORKSPACE_KEY);
+/** Checkboxes in a popover under `anchor` (a bottom sheet on a phone);
+ * every change applies at once. */
+function openWorkspaceForm(anchor) {
+  const dialog = $("#workspace-dialog");
+  const touch = touchLayout();
+  const close = () => dialog.close();
+  const option = (name, checked, onchange) =>
+    h(
+      "label",
+      { class: "scope-option" },
+      h("input", { type: "checkbox", checked, onchange }),
+      h("span", { text: name ?? "All" }),
+    );
+  const render = () =>
+    fill(
+      dialog,
+      h(
+        "form",
+        {
+          class: "scope-form",
+          onsubmit: (event) => (event.preventDefault(), close()),
+        },
+        h("h3", { text: "Workspaces" }),
+        option(null, !state.picked.length, () => {
+          setPicked([]);
+          render();
+        }),
+        state.workspaces.map((name) =>
+          option(name, state.picked.includes(name), (event) => {
+            const rest = state.picked.filter((n) => n !== name);
+            setPicked(
+              event.target.checked
+                ? state.workspaces.filter((n) => n === name || rest.includes(n))
+                : rest,
+            );
+            render();
+          }),
+        ),
+        touch
+          ? h("button", { class: "btn", type: "submit", text: "Done" })
+          : null,
+      ),
+    );
+  render();
+  dialog.className = touch ? "range-sheet" : "range-popover";
+  // NOTE: a handler property returning false cancels the click
+  dialog.onclick = (event) => {
+    if (event.target === dialog) close();
+  };
+  dialog.showModal();
+  if (!touch) {
+    const box = anchor.getBoundingClientRect();
+    dialog.style.top = `${box.bottom + 8}px`;
+    dialog.style.left = `${Math.max(8, Math.min(box.left, innerWidth - dialog.offsetWidth - 8))}px`;
+  } else {
+    dialog.style.top = "";
+    dialog.style.left = "";
+  }
+}
+
+function setPicked(picked, reload = true) {
+  state.picked = picked;
+  if (picked.length)
+    localStorage.setItem(WORKSPACES_KEY, JSON.stringify(picked));
+  else localStorage.removeItem(WORKSPACES_KEY);
+  if (!reload) return;
   renderScopebar();
   scheduleRender();
   if (!$("#view-history").hidden) loadHistory();
@@ -4611,7 +4893,9 @@ function limitsSection(data, width, half) {
   const total = l.shares.reduce((n, sh) => n + sh.cost_usd, 0);
   if (total > 0) {
     const rows = l.shares.map((sh) => ({
-      label: sh.workspace ?? "Outside the workspaces",
+      label: sh.other
+        ? "Other workspaces"
+        : (sh.workspace ?? "Outside the workspaces"),
       cost: sh.cost_usd,
       total: sh.cost_usd,
       parts: [[sh.cost_usd, null]],
@@ -4642,7 +4926,7 @@ function limitsSection(data, width, half) {
     scoped,
     h("div", { class: "chart-pair" }, windows, shares),
     note(
-      `Limits are account-wide: the workspace filter doesn't apply, and only the 5-hour windows follow the time range.${l.scoped.length ? ` ${l.scoped.map((sc) => sc.label).join(" and ")} readings come from /usage every 10 minutes.` : ""}`,
+      `Limits are account-wide: the workspace filter doesn't apply (the workspaces it leaves out share one row in "This week by workspace"), and only the 5-hour windows follow the time range.${l.scoped.length ? ` ${l.scoped.map((sc) => sc.label).join(" and ")} readings come from /usage every 10 minutes.` : ""}`,
     ),
   ];
 }

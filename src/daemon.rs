@@ -1,5 +1,6 @@
 use std::{
     fs::Permissions,
+    net::SocketAddr,
     os::unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
     path::Path,
     sync::Arc,
@@ -10,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use tokio::{
     net::{TcpListener, UnixDatagram, UnixListener},
     signal::unix::{SignalKind, signal},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 use tracing::{debug, info, warn};
 
@@ -18,12 +19,14 @@ use crate::{
     agents,
     api::{http, unix},
     config::Config,
-    hub::{Cmd, Hub, Input},
-    niri, otlp, paths, procs,
+    hub::{Cmd, Hub, Input, Notes},
+    niri,
+    notify::{self, Composer},
+    otlp, paths, procs,
     state::State,
     store::Store,
     usage,
-    util::now_ms,
+    util::{self, now_ms},
     wire::{self, Envelope},
     workspace::Workspaces,
 };
@@ -54,9 +57,24 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     let workspaces = Workspaces::new(&cfg.workspaces.dirs, &home);
     let store = Store::open(&cfg.store_path(), host.clone(), cfg.store.retention_days)?;
     let token = Arc::new(http::load_token(&cfg)?);
+    let notes = (!cfg.notify.url.is_empty()).then(|| {
+        let web_url = cfg.notify.web_url.clone().unwrap_or_else(|| {
+            let port = cfg.http.listen.first().map_or(7837, SocketAddr::port);
+            let host = util::lan_address().map_or_else(|| host.clone(), |ip| ip.to_string());
+            util::base_url(&host, port)
+        });
+        info!("notifications to {} link to {web_url}", cfg.notify.url);
+        let (tx, rx) = watch::channel(Vec::new());
+        tokio::spawn(notify::run(cfg.notify.clone(), rx));
+        Notes {
+            composer: Composer::new(cfg.notify.clone(), web_url, now_ms()),
+            tx,
+        }
+    });
     let hub = Hub::spawn(
         State::new(host.clone(), cfg.niri.terminals.clone(), workspaces.clone()),
         store.clone(),
+        notes,
     );
 
     let ingest = UnixDatagram::bind(replace(&ingest_path)?)

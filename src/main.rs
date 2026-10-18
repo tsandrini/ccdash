@@ -2,6 +2,7 @@ mod actions;
 mod agents;
 mod analytics;
 mod api;
+mod ask;
 mod channel;
 mod client;
 mod command;
@@ -14,6 +15,7 @@ mod hub;
 mod markdown;
 mod model;
 mod niri;
+mod notify;
 mod otlp;
 mod paths;
 mod procs;
@@ -49,6 +51,9 @@ enum Command {
     },
     /// Claude Code hook: forward the hook payload on stdin to the daemon.
     Emit,
+    /// Claude Code PermissionRequest hook: hold the prompt open so ccdash can
+    /// answer it, alongside the terminal dialog.
+    Ask,
     /// Statusline wrapper: forward stdin to the daemon, then run COMMAND on it.
     Tee {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -78,8 +83,8 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
     },
-    /// MCP server for Claude Code's `--channels`: relays replies and
-    /// permission answers from ccdash into the session.
+    /// MCP server for Claude Code's `--channels`: relays replies from
+    /// ccdash into the session.
     Channel,
     /// Print the web UI address including the access token.
     Url {
@@ -101,6 +106,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Emit => return exit(emit::run(Source::Hook, &[])),
+        Command::Ask => return exit(ask::run()),
         Command::Tee { command } => return exit(emit::run(Source::Statusline, &command)),
         Command::Daemon { config } => run_daemon(config),
         Command::Status { json } => client::status(json),

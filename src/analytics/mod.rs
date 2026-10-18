@@ -280,7 +280,7 @@ pub fn analytics(
             ORDER BY e.ts, e.rowid"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -375,7 +375,7 @@ fn session_events(
             ORDER BY e.session, e.ts, e.rowid"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
         |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -451,7 +451,8 @@ fn sample_deltas(
             WHERE s.ts >= :since AND s.ts < :until AND {IN_SCOPE}
             ORDER BY s.session, s.ts"
     ))?;
-    let params = named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir};
+    let params =
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()};
     let rows = stmt.query_map(params, |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -546,7 +547,8 @@ fn resources(
             FROM proc_samples p LEFT JOIN sessions x ON x.id = p.session
             WHERE p.ts >= :since AND p.ts < :until AND {IN_SCOPE} ORDER BY p.ts"
     ))?;
-    let params = named_params! {":since": scope.since, ":until": scope.until, ":dir": scope.dir};
+    let params =
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()};
     let rows = stmt.query_map(params, |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -651,7 +653,7 @@ mod tests {
             since: t0,
             until: t0 + 4 * DAY_MS,
             now: t0 + 4 * DAY_MS,
-            dir: dir.map(str::to_owned),
+            dirs: dir.map(|d| vec![d.to_owned()]),
         };
         let all = analytics(&conn, &scope(None), 0, &[], None, &Workspaces::default()).unwrap();
         assert_eq!((all.bucket_ms, all.buckets.len()), (DAY_MS, 4));
@@ -732,7 +734,7 @@ mod tests {
             since: t0,
             until: t0 + 300_000,
             now: t0 + 300_000,
-            dir: None,
+            dirs: None,
         };
         let a = analytics(&conn, &scope, 0, &[], None, &Workspaces::default()).unwrap();
         assert_eq!((a.bucket_ms, a.buckets.len()), (HOUR_MS, 1));

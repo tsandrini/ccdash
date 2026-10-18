@@ -126,17 +126,50 @@ pub struct ProcInfo {
     pub started_at: i64,
 }
 
-/// A permission prompt relayed by the session's ccdash channel; answering it
-/// with `request_id` resolves the terminal dialog too.
+/// A prompt Claude Code holds open, relayed by `ccdash ask` (the
+/// PermissionRequest hook). The terminal dialog stays open alongside it;
+/// whichever answer comes first wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionAsk {
-    pub request_id: String,
-    pub tool: String,
-    /// What the call does, in Claude's words.
-    pub description: String,
-    /// The call's arguments as JSON-shaped text.
-    pub preview: String,
+pub struct Ask {
+    pub id: String,
+    /// The subagent that asked; None for the main thread.
+    pub agent_id: Option<String>,
     pub at: i64,
+    #[serde(flatten)]
+    pub kind: AskKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AskKind {
+    /// A tool call waiting for approval.
+    Tool {
+        tool: String,
+        /// What the call does, in Claude's words, when it said.
+        description: Option<String>,
+        /// The call's arguments as `(field, text)`, shortened.
+        input: Vec<(String, String)>,
+        /// What "always allow" would allow, from Claude Code's suggestions.
+        always: Option<String>,
+    },
+    /// `AskUserQuestion`: one to four multiple-choice questions.
+    Question { questions: Vec<Question> },
+    /// `ExitPlanMode`: a plan to approve, as markdown.
+    Plan { plan: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<Choice>,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub label: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +252,8 @@ pub struct Session {
     pub renaming: bool,
     /// The session runs the ccdash channel, so it takes replies.
     pub channel: bool,
-    pub permission_ask: Option<PermissionAsk>,
+    /// Open prompts ccdash can answer, oldest first.
+    pub asks: Vec<Ask>,
     /// Replies sent through the channel that Claude has not picked up yet.
     pub outbox: Vec<Stamped>,
     pub resources: Option<Resources>,

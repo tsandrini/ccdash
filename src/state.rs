@@ -6,8 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    ask::Answer,
     model::{
-        Activity, Kind, Limit, PARKED_AFTER_MS, PermissionAsk, ProcInfo, RateLimits, Resources,
+        Activity, Ask, AskKind, Kind, Limit, PARKED_AFTER_MS, ProcInfo, RateLimits, Resources,
         ScopedLimit, Session, Snapshot, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
         WindowRef,
     },
@@ -38,6 +39,7 @@ const PROC_SAMPLE_EVERY_MS: i64 = 60_000;
 /// A session starting this soon after Claude ran `claude --bg` is its child.
 const SPAWN_LINK_MS: i64 = 60_000;
 const MAX_OUTBOX: usize = 10;
+const MAX_ASKS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
@@ -155,6 +157,9 @@ struct Aux {
     last_sample: Option<(i64, Option<f64>)>,
     /// `agent_id` of the pending permission request (None = main thread).
     permission_agent: Option<String>,
+    /// When each agent (None = main thread) last got a tool result: a
+    /// permission prompt from before then is already answered.
+    resolved_at: HashMap<Option<String>, i64>,
     /// `(subagent_type, description)` of Agent calls awaiting SubagentStart.
     pending_agents: Vec<(String, Option<String>)>,
     /// TaskCreate `activeForm` by subject, until the task id is known.
@@ -368,6 +373,7 @@ impl State {
                 s.message = None;
                 s.tool = None;
                 s.waiting_for = None;
+                s.asks.clear();
                 s.turn = Some(Turn {
                     started_at: ts,
                     ..Turn::default()
@@ -430,13 +436,21 @@ impl State {
             }
             "PermissionRequest" => {
                 let summary = tool_summary(tool_name, tool_input, &s.cwd);
-                s.waiting_for = Some(if summary.is_empty() {
-                    tool_name.to_owned()
-                } else {
-                    format!("{tool_name}: {summary}")
-                });
-                aux.permission_agent = agent_id.map(str::to_owned);
-                set_activity(s, Activity::Permission, ts, store);
+                // NOTE: `ccdash ask` sends this over api.sock, so it can trail the
+                // tool result that answered it
+                let answered = aux
+                    .resolved_at
+                    .get(&agent_id.map(str::to_owned))
+                    .is_some_and(|at| *at > ts);
+                if !answered {
+                    s.waiting_for = Some(if summary.is_empty() {
+                        tool_name.to_owned()
+                    } else {
+                        format!("{tool_name}: {summary}")
+                    });
+                    aux.permission_agent = agent_id.map(str::to_owned);
+                    set_activity(s, Activity::Permission, ts, store);
+                }
                 record(
                     store,
                     ts,
@@ -467,6 +481,8 @@ impl State {
             }
             "PostToolUse" | "PostToolUseFailure" => {
                 let ok = event == "PostToolUse";
+                aux.resolved_at.insert(agent_id.map(str::to_owned), ts);
+                close_asks(s, agent_id, Some(tool_name));
                 if ok {
                     for delta in task_deltas(&s.tasks, tool_name, tool_input, p, aux) {
                         apply_and_record_task(s, &delta, ts, store);
@@ -503,11 +519,12 @@ impl State {
                 }
                 if s.activity == Activity::Permission && aux.permission_agent.as_deref() == agent_id
                 {
-                    s.waiting_for = None;
-                    set_activity(s, Activity::Working, ts, store);
+                    end_permission(s, &mut aux.permission_agent, ts, store);
                 }
             }
             "PermissionDenied" => {
+                aux.resolved_at.insert(agent_id.map(str::to_owned), ts);
+                close_asks(s, agent_id, Some(tool_name));
                 record(
                     store,
                     ts,
@@ -526,8 +543,7 @@ impl State {
                     || (s.activity == Activity::Permission
                         && aux.permission_agent.as_deref() == agent_id)
                 {
-                    s.waiting_for = None;
-                    set_activity(s, Activity::Working, ts, store);
+                    end_permission(s, &mut aux.permission_agent, ts, store);
                 }
             }
             "Stop" => {
@@ -576,6 +592,7 @@ impl State {
                 }
             }
             "SubagentStop" => {
+                close_asks(s, agent_id, None);
                 let done = s
                     .subagents
                     .iter()
@@ -856,24 +873,6 @@ impl State {
         }
     }
 
-    /// Shows a permission prompt relayed by the channel of `pid`.
-    pub fn permission_ask(&mut self, pid: u32, ask: PermissionAsk, fx: &mut Effects) {
-        let Some(id) = self.by_pid(pid).map(|s| s.id.clone()) else {
-            return;
-        };
-        let s = self.sessions.get_mut(&id).expect("found above");
-        s.permission_ask = Some(ask);
-        fx.touched.insert(id);
-    }
-
-    /// The live session run by `pid`.
-    pub fn by_pid(&self, pid: u32) -> Option<&Session> {
-        self.sessions
-            .values()
-            .filter(|s| s.activity != Activity::Gone && s.pid == Some(pid))
-            .max_by_key(|s| s.last_event_at)
-    }
-
     /// Shows a reply sent through the channel until Claude picks it up.
     pub fn sent_reply(&mut self, id: &str, text: &str, now: i64, fx: &mut Effects) {
         let Some(s) = self.sessions.get_mut(id) else {
@@ -888,15 +887,84 @@ impl State {
         fx.touched.insert(id.to_owned());
     }
 
-    /// Forgets the permission prompt `request_id` once it is answered.
-    pub fn answered(&mut self, id: &str, request_id: &str, fx: &mut Effects) {
-        if let Some(s) = self.sessions.get_mut(id)
-            && s.permission_ask
-                .take_if(|a| a.request_id == request_id)
-                .is_some()
-        {
-            fx.touched.insert(id.to_owned());
+    /// Shows a prompt `ccdash ask` holds open; false if the session is
+    /// unknown or ended, or a tool result already answered the prompt.
+    pub fn add_ask(&mut self, session: &str, ask: Ask, fx: &mut Effects) -> bool {
+        let Some(s) = self
+            .sessions
+            .get_mut(session)
+            .filter(|s| s.activity != Activity::Gone)
+        else {
+            return false;
+        };
+        let answered = self
+            .aux
+            .get(session)
+            .and_then(|aux| aux.resolved_at.get(&ask.agent_id))
+            .is_some_and(|at| *at > ask.at);
+        if answered {
+            return false;
         }
+        s.asks.push(ask);
+        let excess = s.asks.len().saturating_sub(MAX_ASKS);
+        s.asks.drain(..excess);
+        fx.touched.insert(session.to_owned());
+        true
+    }
+
+    pub fn ask(&self, session: &str, id: &str) -> Option<&Ask> {
+        self.sessions.get(session)?.asks.iter().find(|a| a.id == id)
+    }
+
+    /// Takes the ask `id` off its session, e.g. once its hook went away.
+    pub fn remove_ask(&mut self, session: &str, id: &str, fx: &mut Effects) -> Option<Ask> {
+        let s = self.sessions.get_mut(session)?;
+        let i = s.asks.iter().position(|a| a.id == id)?;
+        fx.touched.insert(session.to_owned());
+        Some(s.asks.remove(i))
+    }
+
+    /// Closes an ask ccdash answered and records how. An answer that
+    /// stops Claude ends the turn: no hook reports an interrupt.
+    pub fn answered(
+        &mut self,
+        session: &str,
+        id: &str,
+        answer: &Answer,
+        via: &str,
+        now: i64,
+        fx: &mut Effects,
+    ) {
+        let Some(ask) = self.remove_ask(session, id, fx) else {
+            return;
+        };
+        let store = &mut fx.store;
+        record(
+            store,
+            now,
+            session,
+            "answered",
+            json!({ "tool": ask_tool(&ask.kind), "action": answer.name(), "via": via }),
+        );
+        if answer.interrupts()
+            && let Some(s) = self.sessions.get_mut(session)
+        {
+            s.tool = None;
+            s.waiting_for = None;
+            if let Some(turn) = &mut s.turn {
+                turn.ended_at = Some(now);
+            }
+            set_activity(s, Activity::YourTurn, now, store);
+        }
+    }
+
+    pub fn sessions(&self) -> impl Iterator<Item = &Session> {
+        self.sessions.values()
+    }
+
+    /// The niri window id with keyboard focus.
+    pub fn focused(&self) -> Option<u64> {
+        self.focused
     }
 
     /// Live sessions with a known process.
@@ -937,9 +1005,15 @@ impl State {
             if e.name.is_some() {
                 s.name = e.name.clone();
             }
-            if quiet && let Some(to) = agent_activity(e, s) {
+            // NOTE: an open ask means a live hook holds the prompt, whatever the poll says
+            if quiet
+                && s.asks.is_empty()
+                && let Some(to) = agent_activity(e, s)
+            {
                 if to == Activity::Permission {
                     s.waiting_for = e.waiting_for.clone();
+                } else if s.activity == Activity::Permission {
+                    s.waiting_for = None;
                 }
                 set_activity(s, to, now, &mut fx.store);
             }
@@ -1123,7 +1197,7 @@ impl State {
             hooked: false,
             renaming: false,
             channel: false,
-            permission_ask: None,
+            asks: Vec::new(),
             outbox: Vec::new(),
             resources: None,
             turn: None,
@@ -1291,6 +1365,45 @@ fn channel_text(prompt: &str) -> Option<String> {
         rest = after.trim_start();
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The agent that raised the permission wait got its answer: the session
+/// works on, or waits on the next open ask.
+fn end_permission(
+    s: &mut Session,
+    permission_agent: &mut Option<String>,
+    ts: i64,
+    store: &mut Vec<StoreMsg>,
+) {
+    let Some(next) = s.asks.first() else {
+        s.waiting_for = None;
+        set_activity(s, Activity::Working, ts, store);
+        return;
+    };
+    *permission_agent = next.agent_id.clone();
+    s.waiting_for = Some(match &next.kind {
+        AskKind::Tool { tool, input, .. } => match input.first() {
+            Some((_, value)) => truncate(&format!("{tool}: {value}"), SUMMARY_LEN),
+            None => tool.clone(),
+        },
+        other => ask_tool(other).to_owned(),
+    });
+}
+
+/// Closes the asks of `agent` (None = main thread), only those of `tool`
+/// when given.
+fn close_asks(s: &mut Session, agent: Option<&str>, tool: Option<&str>) {
+    s.asks
+        .retain(|a| a.agent_id.as_deref() != agent || tool.is_some_and(|t| t != ask_tool(&a.kind)));
+}
+
+/// The tool behind an ask.
+pub fn ask_tool(kind: &AskKind) -> &str {
+    match kind {
+        AskKind::Tool { tool, .. } => tool,
+        AskKind::Question { .. } => "AskUserQuestion",
+        AskKind::Plan { .. } => "ExitPlanMode",
+    }
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -1476,8 +1589,8 @@ fn set_activity(s: &mut Session, to: Activity, ts: i64, store: &mut Vec<StoreMsg
     if s.activity == to {
         return;
     }
-    if to != Activity::Permission {
-        s.permission_ask = None;
+    if !matches!(to, Activity::Permission | Activity::Working) {
+        s.asks.clear();
     }
     record(
         store,
@@ -1551,6 +1664,10 @@ fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {
         "WebFetch" => field("url").map(str::to_owned),
         "WebSearch" | "ToolSearch" => field("query").map(str::to_owned),
         "Skill" => field("skill").map(str::to_owned),
+        "AskUserQuestion" => input
+            .pointer("/questions/0/question")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         "TaskCreate" => field("subject").map(str::to_owned),
         "TaskUpdate" => input.get("taskId").and_then(id_of).map(|id| {
             let status = field("status").map(|s| s.replace('_', " "));
@@ -2482,39 +2599,76 @@ mod tests {
     }
 
     #[test]
-    fn relayed_permission_asks_end_with_the_prompt() {
+    fn asks_close_with_their_prompt() {
         let mut st = state();
-        let pid = std::process::id();
-        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
-        let ask = PermissionAsk {
-            request_id: "abcde".into(),
-            tool: "Bash".into(),
-            description: "List files".into(),
-            preview: "{ \"command\": \"ls\" }".into(),
-            at: 2,
+        let ask = |id: &str, at: i64, agent: Option<&str>| Ask {
+            id: id.into(),
+            agent_id: agent.map(str::to_owned),
+            at,
+            kind: AskKind::Tool {
+                tool: "Bash".into(),
+                description: None,
+                input: vec![("command".into(), "ls".into())],
+                always: None,
+            },
         };
-        st.permission_ask(pid, ask.clone(), &mut Effects::default());
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        let bash = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+        hook(&mut st, 2, "PermissionRequest", bash.clone());
+        assert!(st.add_ask(SID, ask("a", 2, None), &mut Effects::default()));
+        assert!(st.add_ask(SID, ask("s", 2, Some("sub")), &mut Effects::default()));
+        assert!(st.ask(SID, "a").is_some());
+
+        // A different tool's result leaves the prompt open; this one's closes it.
         hook(
             &mut st,
             3,
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {}}),
+        );
+        assert!(st.ask(SID, "a").is_some());
+        hook(&mut st, 4, "PostToolUse", bash.clone());
+        assert!(st.ask(SID, "a").is_none());
+        assert!(st.ask(SID, "s").is_some(), "the subagent's prompt stays");
+
+        // A prompt that arrives after its own answer is not shown.
+        assert!(!st.add_ask(SID, ask("late", 3, None), &mut Effects::default()));
+        let mut fx = Effects::default();
+        hook(&mut st, 5, "PermissionRequest", bash.clone());
+        assert!(st.add_ask(SID, ask("b", 5, None), &mut fx));
+        st.answered(SID, "b", &Answer::Allow, "web", 6, &mut fx);
+        assert!(st.ask(SID, "b").is_none());
+        assert!(kinds(&fx).contains(&"answered"));
+
+        // The session moving on clears whatever is left.
+        hook(
+            &mut st,
+            7,
+            "Stop",
+            json!({"last_assistant_message": "done"}),
+        );
+        assert!(session(&st).asks.is_empty());
+    }
+
+    #[test]
+    fn the_poll_leaves_a_held_prompt_alone() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        hook(
+            &mut st,
+            2,
             "PermissionRequest",
             json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
         );
-        assert_eq!(session(&st).permission_ask.as_ref(), Some(&ask));
-
-        st.answered(SID, "zzzzz", &mut Effects::default());
-        assert!(session(&st).permission_ask.is_some(), "other ids stay open");
-        hook(
-            &mut st,
-            4,
-            "PostToolUse",
-            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
-        );
-        assert!(session(&st).permission_ask.is_none());
-
-        st.permission_ask(pid, ask, &mut Effects::default());
-        st.answered(SID, "abcde", &mut Effects::default());
-        assert!(session(&st).permission_ask.is_none());
+        let held = Ask {
+            id: "a".into(),
+            agent_id: None,
+            at: 2,
+            kind: AskKind::Plan { plan: "p".into() },
+        };
+        assert!(st.add_ask(SID, held, &mut Effects::default()));
+        agents(&mut st, 60_000, "interactive", "idle");
+        assert_eq!(session(&st).activity, Activity::Permission);
     }
 
     #[test]
@@ -2564,6 +2718,11 @@ mod tests {
                 "Agent",
                 json!({"description": "Find callers"}),
                 "Find callers",
+            ),
+            (
+                "AskUserQuestion",
+                json!({"questions": [{"question": "Which one?"}]}),
+                "Which one?",
             ),
         ];
         for (name, input, want) in cases {
