@@ -4,7 +4,8 @@
 //! `{"cmd":"rename","id":"…","title":"…"}`, `{"cmd":"reply","id":"…","text":"…"}`,
 //! `{"cmd":"answer","id":"…","ask":"…","answer":{"action":"allow"}}` (see
 //! `crate::ask::Answer`). Replies carry a `type`: `snapshot`, `session`,
-//! `removed`, `rate_limits`, `ok`, `error`.
+//! `removed`, `rate_limits`, `ok`, `error`. Reads come from the mirror of
+//! this host's sessions; rename, reply and answer go to the hub.
 //!
 //! `{"cmd":"channel","pid":N}` turns the connection into the link of a
 //! `ccdash channel` (see `crate::channel`); `{"cmd":"ask","envelope":{…}}`
@@ -29,13 +30,8 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::{
-    actions,
-    ask::Answer,
-    config::Config,
-    hub::{Cmd, Hub},
-    wire::Envelope,
-};
+use super::{Local, LocalCmd};
+use crate::{actions, ask::Answer, config::CollectorConfig, protocol::Call, wire::Envelope};
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -66,13 +62,13 @@ enum Request {
     },
 }
 
-pub async fn serve(listener: UnixListener, hub: Hub, cfg: Arc<Config>) {
+pub async fn serve(listener: UnixListener, local: Local, cfg: Arc<CollectorConfig>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (hub, cfg) = (hub.clone(), cfg.clone());
+                let (local, cfg) = (local.clone(), cfg.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, hub, cfg).await {
+                    if let Err(e) = handle(stream, local, cfg).await {
                         debug!("api client: {e:#}");
                     }
                 });
@@ -82,52 +78,79 @@ pub async fn serve(listener: UnixListener, hub: Hub, cfg: Arc<Config>) {
     }
 }
 
-async fn handle(stream: UnixStream, hub: Hub, cfg: Arc<Config>) -> Result<()> {
+async fn handle(stream: UnixStream, local: Local, cfg: Arc<CollectorConfig>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<Request>(&line) {
             Err(e) => error(format!("bad request: {e}")),
-            Ok(Request::Snapshot) => tagged("snapshot", &hub.snapshot().await?),
-            Ok(Request::Subscribe) => return subscribe(write, hub).await,
-            Ok(Request::Open { id }) => match actions::open(&hub, &cfg.attach.command, &id).await {
-                Ok(message) => json!({ "type": "ok", "message": message }),
-                Err(e) => error(format!("{e:#}")),
-            },
-            Ok(Request::Rename { id, title }) => match hub.rename(&id, &title).await? {
-                Ok(_) => json!({
-                    "type": "ok",
-                    "message": "renamed; Claude Code adopts it at the next prompt",
-                }),
-                Err(e) => error(e),
-            },
-            Ok(Request::Reply { id, text }) => match hub.reply(&id, &text).await? {
-                Ok(_) => json!({ "type": "ok", "message": "sent" }),
-                Err(e) => error(e),
-            },
-            Ok(Request::Answer { id, ask, answer }) => match hub.answer(&id, &ask, answer).await? {
-                Ok(_) => json!({ "type": "ok", "message": "answered" }),
-                Err(e) => error(e),
-            },
-            Ok(Request::Channel { pid }) => return channel(lines, write, hub, pid).await,
-            Ok(Request::Ask { envelope }) => return ask(lines, write, hub, envelope).await,
+            Ok(Request::Snapshot) => tagged("snapshot", &local.snapshot().await?),
+            Ok(Request::Subscribe) => return subscribe(write, local).await,
+            Ok(Request::Open { id }) => {
+                match actions::open(&local, &cfg.attach.command, &id).await {
+                    Ok(message) => json!({ "type": "ok", "message": message }),
+                    Err(e) => error(format!("{e:#}")),
+                }
+            }
+            Ok(Request::Rename { id, title }) => {
+                let session = resolve(&local, &id).await?;
+                match local.call(Call::Rename { session, title }).await? {
+                    Ok(_) => json!({
+                        "type": "ok",
+                        "message": "renamed; Claude Code adopts it at the next prompt",
+                    }),
+                    Err(e) => error(e),
+                }
+            }
+            Ok(Request::Reply { id, text }) => {
+                let session = resolve(&local, &id).await?;
+                match local.call(Call::Reply { session, text }).await? {
+                    Ok(_) => json!({ "type": "ok", "message": "sent" }),
+                    Err(e) => error(e),
+                }
+            }
+            Ok(Request::Answer { id, ask, answer }) => {
+                let session = resolve(&local, &id).await?;
+                match local
+                    .call(Call::Answer {
+                        session,
+                        ask,
+                        answer,
+                    })
+                    .await?
+                {
+                    Ok(_) => json!({ "type": "ok", "message": "answered" }),
+                    Err(e) => error(e),
+                }
+            }
+            Ok(Request::Channel { pid }) => return channel(lines, write, local, pid).await,
+            Ok(Request::Ask { envelope }) => return ask(lines, write, local, envelope).await,
         };
         send(&mut write, &reply).await?;
     }
     Ok(())
 }
 
-/// Relays between the hub and one `ccdash channel` until either side leaves.
+/// The full id behind a key the mirror knows; unknown keys pass through
+/// for the hub to judge.
+async fn resolve(local: &Local, key: &str) -> Result<String> {
+    Ok(local
+        .resolve(key)
+        .await?
+        .map_or_else(|| key.to_owned(), |s| s.id))
+}
+
+/// Relays between the actor and one `ccdash channel` until either side leaves.
 async fn channel(
     mut lines: Lines<BufReader<OwnedReadHalf>>,
     mut write: OwnedWriteHalf,
-    hub: Hub,
+    local: Local,
     pid: u32,
 ) -> Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let conn = NEXT.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel(32);
-    hub.send(Cmd::ChannelOpen(pid, conn, tx)).await?;
+    local.send(LocalCmd::ChannelOpen(pid, conn, tx)).await?;
     let result = async {
         loop {
             tokio::select! {
@@ -144,22 +167,22 @@ async fn channel(
         }
     }
     .await;
-    hub.send(Cmd::ChannelClosed(pid, conn)).await?;
+    local.send(LocalCmd::ChannelClosed(pid, conn)).await?;
     result
 }
 
-/// Holds a prompt for `ccdash ask` until ccdash answers it, the hub lets
-/// go of it, or the hook goes away.
+/// Holds a prompt for `ccdash ask` until the hub answers it, lets go of
+/// it, or the hook goes away.
 async fn ask(
     mut lines: Lines<BufReader<OwnedReadHalf>>,
     mut write: OwnedWriteHalf,
-    hub: Hub,
+    local: Local,
     envelope: Box<Envelope>,
 ) -> Result<()> {
     let (shown, id) = oneshot::channel();
     let (decide, decision) = oneshot::channel();
-    hub.send(Cmd::Ask(envelope, shown, decide)).await?;
-    let Ok(Some(id)) = id.await else {
+    local.send(LocalCmd::Ask(envelope, shown, decide)).await?;
+    let Ok(id) = id.await else {
         return Ok(());
     };
     tokio::select! {
@@ -168,19 +191,19 @@ async fn ask(
                 send(&mut write, &json!({ "type": "decision", "decision": decision })).await?;
             }
         }
-        _ = lines.next_line() => hub.send(Cmd::AskGone(id)).await?,
+        _ = lines.next_line() => local.send(LocalCmd::AskGone(id)).await?,
     }
     Ok(())
 }
 
-async fn subscribe(mut write: OwnedWriteHalf, hub: Hub) -> Result<()> {
-    let mut updates = hub.subscribe();
-    send(&mut write, &tagged("snapshot", &hub.snapshot().await?)).await?;
+async fn subscribe(mut write: OwnedWriteHalf, local: Local) -> Result<()> {
+    let mut updates = local.subscribe();
+    send(&mut write, &tagged("snapshot", &local.snapshot().await?)).await?;
     loop {
         match updates.recv().await {
-            Ok(update) => send(&mut write, &serde_json::to_value(&update)?).await?,
+            Ok(update) => send(&mut write, &update).await?,
             Err(RecvError::Lagged(_)) => {
-                send(&mut write, &tagged("snapshot", &hub.snapshot().await?)).await?;
+                send(&mut write, &tagged("snapshot", &local.snapshot().await?)).await?;
             }
             Err(RecvError::Closed) => return Ok(()),
         }

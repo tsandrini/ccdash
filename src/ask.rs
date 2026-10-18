@@ -14,7 +14,7 @@ use std::{
     os::unix::net::UnixStream,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -181,7 +181,7 @@ fn always(suggestions: &Value) -> (Option<String>, Vec<Value>) {
 }
 
 /// An answer from the web UI, the CLI or a notification button.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Answer {
     /// Allows the tool call or approves the plan.

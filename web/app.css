@@ -1869,6 +1869,7 @@ dl.ask-preview {
 
 .scopebar {
   display: flex;
+  gap: 8px;
   margin-bottom: 16px;
 }
 

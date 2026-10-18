@@ -92,7 +92,11 @@ let
 in
 {
   options.services.ccdash = {
-    enable = mkEnableOption "ccdash, a live dashboard for running Claude Code sessions";
+    enable = mkEnableOption ''
+      the ccdash collector: reports this machine's Claude Code sessions to
+      a ccdash hub (the NixOS module `services.ccdash-hub`) and carries out
+      what the hub sends back
+    '';
 
     package = mkOption {
       type = types.package;
@@ -101,17 +105,34 @@ in
       description = "The ccdash package.";
     };
 
+    hub = {
+      url = mkOption {
+        type = types.str;
+        example = "wss://ccdash.example.org/collect";
+        description = "The hub's `/collect` endpoint.";
+      };
+
+      tokenFile = mkOption {
+        type = types.str;
+        example = "\${XDG_RUNTIME_DIR}/agenix/ccdash-collector-token";
+        description = ''
+          File holding this machine's collector token, the one the hub
+          lists under this host name. `$VAR` and `''${VAR}` expand.
+        '';
+      };
+    };
+
     settings = mkOption {
       inherit (toml) type;
       default = { };
       example = literalExpression ''
         {
-          http.listen = [ "127.0.0.1:7837" "[::]:7837" ];
           niri.terminals = [ "com.mitchellh.ghostty" "foot" ];
+          procs.enable = false;
         }
       '';
       description = ''
-        Daemon configuration, written to
+        Collector configuration, written to
         {file}`$XDG_CONFIG_HOME/ccdash/config.toml`. Unset keys keep their
         built-in defaults.
       '';
@@ -127,7 +148,7 @@ in
     systemdTarget = mkOption {
       type = types.str;
       default = "graphical-session.target";
-      description = "systemd user target the daemon starts with.";
+      description = "systemd user target the collector starts with.";
     };
 
     claudeCode = {
@@ -181,8 +202,8 @@ in
           hits, API latency, commits, pull requests and edit decisions in
           the analytics view. Sets the `OTEL_*` variables in
           {option}`programs.claude-code.settings.env` and a loopback-only
-          receiver in the daemon; nothing leaves the machine, and prompt
-          text stays redacted
+          receiver in the collector, which forwards the kept records to
+          the hub; prompt text stays redacted
         '';
 
         port = mkOption {
@@ -216,17 +237,22 @@ in
     {
       home.packages = [ cfg.package ];
 
-      xdg.configFile."ccdash/config.toml" = mkIf (cfg.settings != { }) { source = configFile; };
+      services.ccdash.settings.hub = {
+        url = mkDefault cfg.hub.url;
+        token_file = mkDefault cfg.hub.tokenFile;
+      };
+
+      xdg.configFile."ccdash/config.toml".source = configFile;
 
       systemd.user.services.ccdash = {
         Unit = {
-          Description = "ccdash, live dashboard for Claude Code sessions";
+          Description = "ccdash collector, reports Claude Code sessions to the hub";
           PartOf = [ cfg.systemdTarget ];
           After = [ cfg.systemdTarget ];
-          X-Restart-Triggers = mkIf (cfg.settings != { }) [ "${configFile}" ];
+          X-Restart-Triggers = [ "${configFile}" ];
         };
         Service = {
-          ExecStart = "${exe} daemon";
+          ExecStart = "${exe} collector";
           Restart = "on-failure";
           RestartSec = 2;
         };

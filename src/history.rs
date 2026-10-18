@@ -64,6 +64,7 @@ pub struct Transition {
 
 struct Row {
     id: String,
+    host: String,
     cwd: String,
     name: Option<String>,
     title: Option<String>,
@@ -92,7 +93,7 @@ pub fn history(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<His
                 "SELECT count(*) FROM events e LEFT JOIN sessions x ON x.id = e.session
                     WHERE e.kind = 'prompt' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}"
             ),
-            named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
+            named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
             |r| r.get(0),
         )?,
         tools: tools(conn, scope)?,
@@ -107,7 +108,7 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
     let mut closes = closes_in(conn, scope)?;
     let mut lanes = Vec::new();
     for row in sessions_overlapping(conn, scope)? {
-        if !scope.contains(&row.cwd) {
+        if !scope.covers(&row.host, &row.cwd) {
             continue;
         }
         let current = live.get(row.id.as_str()).copied();
@@ -184,7 +185,7 @@ fn tools(conn: &Connection, scope: &Scope) -> Result<Vec<ToolCount>> {
             GROUP BY tool ORDER BY 2 DESC, tool LIMIT 12"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
         |r| {
             Ok(ToolCount {
                 name: r.get(0)?,
@@ -236,18 +237,19 @@ fn finished_is_idle(segments: &mut Vec<(i64, i64, Activity)>) {
 
 fn sessions_overlapping(conn: &Connection, scope: &Scope) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, cwd, name, title, kind, started_at, ended_at FROM sessions
+        "SELECT id, host, cwd, name, title, kind, started_at, ended_at FROM sessions
             WHERE started_at < ?2 AND (ended_at IS NULL OR ended_at >= ?1)",
     )?;
     let rows = stmt.query_map(params![scope.since, scope.until], |r| {
         Ok(Row {
             id: r.get(0)?,
-            cwd: r.get(1)?,
-            name: r.get(2)?,
-            title: r.get(3)?,
-            kind: r.get(4)?,
-            started_at: r.get(5)?,
-            ended_at: r.get(6)?,
+            host: r.get(1)?,
+            cwd: r.get(2)?,
+            name: r.get(3)?,
+            title: r.get(4)?,
+            kind: r.get(5)?,
+            started_at: r.get(6)?,
+            ended_at: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -353,7 +355,7 @@ fn cost(conn: &Connection, scope: &Scope) -> Result<f64> {
             GROUP BY s.session"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
         |r| {
             Ok((
                 r.get::<_, f64>(0)?,
@@ -385,6 +387,7 @@ mod tests {
             until,
             now: until,
             dirs: None,
+            host: None,
         }
     }
 

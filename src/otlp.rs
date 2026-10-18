@@ -18,10 +18,10 @@ use axum::{
     routing::post,
 };
 use serde_json::{Map, Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 use tracing::warn;
 
-use crate::{state::StoreMsg, store::Store, util::now_ms};
+use crate::{state::StoreMsg, util::now_ms};
 
 const MAX_BODY: usize = 16 << 20;
 /// Cumulative series remembered for deltas; cleared past this.
@@ -30,18 +30,19 @@ const PREFIX: &str = "claude_code.";
 
 #[derive(Clone)]
 struct Receiver {
-    store: Store,
+    /// Where the kept records go (the collector's hub link).
+    sink: mpsc::Sender<Vec<StoreMsg>>,
     /// Last value of each cumulative series, by name and attributes.
     last: Arc<Mutex<HashMap<String, f64>>>,
 }
 
-pub async fn serve(listener: TcpListener, store: Store) {
+pub async fn serve(listener: TcpListener, sink: mpsc::Sender<Vec<StoreMsg>>) {
     let app = Router::new()
         .route("/v1/metrics", post(metrics))
         .route("/v1/logs", post(logs))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(Receiver {
-            store,
+            sink,
             last: Arc::default(),
         });
     if let Err(e) = axum::serve(listener, app).await {
@@ -61,8 +62,8 @@ async fn metrics(State(r): State<Receiver>, headers: HeaderMap, body: Bytes) -> 
         }
         metric_records(&body, &mut last)
     };
-    for record in records {
-        r.store.send(record);
+    if !records.is_empty() {
+        let _ = r.sink.send(records).await;
     }
     Json(json!({})).into_response()
 }
@@ -72,8 +73,9 @@ async fn logs(State(r): State<Receiver>, headers: HeaderMap, body: Bytes) -> Res
         Ok(body) => body,
         Err(e) => return e.into_response(),
     };
-    for record in log_records(&body, now_ms()) {
-        r.store.send(record);
+    let records = log_records(&body, now_ms());
+    if !records.is_empty() {
+        let _ = r.sink.send(records).await;
     }
     Json(json!({})).into_response()
 }
@@ -153,7 +155,7 @@ fn metric_records(body: &Value, last: &mut HashMap<String, f64>) -> Vec<StoreMsg
                 out.push(StoreMsg::Telemetry {
                     ts: nanos_ms(&point["timeUnixNano"]).unwrap_or_else(now_ms),
                     session,
-                    name: kind,
+                    name: kind.to_owned(),
                     data,
                 });
             }
@@ -223,7 +225,7 @@ fn log_records(body: &Value, now: i64) -> Vec<StoreMsg> {
             out.push(StoreMsg::Telemetry {
                 ts,
                 session,
-                name,
+                name: name.to_owned(),
                 data,
             });
         }
@@ -333,7 +335,7 @@ mod tests {
         let StoreMsg::Telemetry { ts, name, data, .. } = &records[0] else {
             panic!()
         };
-        assert_eq!((*ts, *name), (1_791_889_474_282, "api_request"));
+        assert_eq!((*ts, name.as_str()), (1_791_889_474_282, "api_request"));
         assert_eq!(data["input"], 120.0);
         assert_eq!(data["cache_read"], 48000.0);
         assert_eq!(data["ms"], 2300.0);

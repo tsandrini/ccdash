@@ -12,7 +12,7 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    hub::{Cmd, Input},
+    collector::LocalCmd,
     state::{NiriEvent, Window},
 };
 
@@ -20,7 +20,7 @@ fn socket() -> Option<String> {
     std::env::var("NIRI_SOCKET").ok().filter(|s| !s.is_empty())
 }
 
-pub async fn run(tx: mpsc::Sender<Cmd>) {
+pub async fn run(tx: mpsc::Sender<LocalCmd>) {
     let Some(path) = socket() else {
         info!("NIRI_SOCKET unset, window tracking disabled");
         return;
@@ -34,7 +34,7 @@ pub async fn run(tx: mpsc::Sender<Cmd>) {
     }
 }
 
-async fn stream(path: &str, tx: &mpsc::Sender<Cmd>) -> Result<()> {
+async fn stream(path: &str, tx: &mpsc::Sender<LocalCmd>) -> Result<()> {
     let socket = UnixStream::connect(path).await.context("connecting")?;
     let (read, mut write) = socket.into_split();
     write.write_all(b"\"EventStream\"\n").await?;
@@ -46,7 +46,7 @@ async fn stream(path: &str, tx: &mpsc::Sender<Cmd>) -> Result<()> {
     info!("following niri events");
     while let Some(line) = lines.next_line().await? {
         if let Some(event) = parse_event(&line)
-            && tx.send(Cmd::Input(Input::Niri(event))).await.is_err()
+            && tx.send(LocalCmd::Niri(event)).await.is_err()
         {
             return Ok(());
         }

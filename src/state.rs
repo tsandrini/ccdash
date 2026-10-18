@@ -2,17 +2,16 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
     ask::Answer,
     model::{
         Activity, Ask, AskKind, Kind, Limit, PARKED_AFTER_MS, ProcInfo, RateLimits, Resources,
-        ScopedLimit, Session, Snapshot, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
-        WindowRef,
+        ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
     },
-    util::{pid_alive, tail, truncate},
+    util::{tail, truncate},
     wire::{Envelope, Source},
     workspace::Workspaces,
 };
@@ -41,7 +40,7 @@ const SPAWN_LINK_MS: i64 = 60_000;
 const MAX_OUTBOX: usize = 10;
 const MAX_ASKS: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     pub id: u64,
     pub app_id: String,
@@ -49,7 +48,8 @@ pub struct Window {
     pub focused: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum NiriEvent {
     Windows(Vec<Window>),
     WindowChanged(Window),
@@ -58,7 +58,7 @@ pub enum NiriEvent {
 }
 
 /// One entry of `claude agents --json`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentEntry {
     pub session_id: String,
@@ -122,7 +122,7 @@ pub enum StoreMsg {
     Telemetry {
         ts: i64,
         session: String,
-        name: &'static str,
+        name: String,
         data: Value,
     },
 }
@@ -182,7 +182,7 @@ struct ProcWindow {
 }
 
 /// One poll of a session's process tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcPoll {
     pub session: String,
     pub cpu_pct: f64,
@@ -206,6 +206,8 @@ pub struct State {
     spawns: Vec<(String, i64)>,
     /// Claude processes connected through `ccdash channel`.
     channel_pids: HashSet<u32>,
+    /// Pids the collector reported as no longer running.
+    dead: HashSet<u32>,
 }
 
 impl State {
@@ -221,7 +223,18 @@ impl State {
             focused: None,
             spawns: Vec::new(),
             channel_pids: HashSet::new(),
+            dead: HashSet::new(),
         }
+    }
+
+    /// Takes the collector's word on which known pids have exited; the
+    /// hub has no `/proc` of that machine.
+    pub fn report_dead(&mut self, dead: &[u32]) {
+        self.dead = dead.iter().copied().collect();
+    }
+
+    fn alive(&self, pid: Option<u32>) -> bool {
+        pid.is_some_and(|pid| !self.dead.contains(&pid))
     }
 
     pub fn session(&self, id: &str) -> Option<&Session> {
@@ -230,18 +243,6 @@ impl State {
 
     pub fn rate_limits(&self) -> Option<&RateLimits> {
         self.rate_limits.as_ref()
-    }
-
-    pub fn snapshot(&self, now: i64) -> Snapshot {
-        let mut sessions: Vec<Session> = self.sessions.values().cloned().collect();
-        sessions.sort_by_key(|s| s.started_at);
-        Snapshot {
-            host: self.host.clone(),
-            now,
-            workspaces: self.workspaces.names(),
-            sessions,
-            rate_limits: self.rate_limits.clone(),
-        }
     }
 
     /// Finds a session by full id, background short id, or unique id prefix.
@@ -967,15 +968,6 @@ impl State {
         self.focused
     }
 
-    /// Live sessions with a known process.
-    pub fn pids(&self) -> Vec<(String, u32)> {
-        self.sessions
-            .values()
-            .filter(|s| s.activity != Activity::Gone)
-            .filter_map(|s| Some((s.id.clone(), s.pid?)))
-            .collect()
-    }
-
     pub fn agents(&mut self, list: &[AgentEntry], now: i64, fx: &mut Effects) {
         let mut seen = HashSet::new();
         for e in list {
@@ -1029,7 +1021,7 @@ impl State {
             }
             let aux = self.aux.entry(id.clone()).or_default();
             aux.missing_polls = aux.missing_polls.saturating_add(1);
-            if aux.missing_polls >= 2 && !pid_alive(s.pid) {
+            if aux.missing_polls >= 2 && !self.alive(s.pid) {
                 vanished.push(id.clone());
             }
         }
@@ -1135,7 +1127,7 @@ impl State {
         let dead: Vec<String> = self
             .sessions
             .values()
-            .filter(|s| s.activity != Activity::Gone && s.pid.is_some() && !pid_alive(s.pid))
+            .filter(|s| s.activity != Activity::Gone && s.pid.is_some() && !self.alive(s.pid))
             .map(|s| s.id.clone())
             .collect();
         for id in dead {
@@ -2232,6 +2224,7 @@ mod tests {
 
         // Missing twice with a dead pid → gone.
         st.sessions.get_mut(SID).unwrap().pid = Some(u32::MAX);
+        st.report_dead(&[u32::MAX]);
         let mut fx = Effects::default();
         st.agents(&[], 200_000, &mut fx);
         assert_eq!(session(&st).activity, Activity::YourTurn);

@@ -1,7 +1,8 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
 //! replying to them and answering their prompts.
 //! Every `/api` route needs `Authorization: Bearer <token>`. `/act/{key}/…`
-//! takes the one-time key of a notification button instead.
+//! takes the one-time key of a notification button instead, `/collect`
+//! a collector's token (see `super::collect`).
 
 use std::{
     convert::Infallible,
@@ -30,14 +31,17 @@ use tokio::net::TcpListener;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::warn;
 
-use super::web;
+use super::{
+    collect::{self, Tokens},
+    core::Hub,
+    web,
+};
 use crate::{
     analytics::{self, Analytics},
     ask::Answer,
-    config::Config,
+    config::HubConfig,
     conversation,
     history::{self, History},
-    hub::Hub,
     model::{Activity, Snapshot},
     paths,
     store::Store,
@@ -54,17 +58,20 @@ struct App {
     store: Store,
     workspaces: Arc<Workspaces>,
     token: Arc<String>,
-    port: u16,
+    /// Where phones open the UI.
+    public_url: Arc<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
     hub: Hub,
     store: Store,
     token: Arc<String>,
     workspaces: Workspaces,
+    tokens: Tokens,
+    public_url: String,
 ) {
-    let port = listener.local_addr().map_or(7837, |a| a.port());
     let api = Router::new()
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
@@ -80,13 +87,17 @@ pub async fn serve(
         .route("/", get(web::index))
         .route("/{asset}", get(web::asset))
         .route("/act/{key}/{action}", post(button))
+        .route(
+            "/collect",
+            get(collect::collect).with_state((hub.clone(), tokens)),
+        )
         .nest("/api/v1", api)
         .with_state(App {
             hub,
             store,
             workspaces: Arc::new(workspaces),
             token,
-            port,
+            public_url: Arc::new(public_url),
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -95,7 +106,7 @@ pub async fn serve(
 
 /// Reads the configured token file, or the generated one in the state dir
 /// (creating it on first use).
-pub fn load_token(cfg: &Config) -> Result<String> {
+pub fn load_token(cfg: &HubConfig) -> Result<String> {
     if let Some(path) = &cfg.http.token_file {
         let path = std::path::PathBuf::from(util::expand_env(&path.to_string_lossy()));
         let token = std::fs::read_to_string(&path)
@@ -265,15 +276,11 @@ async fn button(
     Ok("done")
 }
 
-/// The address a phone on the LAN opens, token included, and its QR code.
+/// The address a phone opens, token included, and its QR code.
 async fn pair(State(app): State<App>) -> Result<Json<Value>, ApiError> {
-    let lan = util::lan_address();
-    let host = lan.map_or_else(util::hostname, |ip| ip.to_string());
-    let url = util::web_url(&host, app.port, &app.token);
+    let url = util::web_url(&app.public_url, &app.token);
     let svg = util::qr_svg(&url)?;
-    Ok(Json(
-        json!({ "url": url, "svg": svg, "lan": lan.is_some() }),
-    ))
+    Ok(Json(json!({ "url": url, "svg": svg, "lan": true })))
 }
 
 /// Time range and workspace of a history or analytics request.
@@ -284,6 +291,8 @@ struct RangeQuery {
     until: Option<i64>,
     /// Comma-separated workspace names from the snapshot's list.
     workspace: Option<String>,
+    /// One host name from the snapshot's list.
+    host: Option<String>,
     /// Viewer's offset from UTC in minutes (east positive), for day buckets.
     tz: Option<i64>,
 }
@@ -317,6 +326,7 @@ impl RangeQuery {
             until,
             now,
             dirs,
+            host: self.host.clone().filter(|h| !h.is_empty()),
         })
     }
 }

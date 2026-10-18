@@ -5,30 +5,39 @@ working, which are waiting on you, and which look stuck. On the desktop as a
 [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) plugin,
 on the phone as a web page.
 
-> **Status:** work in progress. The collector daemon, the web UI and the
-> DMS plugin work; several hosts are not supported yet.
+> **Status:** work in progress. One hub, collectors on each workstation,
+> the web UI and the DMS plugin work.
 
 ## How it works
 
 ```text
+on each workstation                      on the hub (always on)
 Claude Code hooks ──► ccdash emit ─┐
 prompts ────────────► ccdash ask ──┤
-statusline ─────────► ccdash tee ──┼──► ccdash daemon ──┬──► web UI (LAN / VPN)
-claude agents --json ──────────────┤    (per host)      ├──► DMS plugin
-claude -p /usage ──────────────────┤                    └──► ntfy (phone, watch)
-niri window events ────────────────┘
+statusline ─────────► ccdash tee ──┼──► ccdash collector ══wss══► ccdash hub
+claude agents --json ──────────────┤      │ (forwards, acts)      │ (state, SQLite,
+claude -p /usage ──────────────────┤      └──► DMS plugin         │  notifications)
+niri window events ────────────────┘                              ├──► web UI
+                                                                  └──► ntfy
 ```
 
-- Every session reports through Claude Code hooks to a small daemon on the
-  same machine. The daemon keeps live state in memory and history in SQLite.
-- The **web UI** is meant for the phone: it reads, renames sessions,
-  answers their permission prompts, questions and plans, and (with the
-  channel enabled) sends them messages. "Open in Claude" opens a session in
-  the Claude app through Remote Control.
+- Every session reports through Claude Code hooks to a small **collector**
+  on the same machine, which forwards everything to the **hub** over one
+  WebSocket (`/collect`, a token per machine) and carries out what comes
+  back: replies into sessions, prompt answers, renames. While the hub is
+  unreachable, hook events wait in an on-disk queue and Claude Code runs
+  as if ccdash were not there.
+- The hub keeps every machine's live state in memory and history in
+  SQLite, and serves the **web UI**, meant for the phone: it reads,
+  renames sessions, answers their permission prompts, questions and plans,
+  and (with the channel enabled) sends them messages. "Open in Claude"
+  opens a session in the Claude app through Remote Control. Every view can
+  be narrowed to one host.
 - **Notifications** through [ntfy](https://ntfy.sh) reach the phone (and a
   watch mirroring it) with buttons that answer the prompt.
-- The **DMS plugin** adds a bar indicator, a quick list, and a full dashboard
-  tab. Clicking a session focuses its terminal window in niri.
+- The **DMS plugin** on each workstation shows that machine's sessions
+  (mirrored from the hub): a bar indicator, a quick list, and a full
+  dashboard tab. Clicking a session focuses its terminal window in niri.
 
 Only public Claude Code interfaces are used (`claude agents --json`, hooks,
 the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
@@ -36,17 +45,44 @@ the statusline payload, [channels](https://code.claude.com/docs/en/channels-refe
 `/usage` report); no internal state files.
 
 The statusline carries only the 5-hour and 7-day limits. For per-model
-weekly limits such as Fable's, the daemon runs `claude -p /usage` every 10
-minutes (`usage.interval_secs`) in safe mode: no model request, no hooks,
-plugins or memory, nothing saved; about a second of CPU. It reads the
-structured report (`SDKUsageReport` in the
+weekly limits such as Fable's, the collector runs `claude -p /usage` every
+10 minutes (`usage.interval_secs`) in safe mode: no model request, no
+hooks, plugins or memory, nothing saved; about a second of CPU. It reads
+the structured report (`SDKUsageReport` in the
 [Agent SDK reference](https://code.claude.com/docs/en/agent-sdk/typescript),
 experimental). `usage.command = []` turns it off.
 
 ## Usage
 
-With Home Manager (the module also wires the hooks into
-`programs.claude-code`):
+The hub is a NixOS service. It listens on loopback; put nginx (or any TLS
+proxy that passes WebSockets through) in front of it:
+
+```nix
+{
+  imports = [ inputs.ccdash.nixosModules.hub ];
+
+  services.ccdash-hub = {
+    enable = true;
+    tokenFile = "/run/agenix/ccdash-ui-token";            # web UI bearer token
+    collectors = {
+      desk = "/run/agenix/ccdash-collector-desk";          # one token per machine
+      laptop = "/run/agenix/ccdash-collector-laptop";
+    };
+    nginx = { enable = true; domain = "ccdash.example.org"; };
+    backup.enable = true;                                  # nightly copy, checked
+    settings = {
+      # optional: filter the UI by workspace (named by the last path component)
+      workspaces.dirs = [ "/home/me/code/work" "/home/me/code/personal" ];
+      store.retention_days = 90;
+    };
+  };
+  # TLS, listen addresses and access control for the vhost are yours:
+  services.nginx.virtualHosts."ccdash.example.org" = { ... };
+}
+```
+
+Each workstation runs the collector through Home Manager (the module also
+wires the hooks into `programs.claude-code`):
 
 ```nix
 {
@@ -54,9 +90,8 @@ With Home Manager (the module also wires the hooks into
 
   services.ccdash = {
     enable = true;
-    settings.http.listen = [ "[::]:7837" ];
-    # optional: filter the UI by workspace (named by the last path component)
-    settings.workspaces.dirs = [ "~/code/work" "~/code/personal" ];
+    hub.url = "wss://ccdash.example.org/collect";
+    hub.tokenFile = "\${XDG_RUNTIME_DIR}/agenix/ccdash-collector-desk";
     # keep your statusline, ccdash reads the stats on its way through
     claudeCode.statusLine = {
       enable = true;
@@ -66,17 +101,28 @@ With Home Manager (the module also wires the hooks into
 }
 ```
 
-Then:
+The collector announces its host name (`host` in its config, the kernel's
+by default); the hub must list a token under that name.
+
+Then, on a workstation:
 
 ```sh
-ccdash status             # what every session is doing
+ccdash status             # this machine's sessions as the hub sees them
 ccdash open <id>          # focus its window, or attach to a background session
 ccdash rename <id> <name> # rename a session (Claude adopts it at the next prompt)
 ccdash reply <id> <text>  # send a message to a session (needs the channel)
-ccdash url --lan --qr     # web address for the phone as a QR code, token included
+ccdash url                # the hub's web address
 ```
 
-The web UI lives on the HTTP port:
+And on the hub:
+
+```sh
+ccdash url --hub --config /etc/ccdash/hub.toml --qr   # pairing link with the token
+ccdash import db old.db --config /etc/ccdash/hub.toml # history of a pre-hub daemon
+ccdash backup --config /etc/ccdash/hub.toml copy.db   # what the nightly timer runs
+```
+
+The web UI lives on the hub:
 
 - **Sessions:** the ones that need you first, then working, parked and idle,
   then background agents (sessions Claude started, or `claude --bg`), which show
@@ -127,21 +173,24 @@ drag across any time chart with a mouse to zoom in. With
 `workspaces.dirs` set, a workspace filter narrows every view to one or
 several workspaces. It reads "All" (or what you picked) until you open it,
 so the other names stay out of sight; each browser remembers its choice.
+With more than one machine reporting, a host filter sits next to it, and
+cards name their machine.
 
-To connect a phone, scan `ccdash url --lan --qr` (or open "Connect a phone"
-in the web UI on the desktop). The address carries the access token; each
-browser keeps it, so it is a one-time step per device. The token lives in
-`~/.local/state/ccdash/token` and survives reboots; delete it and restart
-ccdash to lock every device out. The DMS plugin adds it to the links it
-opens by itself.
+To connect a phone, scan `ccdash url --hub --qr` on the hub (or open
+"Connect a phone" in the web UI on a paired browser). The address carries
+the access token; each browser keeps it, so it is a one-time step per
+device. The token comes from `tokenFile`; rotate it and restart the hub to
+lock every device out. The DMS plugin opens the hub's address without a
+token, so pair the desktop browser once.
 
 The Tokens section, and the approval sources under Permissions, come from
 Claude Code's OpenTelemetry export. `claudeCode.telemetry.enable = true` sets
 the `OTEL_*` variables in `programs.claude-code.settings.env` and starts an
-OTLP/HTTP receiver in the daemon on `127.0.0.1:7839`. It takes no token, so
-ccdash refuses to bind it anywhere but loopback, and it keeps only counts and
-timings: prompt text stays redacted, as Claude Code sends it by default.
-Sessions started after the switch report.
+OTLP/HTTP receiver in the collector on `127.0.0.1:7839`, which forwards
+the kept records to the hub. It takes no token, so ccdash refuses to bind
+it anywhere but loopback, and it keeps only counts and timings: prompt
+text stays redacted, as Claude Code sends it by default. Sessions started
+after the switch report.
 
 Sessions can be renamed from the web UI and the DMS plugin. ccdash shows the
 new name at once and hands it to Claude Code at the session's next prompt
@@ -163,15 +212,17 @@ open; whichever answer comes first wins:
 - **Plans:** Approve, or Keep planning (with a note).
 
 The PermissionRequest hook is `ccdash ask`: it hands the prompt to the
-daemon and holds it until ccdash answers or the prompt closes in the
-terminal. Claude Code runs it alongside the dialog (verified on 2.1.302;
-the [hooks reference](https://code.claude.com/docs/en/hooks) promises this
+collector, which holds it until the hub answers or the prompt closes in
+the terminal (or the hub link drops: then the hook lets go and the
+terminal alone decides). Claude Code runs it alongside the dialog
+(verified on 2.1.302; the
+[hooks reference](https://code.claude.com/docs/en/hooks) promises this
 only for SDK hosts, so recheck after updates).
 `claudeCode.asks.enable = false` makes the hook report prompts only.
 
 ### Notifications
 
-The daemon can push prompts and finished turns to an
+The hub can push prompts and finished turns to an
 [ntfy](https://docs.ntfy.sh) server; the ntfy app on the phone shows them
 with buttons (Allow / Deny / Always, up to three options of a question,
 Approve / Keep planning), which a watch mirroring the phone's notifications
@@ -180,21 +231,21 @@ window has focus), so a prompt answered at the desk never sends one, and it
 is deleted from the phone once the prompt is answered anywhere.
 
 ```nix
-services.ccdash.settings.notify = {
+services.ccdash-hub.settings.notify = {
   url = "https://ntfy.example.org";
   topic = "ccdash";
   token_file = "/run/agenix/ccdash-ntfy-token"; # may publish to the topic
-  # how the phone reaches this daemon (buttons, taps); default: LAN address
-  web_url = "http://10.0.0.2:7837";
+  # where buttons and taps point; default: the hub's public URL
+  # web_url = "https://ccdash.example.org";
   # turns = false;  questions, plans, permissions: per-kind switches
   # workspaces = [ "work" ];  only these workspaces
 };
 ```
 
-A button calls `POST /act/<key>/<action>` on the daemon with a random key
+A button calls `POST /act/<key>/<action>` on the hub with a random key
 that belongs to that one prompt and dies with it; the access token never
-goes into a notification. The phone needs to reach the daemon (LAN or
-VPN) for the buttons to work. Notifications carry session titles, commands
+goes into a notification. The phone needs to reach the hub (LAN or VPN)
+for the buttons to work. Notifications carry session titles, commands
 and questions, so use an ntfy server you run, with access control. Keeping
 it on the same LAN or VPN costs nothing (the buttons need it anyway), and a
 short in-memory cache (`cache-duration`, no `cache-file`) keeps the text off
@@ -210,7 +261,7 @@ sent while Claude works waits for its next turn. Messages reach Claude as
 This uses Claude Code
 [channels](https://code.claude.com/docs/en/channels-reference), a research
 preview: `ccdash channel` is an MCP server that every session started with
-the channel flags runs, connected to the daemon. Two pieces turn it on:
+the channel flags runs, connected to the collector. Two pieces turn it on:
 
 ```nix
 # Home Manager: a `claude` wrapper that starts interactive sessions with
@@ -241,16 +292,15 @@ running when ccdash was installed only show busy/idle until you restart
 them (`claude --resume` keeps the conversation). The conversation is built
 from hook events; Claude's thinking is not part of them.
 
-CPU and memory come from `/proc`: every 5 s ccdash sums the CPU time of each
-session's process tree (Claude, its MCP servers and running commands) and
-its memory as PSS, so shared pages are not counted twice. Turn it off with
-`procs.enable = false`.
+CPU and memory come from `/proc`: every 5 s the collector sums the CPU
+time of each session's process tree (Claude, its MCP servers and running
+commands) and its memory as PSS, so shared pages are not counted twice.
+Turn it off with `procs.enable = false`.
 
 The HTTP API needs the bearer token for everything (it can read sessions,
 rename them, answer their prompts and, with the channel, prompt them),
-except the notification buttons' one-time links. The token is generated in
-`~/.local/state/ccdash/token` unless `http.token_file` is set. Keep the
-port behind your firewall or VPN.
+except the notification buttons' one-time links and `/collect`, which
+takes a collector's token. Keep the hub behind your firewall or VPN.
 
 ## Desktop (DankMaterialShell)
 
@@ -268,18 +318,27 @@ Mod+Shift+C { spawn "dms" "ipc" "call" "ccdash" "focusWaiting"; }
 
 ## Data
 
-Everything is stored on the machine running the daemon:
+Everything is stored on the hub:
 
-| What       | Where                                                       |
-| ---------- | ----------------------------------------------------------- |
-| Live state | daemon memory                                               |
-| History    | `~/.local/state/ccdash/ccdash.db` (SQLite, WAL), owner-only |
-| Web token  | `~/.local/state/ccdash/token`, owner-only                   |
-| Config     | `~/.config/ccdash/config.toml`                              |
-| Sockets    | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)      |
-| Telemetry  | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled             |
+| What       | Where                                                        |
+| ---------- | ------------------------------------------------------------ |
+| Live state | hub memory, one reducer per host                             |
+| History    | `/var/lib/ccdash-hub/ccdash.db` (SQLite, WAL), `ccdash` user |
+| Backups    | `/var/lib/ccdash-hub/backups/`, nightly, checked             |
+| Config     | `/etc/ccdash/hub.toml`                                       |
 
-The database keeps 30 days (`store.retention_days`) of:
+On each workstation the collector keeps only what it cannot deliver:
+
+| What      | Where                                                       |
+| --------- | ----------------------------------------------------------- |
+| Mirror    | collector memory (this host's sessions for DMS and the CLI) |
+| Outbox    | `~/.local/state/ccdash/outbox.ndjson`, bounded              |
+| Config    | `~/.config/ccdash/config.toml`                              |
+| Sockets   | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)      |
+| Telemetry | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled             |
+
+Every row carries the host it came from. The database keeps 30 days
+(`store.retention_days`) of:
 
 - `events`: prompts (up to 8 KiB), Claude's messages and replies (up to
   32 KiB), tool calls (name, file path or first command line, duration),
@@ -295,16 +354,25 @@ The database keeps 30 days (`store.retention_days`) of:
   edit decisions and active time
 
 The HTTP API serves it to your browser with the token. Nothing else leaves
-the machine, except notifications when `notify.url` is set. Delete the
-database to start over.
+the hub, except notifications when `notify.url` is set. Delete the
+database to start over. `ccdash import db` brings the history of a
+pre-hub daemon (`~/.local/state/ccdash/ccdash.db` on the workstation)
+into the hub; it skips rows the hub already has, so it is safe to repeat.
+
+The collector ↔ hub protocol (`src/protocol.rs`) is versioned: a hub and a
+collector of different versions refuse each other and log why.
 
 ## Development
 
 ```sh
 direnv allow   # or: nix develop
-cargo run -- daemon
+cargo run -- hub --config hub.toml             # http.listen, collect.tokens, store.path
+cargo run -- collector --config collector.toml # hub.url = "ws://127.0.0.1:7837/collect"
 nix build
 ```
+
+`CCDASH_RUNTIME_DIR` moves a collector's sockets, so a second collector
+(or the hooks of a test session) can run next to the real one.
 
 `CCDASH_WEB_DIR=web` serves the UI from disk instead of the embedded copy,
 so edits show up on reload.

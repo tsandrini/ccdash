@@ -95,7 +95,7 @@ pub fn telemetry(
             ORDER BY t.ts"
     ))?;
     let rows = stmt.query_map(
-        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param()},
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
         |r| {
             Ok((
                 r.get::<_, i64>(0)?,

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, fs, time::Duration};
 
 use crate::{
-    hub::{Cmd, Hub, Input},
+    collector::{Local, LocalCmd},
     model::ProcInfo,
     state::ProcPoll,
     util::{now_ms, truncate},
@@ -160,14 +160,14 @@ impl Poller {
     }
 }
 
-pub async fn run(hub: Hub, every: Duration) {
-    let tx = hub.sender();
+pub async fn run(local: Local, every: Duration) {
+    let tx = local.sender();
     let mut poller = Poller::new();
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let Ok(roots) = hub.pids().await else {
+        let Ok(roots) = local.pids().await else {
             return;
         };
         let now = now_ms();
@@ -180,7 +180,7 @@ pub async fn run(hub: Hub, every: Duration) {
             return;
         };
         poller = back;
-        if tx.send(Cmd::Input(Input::Procs(polls, now))).await.is_err() {
+        if tx.send(LocalCmd::Procs(polls, now)).await.is_err() {
             return;
         }
     }

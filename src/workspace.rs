@@ -66,13 +66,18 @@ pub struct Scope {
     /// Workspace directories; sessions outside all of them are left out.
     /// None covers everything, sessions outside every workspace included.
     pub dirs: Option<Vec<String>>,
+    /// One machine's sessions only; None covers every host.
+    pub host: Option<String>,
 }
 
 impl Scope {
-    pub fn contains(&self, cwd: &str) -> bool {
-        self.dirs
-            .as_ref()
-            .is_none_or(|dirs| dirs.iter().any(|dir| within(cwd, dir)))
+    /// Whether a session on `host` running in `cwd` is in scope.
+    pub fn covers(&self, host: &str, cwd: &str) -> bool {
+        self.host.as_deref().is_none_or(|h| h == host)
+            && self
+                .dirs
+                .as_ref()
+                .is_none_or(|dirs| dirs.iter().any(|dir| within(cwd, dir)))
     }
 
     /// The directories as a JSON array for [`IN_SCOPE`]'s `:dirs`.
@@ -84,9 +89,10 @@ impl Scope {
 }
 
 /// SQL condition on a `sessions` row aliased `x`, bound to `:dirs`
-/// ([`Scope::dirs_param`]).
-pub const IN_SCOPE: &str = "(:dirs IS NULL OR EXISTS (SELECT 1 FROM json_each(:dirs) d
-    WHERE x.cwd = d.value OR substr(x.cwd, 1, length(d.value) + 1) = d.value || '/'))";
+/// ([`Scope::dirs_param`]) and `:host` ([`Scope::host`]).
+pub const IN_SCOPE: &str = "((:host IS NULL OR x.host = :host)
+    AND (:dirs IS NULL OR EXISTS (SELECT 1 FROM json_each(:dirs) d
+    WHERE x.cwd = d.value OR substr(x.cwd, 1, length(d.value) + 1) = d.value || '/')))";
 
 #[cfg(test)]
 mod tests {
@@ -118,15 +124,16 @@ mod tests {
                 until: 0,
                 now: 0,
                 dirs: dirs.map(|d| d.iter().map(|d| (*d).to_owned()).collect()),
+                host: None,
             };
             let sql: bool = conn
                 .query_row(
-                    &format!("SELECT {IN_SCOPE} FROM (SELECT :cwd AS cwd) x"),
-                    named_params! {":cwd": cwd, ":dirs": scope.dirs_param()},
+                    &format!("SELECT {IN_SCOPE} FROM (SELECT :cwd AS cwd, 'h' AS host) x"),
+                    named_params! {":cwd": cwd, ":dirs": scope.dirs_param(), ":host": scope.host},
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(sql, scope.contains(cwd), "{cwd} in {dirs:?}");
+            assert_eq!(sql, scope.covers("h", cwd), "{cwd} in {dirs:?}");
             sql
         };
         assert!(hit("/a/b_c/d", Some(&["/a/b_c"])));
@@ -136,5 +143,23 @@ mod tests {
         assert!(!hit("/q", Some(&["/a/b_c", "/z"])));
         assert!(!hit("/q", Some(&[])));
         assert!(hit("/anything", None));
+
+        let one = Scope {
+            since: 0,
+            until: 0,
+            now: 0,
+            dirs: None,
+            host: Some("h".into()),
+        };
+        let on = |host: &str| -> bool {
+            conn.query_row(
+                &format!("SELECT {IN_SCOPE} FROM (SELECT '/w' AS cwd, :h AS host) x"),
+                named_params! {":h": host, ":dirs": one.dirs_param(), ":host": one.host},
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(on("h") && one.covers("h", "/w"));
+        assert!(!on("other") && !one.covers("other", "/w"));
     }
 }

@@ -18,15 +18,24 @@ pub fn api_socket() -> PathBuf {
     runtime_dir().join("api.sock")
 }
 
-/// Where `ccdash rename` queues a title until the session's next prompt.
-/// `None` for ids that are not plain session ids.
-pub fn pending_title(session: &str) -> Option<PathBuf> {
-    let plain = !session.is_empty()
+/// Whether `session` is safe to use as a file name (plain session ids are).
+pub fn plain_session_id(session: &str) -> bool {
+    !session.is_empty()
         && session.len() <= 64
         && session
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    plain.then(|| runtime_dir().join("titles").join(session))
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Where `ccdash rename` queues a title until the session's next prompt.
+/// `None` for ids that are not plain session ids.
+pub fn pending_title(session: &str) -> Option<PathBuf> {
+    plain_session_id(session).then(|| runtime_dir().join("titles").join(session))
+}
+
+/// The collector's queue of events for the hub while it is unreachable.
+pub fn outbox_file() -> PathBuf {
+    state_dir().join("outbox.ndjson")
 }
 
 pub fn state_dir() -> PathBuf {

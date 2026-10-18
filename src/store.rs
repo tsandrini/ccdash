@@ -1,4 +1,6 @@
-//! SQLite history: events, statusline samples, and one row per session.
+//! SQLite history: events, statusline samples, and one row per session,
+//! every row tagged with the host it came from. The hub is the only writer
+//! (one thread); readers open their own read-only connections.
 
 use std::{
     fs::{self, OpenOptions, Permissions},
@@ -114,38 +116,28 @@ const PRUNE_EVERY_MS: i64 = 3_600_000;
 
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::Sender<StoreMsg>,
+    tx: mpsc::Sender<(String, StoreMsg)>,
     path: PathBuf,
 }
 
 impl Store {
     /// Opens (creating if needed) the database and starts the writer thread.
-    pub fn open(path: &Path, host: String, retention_days: u32) -> Result<Self> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-            if dir == paths::state_dir() {
-                fs::set_permissions(dir, Permissions::from_mode(0o700))?;
-            }
-        }
-        make_private(path)?;
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
-        migrate(&conn)?;
+    pub fn open(path: &Path, retention_days: u32) -> Result<Self> {
+        let conn = open_writer(path)?;
         let (tx, rx) = mpsc::channel();
         let retention_ms = i64::from(retention_days) * 86_400_000;
         thread::Builder::new()
             .name("store".into())
-            .spawn(move || writer(conn, rx, host, retention_ms))?;
+            .spawn(move || writer(conn, rx, retention_ms))?;
         Ok(Self {
             tx,
             path: path.to_owned(),
         })
     }
 
-    pub fn send(&self, msg: StoreMsg) {
-        let _ = self.tx.send(msg);
+    /// Queues `msg`, which came from `host`.
+    pub fn send(&self, host: &str, msg: StoreMsg) {
+        let _ = self.tx.send((host.to_owned(), msg));
     }
 
     pub fn reader(&self) -> Result<Connection> {
@@ -158,11 +150,34 @@ impl Store {
     }
 }
 
-fn writer(mut conn: Connection, rx: mpsc::Receiver<StoreMsg>, host: String, retention_ms: i64) {
+/// Opens the database for writing with the settings every writer needs:
+/// WAL, full syncs (consumer flash has no power-loss protection), 8 KiB
+/// pages and incremental vacuum for the retention churn. Page size and
+/// vacuum mode only take effect on a database created here.
+pub fn open_writer(path: &Path) -> Result<Connection> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+        if dir == paths::state_dir() {
+            fs::set_permissions(dir, Permissions::from_mode(0o700))?;
+        }
+    }
+    make_private(path)?;
+    let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    conn.pragma_update(None, "page_size", 8192)?;
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+fn writer(mut conn: Connection, rx: mpsc::Receiver<(String, StoreMsg)>, retention_ms: i64) {
     let mut last_prune = 0;
     while let Ok(first) = rx.recv() {
-        let batch: Vec<StoreMsg> = std::iter::once(first).chain(rx.try_iter()).collect();
-        if let Err(e) = write_batch(&mut conn, &host, &batch) {
+        let batch: Vec<(String, StoreMsg)> = std::iter::once(first).chain(rx.try_iter()).collect();
+        if let Err(e) = write_batch(&mut conn, &batch) {
             warn!("store: {e:#}");
         }
         let now = now_ms();
@@ -175,9 +190,9 @@ fn writer(mut conn: Connection, rx: mpsc::Receiver<StoreMsg>, host: String, rete
     }
 }
 
-fn write_batch(conn: &mut Connection, host: &str, batch: &[StoreMsg]) -> Result<()> {
+fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()> {
     let tx = conn.transaction()?;
-    for msg in batch {
+    for (host, msg) in batch {
         match msg {
             StoreMsg::Event {
                 ts,
@@ -286,6 +301,7 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
         [cutoff],
     )?;
+    conn.execute_batch("PRAGMA incremental_vacuum")?;
     Ok(())
 }
 
@@ -436,17 +452,20 @@ mod tests {
     fn writes_and_restores() {
         let dir = std::env::temp_dir().join(format!("ccdash-store-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir.join("t.db"), "testhost".into(), 30).unwrap();
+        let store = Store::open(&dir.join("t.db"), 30).unwrap();
         let t = now_ms();
-        store.send(StoreMsg::Session {
-            id: "s1".into(),
-            cwd: "/w".into(),
-            name: None,
-            title: Some("Fix it".into()),
-            kind: Kind::Interactive,
-            started_at: t,
-            ended_at: None,
-        });
+        store.send(
+            "testhost",
+            StoreMsg::Session {
+                id: "s1".into(),
+                cwd: "/w".into(),
+                name: None,
+                title: Some("Fix it".into()),
+                kind: Kind::Interactive,
+                started_at: t,
+                ended_at: None,
+            },
+        );
         for (dt, kind, data) in [
             (1, "prompt", json!({ "text": "first" })),
             (2, "reply", json!({ "text": "done" })),
@@ -477,17 +496,40 @@ mod tests {
                 json!({ "id": "2", "subject": "Test", "status": "deleted" }),
             ),
         ] {
-            store.send(StoreMsg::Event {
-                ts: t + dt,
-                session: "s1".into(),
-                kind,
-                data,
-            });
+            store.send(
+                "testhost",
+                StoreMsg::Event {
+                    ts: t + dt,
+                    session: "s1".into(),
+                    kind,
+                    data,
+                },
+            );
         }
 
         let mode = fs::metadata(dir.join("t.db")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let reader = store.reader().unwrap();
+        let page_size: i64 = reader
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .unwrap();
+        assert_eq!(page_size, 8192);
+        let host: String = {
+            let mut host = String::new();
+            for _ in 0..100 {
+                if let Ok(h) =
+                    reader.query_row("SELECT host FROM sessions WHERE id = 's1'", [], |r| {
+                        r.get(0)
+                    })
+                {
+                    host = h;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            host
+        };
+        assert_eq!(host, "testhost");
         let mut saved = Restored::default();
         for _ in 0..100 {
             saved = restored(&reader, "s1").unwrap();

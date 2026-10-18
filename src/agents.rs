@@ -6,13 +6,9 @@ use anyhow::{Context, Result, bail};
 use tokio::{process::Command, sync::mpsc};
 use tracing::warn;
 
-use crate::{
-    hub::{Cmd, Input},
-    state::AgentEntry,
-    util::now_ms,
-};
+use crate::{collector::LocalCmd, state::AgentEntry, util::now_ms};
 
-pub async fn run(command: Vec<String>, every: Duration, tx: mpsc::Sender<Cmd>) {
+pub async fn run(command: Vec<String>, every: Duration, tx: mpsc::Sender<LocalCmd>) {
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_error = None;
@@ -21,11 +17,7 @@ pub async fn run(command: Vec<String>, every: Duration, tx: mpsc::Sender<Cmd>) {
         match poll(&command).await {
             Ok(list) => {
                 last_error = None;
-                if tx
-                    .send(Cmd::Input(Input::Agents(list, now_ms())))
-                    .await
-                    .is_err()
-                {
+                if tx.send(LocalCmd::Agents(list, now_ms())).await.is_err() {
                     return;
                 }
             }

@@ -3,12 +3,12 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-use crate::{hub::Hub, model::Kind, niri};
+use crate::{collector::Local, model::Kind, niri};
 
 /// Focuses the session's window, or attaches to a background session in a new
 /// terminal when it has none.
-pub async fn open(hub: &Hub, attach_command: &[String], key: &str) -> Result<String> {
-    let session = hub
+pub async fn open(local: &Local, attach_command: &[String], key: &str) -> Result<String> {
+    let session = local
         .resolve(key)
         .await?
         .with_context(|| format!("no session matches {key:?}"))?;

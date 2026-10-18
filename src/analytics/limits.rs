@@ -265,7 +265,8 @@ fn shares(
     workspaces: &Workspaces,
 ) -> Result<Vec<Share>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT min(s.cost_usd), max(s.cost_usd), coalesce(x.started_at, 0), coalesce(x.cwd, '')
+        "SELECT min(s.cost_usd), max(s.cost_usd), coalesce(x.started_at, 0), coalesce(x.cwd, ''),
+            coalesce(x.host, '')
             FROM samples s LEFT JOIN sessions x ON x.id = s.session
             WHERE s.ts >= ?1 AND s.ts < ?2 AND s.cost_usd IS NOT NULL
             GROUP BY s.session",
@@ -276,13 +277,14 @@ fn shares(
             r.get::<_, f64>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
         ))
     })?;
     let mut by: BTreeMap<(bool, Option<String>), f64> = BTreeMap::new();
     for row in rows {
-        let (min, max, started_at, cwd) = row?;
+        let (min, max, started_at, cwd, host) = row?;
         let cost = if started_at >= since { max } else { max - min };
-        let key = if scope.contains(&cwd) {
+        let key = if scope.covers(&host, &cwd) {
             (false, workspaces.of(&cwd))
         } else {
             (true, None)
@@ -364,6 +366,7 @@ mod tests {
             until: now,
             now,
             dirs,
+            host: None,
         };
         let rows = |dirs| {
             shares(&conn, &scope(dirs), now - 2 * HOUR_MS, &ws)
@@ -415,6 +418,7 @@ mod tests {
             until: now,
             now,
             dirs: None,
+            host: None,
         };
         let l = limits(&conn, &scope, Some(&live), &Workspaces::default()).unwrap();
         let fable = &l.scoped[0];

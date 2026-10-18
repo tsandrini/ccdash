@@ -3,6 +3,7 @@ const THEME_KEY = "ccdash.theme";
 const VIEW_KEY = "ccdash.view";
 const WORKSPACES_KEY = "ccdash.workspaces";
 const OLD_WORKSPACE_KEY = "ccdash.workspace";
+const HOST_KEY = "ccdash.host";
 const HISTORY_RANGE_KEY = "ccdash.range.history";
 const ANALYTICS_RANGE_KEY = "ccdash.range.analytics";
 const STALE_STREAM_MS = 45_000;
@@ -40,6 +41,10 @@ const state = {
   workspaces: [],
   /** Workspaces the views are filtered to; empty shows everything. */
   picked: loadPicked(),
+  /** Machines reporting to the hub. */
+  hosts: [],
+  /** Host the views are filtered to; empty shows every host. */
+  host_pick: localStorage.getItem(HOST_KEY) || "",
   /** Session to open from `#session=…` once the snapshot has it. */
   pendingSession: null,
   pendingPair: false,
@@ -380,9 +385,10 @@ function applySnapshot(snapshot) {
   state.skew = snapshot.now - Date.now();
   state.sessions = new Map(snapshot.sessions.map((s) => [s.id, s]));
   state.rateLimits = snapshot.rate_limits;
-  const known = state.workspaces.join();
+  const known = scopeKey();
   state.workspaces = snapshot.workspaces || [];
-  if (state.workspaces.join() !== known) renderScopebar();
+  state.hosts = snapshot.hosts || [];
+  if (scopeKey() !== known) renderScopebar();
   scheduleRender();
   loadRecent();
   if (state.detailId) scheduleDetailRefresh();
@@ -405,6 +411,9 @@ function applyUpdate(update) {
     state.sessions.delete(update.id);
   } else if (update.type === "rate_limits") {
     state.rateLimits = update.rate_limits;
+  } else if (update.type === "hosts") {
+    state.hosts = update.hosts;
+    renderScopebar();
   }
   scheduleRender();
 }
@@ -450,7 +459,7 @@ function byAttention(a, b) {
 function renderSessions() {
   $("#host").textContent = state.host;
   const all = [...state.sessions.values()]
-    .filter((s) => !stub(s) && inWorkspace(s))
+    .filter((s) => !stub(s) && inWorkspace(s) && inHost(s))
     .sort(byAttention);
   const mine = all.filter((s) => !isAgent(s));
   const agents = all.filter(isAgent);
@@ -651,7 +660,12 @@ const clock = (since) =>
   });
 
 function card(s) {
-  const where = [place(s.cwd), s.model, isAgent(s) ? `bg ${s.short_id}` : null]
+  const where = [
+    multiHost() ? s.host : null,
+    place(s.cwd),
+    s.model,
+    isAgent(s) ? `bg ${s.short_id}` : null,
+  ]
     .filter(Boolean)
     .join(" · ");
   return h(
@@ -2653,6 +2667,89 @@ const workspaceParam = () =>
     ? `&workspace=${state.picked.map(encodeURIComponent).join(",")}`
     : "";
 
+// --- hosts --------------------------------------------------------------------
+
+const inHost = (s) => !state.host_pick || s.host === state.host_pick;
+const hostParam = () =>
+  state.host_pick ? `&host=${encodeURIComponent(state.host_pick)}` : "";
+/** More than one machine reports, so hosts are worth telling apart. */
+const multiHost = () => state.hosts.length > 1;
+const scopeKey = () =>
+  `${state.workspaces.join()}|${state.hosts.map((x) => `${x.name}:${x.connected}`).join()}`;
+
+function hostLabel(host) {
+  const status = state.hosts.find((x) => x.name === host);
+  return status && !status.connected ? `${host} (offline)` : host;
+}
+
+function setHost(host) {
+  state.host_pick = host;
+  if (host) localStorage.setItem(HOST_KEY, host);
+  else localStorage.removeItem(HOST_KEY);
+  renderScopebar();
+  scheduleRender();
+  if (!$("#view-history").hidden) loadHistory();
+  if (!$("#view-analytics").hidden) loadAnalytics();
+}
+
+/** One host or all, in the same popover as the workspaces. */
+function openHostForm(anchor) {
+  const dialog = $("#workspace-dialog");
+  const touch = touchLayout();
+  const close = () => dialog.close();
+  const option = (name, label, checked) =>
+    h(
+      "label",
+      { class: "scope-option" },
+      h("input", {
+        type: "radio",
+        name: "host",
+        checked,
+        onchange: () => {
+          setHost(name);
+          close();
+        },
+      }),
+      h("span", { text: label }),
+    );
+  fill(
+    dialog,
+    h(
+      "form",
+      {
+        class: "scope-form",
+        onsubmit: (event) => (event.preventDefault(), close()),
+      },
+      h("h3", { text: "Hosts" }),
+      option("", "All", !state.host_pick),
+      state.hosts.map((x) =>
+        option(x.name, hostLabel(x.name), state.host_pick === x.name),
+      ),
+      touch
+        ? h("button", { class: "btn", type: "submit", text: "Done" })
+        : null,
+    ),
+  );
+  placeScopeForm(dialog, anchor, touch);
+}
+
+function placeScopeForm(dialog, anchor, touch) {
+  dialog.className = touch ? "range-sheet" : "range-popover";
+  // NOTE: a handler property returning false cancels the click
+  dialog.onclick = (event) => {
+    if (event.target === dialog) dialog.close();
+  };
+  dialog.showModal();
+  if (!touch) {
+    const box = anchor.getBoundingClientRect();
+    dialog.style.top = `${box.bottom + 8}px`;
+    dialog.style.left = `${Math.max(8, Math.min(box.left, innerWidth - dialog.offsetWidth - 8))}px`;
+  } else {
+    dialog.style.top = "";
+    dialog.style.left = "";
+  }
+}
+
 /** "All" until something is picked, so the closed control names nothing. */
 function pickedLabel() {
   const picked = state.picked;
@@ -2663,24 +2760,46 @@ function pickedLabel() {
 function renderScopebar() {
   const bar = $("#scopebar");
   const names = state.workspaces;
-  bar.hidden = !names.length;
-  if (!names.length) return;
+  const hosts = multiHost() || state.host_pick;
+  bar.hidden = !names.length && !hosts;
+  if (bar.hidden) return;
   const kept = state.picked.filter((n) => names.includes(n));
   if (kept.length !== state.picked.length) setPicked(kept, false);
-  const trigger = h(
-    "button",
-    {
-      class: "scope-trigger",
-      type: "button",
-      "aria-haspopup": "dialog",
-      title: "Filter by workspace",
-      onclick: () => openWorkspaceForm(trigger),
-    },
-    h("span", { class: "scope-label", text: "Workspace" }),
-    h("span", { class: "scope-value", text: pickedLabel() }),
-    h("span", { class: "scope-caret", "aria-hidden": "true", text: "▾" }),
+  const trigger = (label, value, title, open) => {
+    const button = h(
+      "button",
+      {
+        class: "scope-trigger",
+        type: "button",
+        "aria-haspopup": "dialog",
+        title,
+        onclick: () => open(button),
+      },
+      h("span", { class: "scope-label", text: label }),
+      h("span", { class: "scope-value", text: value }),
+      h("span", { class: "scope-caret", "aria-hidden": "true", text: "▾" }),
+    );
+    return button;
+  };
+  fill(
+    bar,
+    names.length
+      ? trigger(
+          "Workspace",
+          pickedLabel(),
+          "Filter by workspace",
+          openWorkspaceForm,
+        )
+      : null,
+    hosts
+      ? trigger(
+          "Host",
+          state.host_pick ? hostLabel(state.host_pick) : "All",
+          "Filter by host",
+          openHostForm,
+        )
+      : null,
   );
-  fill(bar, trigger);
 }
 
 /** Checkboxes in a popover under `anchor` (a bottom sheet on a phone);
@@ -2727,20 +2846,7 @@ function openWorkspaceForm(anchor) {
       ),
     );
   render();
-  dialog.className = touch ? "range-sheet" : "range-popover";
-  // NOTE: a handler property returning false cancels the click
-  dialog.onclick = (event) => {
-    if (event.target === dialog) close();
-  };
-  dialog.showModal();
-  if (!touch) {
-    const box = anchor.getBoundingClientRect();
-    dialog.style.top = `${box.bottom + 8}px`;
-    dialog.style.left = `${Math.max(8, Math.min(box.left, innerWidth - dialog.offsetWidth - 8))}px`;
-  } else {
-    dialog.style.top = "";
-    dialog.style.left = "";
-  }
+  placeScopeForm(dialog, anchor, touch);
 }
 
 function setPicked(picked, reload = true) {
@@ -2816,7 +2922,7 @@ async function loadHistory() {
   container.classList.add("loading");
   try {
     state.history = await getJson(
-      `history?${rangeParams(state.range)}${workspaceParam()}`,
+      `history?${rangeParams(state.range)}${workspaceParam()}${hostParam()}`,
     );
     renderHistory();
   } catch (e) {
@@ -3792,7 +3898,7 @@ async function loadAnalytics() {
   try {
     const tz = -new Date().getTimezoneOffset();
     state.analytics = await getJson(
-      `analytics?${rangeParams(state.aRange)}&tz=${tz}${workspaceParam()}`,
+      `analytics?${rangeParams(state.aRange)}&tz=${tz}${workspaceParam()}${hostParam()}`,
     );
     renderAnalytics();
   } catch (e) {

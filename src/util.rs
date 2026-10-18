@@ -109,8 +109,8 @@ pub fn lan_address() -> Option<IpAddr> {
 }
 
 /// The web UI address with the access token in the fragment.
-pub fn web_url(host: &str, port: u16, token: &str) -> String {
-    format!("{}/#token={token}", base_url(host, port))
+pub fn web_url(base: &str, token: &str) -> String {
+    format!("{}/#token={token}", base.trim_end_matches('/'))
 }
 
 /// `http://host:port`, IPv6 addresses bracketed.
@@ -221,12 +221,16 @@ mod tests {
     #[test]
     fn web_urls_bracket_ipv6() {
         assert_eq!(
-            web_url("10.0.0.2", 7837, "t"),
+            web_url(&base_url("10.0.0.2", 7837), "t"),
             "http://10.0.0.2:7837/#token=t"
         );
         assert_eq!(
-            web_url("fd00::2", 7837, "t"),
+            web_url(&base_url("fd00::2", 7837), "t"),
             "http://[fd00::2]:7837/#token=t"
+        );
+        assert_eq!(
+            web_url("https://x.example/", "t"),
+            "https://x.example/#token=t"
         );
         assert!(qr_svg("http://x/#token=t").unwrap().starts_with("<?xml"));
     }

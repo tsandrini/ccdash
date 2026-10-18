@@ -264,12 +264,25 @@ pub struct Session {
     pub last_event_at: i64,
 }
 
+/// A machine whose collector reports to the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStatus {
+    pub name: String,
+    pub connected: bool,
+    /// When the link last came up or went down.
+    pub since: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// The machine answering: the hub, or a collector showing its mirror.
     pub host: String,
     pub now: i64,
     /// Configured workspace names, for filtering.
     pub workspaces: Vec<String>,
+    /// Machines with sessions, for filtering.
+    #[serde(default)]
+    pub hosts: Vec<HostStatus>,
     pub sessions: Vec<Session>,
     pub rate_limits: Option<RateLimits>,
 }
@@ -278,6 +291,7 @@ pub struct Snapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
     Session { session: Box<Session> },
-    Removed { id: String },
+    Removed { host: String, id: String },
     RateLimits { rate_limits: RateLimits },
+    Hosts { hosts: Vec<HostStatus> },
 }
