@@ -30,6 +30,9 @@ pub fn import(source: &Path, dest: &Path) -> Result<Vec<(String, usize)>> {
     if !source.is_file() {
         bail!("{} is not a file", source.display());
     }
+    // NOTE: a copy made by another user is often 0600; SQLite only says "error code 14"
+    std::fs::File::open(source)
+        .with_context(|| format!("{} is not readable by this user", source.display()))?;
     let mut conn = store::open_writer(dest)?;
     conn.execute(
         "ATTACH DATABASE ?1 AS src",
