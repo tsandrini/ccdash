@@ -6,7 +6,7 @@ working, which are waiting on you, and which look stuck. On the desktop as a
 on the phone as a web page.
 
 > **Status:** work in progress. One hub, collectors on each workstation,
-> the web UI and the DMS plugin work.
+> the web UI, the DMS plugin and the knowledge layer work.
 
 ## How it works
 
@@ -302,6 +302,54 @@ rename them, answer their prompts and, with the channel, prompt them),
 except the notification buttons' one-time links and `/collect`, which
 takes a collector's token. Keep the hub behind your firewall or VPN.
 
+## Knowledge: memories, issues, progress, documents
+
+The hub also holds what Claude should know across sessions and machines:
+memories (facts worth keeping), issues (open work), progress (dated
+entries) and documents (plans, specs), as notes with `[[slug]]` links,
+backlinks and full-text search, each in one workspace. Sessions reach
+them through tools the channel server exposes (`recall`, `remember`,
+`verify`, `issue_add`, `issue_update`, `progress`, `doc_write`,
+`tell_session`), and the hooks inject what matters: open issues and
+relevant memories at session start, other sessions active in the same
+project at every prompt, and a warning before editing a file another
+session edited recently. The **Projects** page of the web UI shows every
+project's notes, searches them and edits them.
+
+Every read is scoped to the calling session's workspace in the hub; a
+session never sees another workspace's notes. A tool call is one round
+trip session → collector → hub with a 5 s budget.
+
+While the hub is unreachable, writes are queued in the collector's outbox
+(the tool says so) and replayed in order when the link returns; reads come
+from a cache of the live notes the hub pushes to every collector on
+connect and on every change, kept in `~/.local/state/ccdash/notes-cache.json`.
+`doc_write` carries the version the edit was based on and the hub refuses
+a stale one, so shared documents never lose an edit silently. A session
+that started during an outage gets a one-off catch-up at its first prompt
+after the link returns.
+
+A daily pass marks memories stale when they were not verified for 90 days
+or not recalled for 60 (`knowledge.stale_unverified_days`,
+`knowledge.stale_unrecalled_days`; `knowledge.reflect = false` turns it
+off). Stale notes stay searchable but are no longer injected; the Projects
+page lists them so you can verify, rewrite or archive them. A note that
+`supersedes` another retires it.
+
+```sh
+# one note per memory file (safe to rerun)
+ccdash import memory ~/code/work/.claude/memory
+# the doc, its checkboxes as issues, its log as progress
+ccdash import plan ~/code/work/meta/plans/x.md --project x
+# every note as markdown with frontmatter
+ccdash export --config /etc/ccdash/hub.toml ./notes
+```
+
+`import` runs on a workstation and sends through its collector; `export`
+reads the database (or a backup copy with `--db`) directly. Collector
+settings `inject.session_start`, `inject.prompt` and `inject.edits` turn
+the three injections off individually.
+
 ## Desktop (DankMaterialShell)
 
 `services.ccdash.dms.enable = true;` links the [DMS plugin](dms-plugin/) into
@@ -348,6 +396,7 @@ Every row carries the host it came from. The database keeps 30 days
   cost, rate limits, model, lines changed)
 - `proc_samples`: once a minute per session (CPU, memory, process count)
 - `sessions`: id, directory, title, kind, start and end
+- `notes`, `links`, `notes_fts`: the knowledge layer (not pruned)
 - `limit_samples`: per-model weekly limits from each `/usage` poll
 - `telemetry` (with telemetry on): API requests (model, tokens, cost,
   latency), API errors, tool approval decisions, commits, pull requests,

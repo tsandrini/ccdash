@@ -11,10 +11,21 @@
 //! `ccdash channel` (see `crate::channel`); `{"cmd":"ask","envelope":{…}}`
 //! into a prompt held by `ccdash ask`, answered with one
 //! `{"type":"decision","decision":{…}}` line or closed without one.
+//!
+//! Knowledge: `{"cmd":"tool","name":"…","args":{…},"pid":N,"session":"…",
+//! "cwd":"…"}` runs a knowledge tool (reply `{"type":"tool","ok":bool,
+//! "text":"…"}`); `{"cmd":"inject","envelope":{…}}` asks for a hook's
+//! context (`{"type":"context","text":"…"}` or `{"type":"none"}`);
+//! `{"cmd":"import","dir":"…","notes":[…]}` loads notes into the hub.
+//! Writes are queued while the hub is unreachable, reads fall back to the
+//! notes cache.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -30,8 +41,22 @@ use tokio::{
 };
 use tracing::debug;
 
-use super::{Local, LocalCmd};
-use crate::{actions, ask::Answer, config::CollectorConfig, protocol::Call, wire::Envelope};
+use super::{Local, LocalCmd, NOT_CONNECTED, TIMED_OUT};
+use crate::{
+    actions,
+    ask::Answer,
+    config::CollectorConfig,
+    knowledge::{Upsert, tools},
+    protocol::{Call, Injection, Reply, Who},
+    wire::Envelope,
+};
+
+/// How long a tool waits for the hub before it answers from the cache or
+/// reports the write unconfirmed; the channel gives up at 5 s.
+const TOOL_WAIT: Duration = Duration::from_millis(4000);
+/// Hooks run with a 5 s timeout; `ccdash emit` waits a little longer than this.
+const START_WAIT: Duration = Duration::from_millis(2500);
+const HOOK_WAIT: Duration = Duration::from_millis(1200);
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -59,6 +84,20 @@ enum Request {
     },
     Ask {
         envelope: Box<Envelope>,
+    },
+    Tool {
+        name: String,
+        #[serde(default)]
+        args: Value,
+        #[serde(flatten)]
+        who: Who,
+    },
+    Inject {
+        envelope: Box<Envelope>,
+    },
+    Import {
+        dir: String,
+        notes: Vec<Upsert>,
     },
 }
 
@@ -94,41 +133,173 @@ async fn handle(stream: UnixStream, local: Local, cfg: Arc<CollectorConfig>) -> 
             }
             Ok(Request::Rename { id, title }) => {
                 let session = resolve(&local, &id).await?;
-                match local.call(Call::Rename { session, title }).await? {
-                    Ok(_) => json!({
-                        "type": "ok",
-                        "message": "renamed; Claude Code adopts it at the next prompt",
-                    }),
-                    Err(e) => error(e),
-                }
+                done(
+                    local.call(Call::Rename { session, title }).await?,
+                    "renamed; Claude Code adopts it at the next prompt",
+                )
             }
             Ok(Request::Reply { id, text }) => {
                 let session = resolve(&local, &id).await?;
-                match local.call(Call::Reply { session, text }).await? {
-                    Ok(_) => json!({ "type": "ok", "message": "sent" }),
-                    Err(e) => error(e),
-                }
+                done(local.call(Call::Reply { session, text }).await?, "sent")
             }
             Ok(Request::Answer { id, ask, answer }) => {
                 let session = resolve(&local, &id).await?;
-                match local
-                    .call(Call::Answer {
-                        session,
-                        ask,
-                        answer,
-                    })
-                    .await?
-                {
-                    Ok(_) => json!({ "type": "ok", "message": "answered" }),
-                    Err(e) => error(e),
-                }
+                done(
+                    local
+                        .call(Call::Answer {
+                            session,
+                            ask,
+                            answer,
+                        })
+                        .await?,
+                    "answered",
+                )
             }
             Ok(Request::Channel { pid }) => return channel(lines, write, local, pid).await,
             Ok(Request::Ask { envelope }) => return ask(lines, write, local, envelope).await,
+            Ok(Request::Tool { name, args, who }) => tool(&local, &name, &args, who).await?,
+            Ok(Request::Inject { envelope }) => inject(&local, &cfg, &envelope).await?,
+            Ok(Request::Import { dir, notes }) => {
+                match local
+                    .call_within(Call::Import { dir, notes }, Duration::from_secs(60))
+                    .await?
+                {
+                    Ok(reply) => json!({ "type": "ok", "message": tools::text_of(&reply) }),
+                    Err(e) => error(e),
+                }
+            }
         };
         send(&mut write, &reply).await?;
     }
     Ok(())
+}
+
+fn done(result: Result<Reply, String>, message: &str) -> Value {
+    match result {
+        Ok(_) => json!({ "type": "ok", "message": message }),
+        Err(e) => error(e),
+    }
+}
+
+/// Runs a knowledge tool: on the hub when the link is up, else writes are
+/// queued and reads come from the cache.
+async fn tool(local: &Local, name: &str, args: &Value, who: Who) -> Result<Value> {
+    let call = match tools::call(name, args, who.clone()) {
+        Ok(call) => call,
+        Err(e) => return Ok(tool_reply(false, format!("{e:#}"))),
+    };
+    let write = tools::is_write(&call);
+    let connected = local.connected().await?;
+    if !connected && write {
+        local.send(LocalCmd::Queue(call)).await?;
+        return Ok(tool_reply(
+            true,
+            "queued: the ccdash hub is offline; the write lands when the link returns",
+        ));
+    }
+    if !connected {
+        return cached(local, &who, call).await;
+    }
+    match local.call_within(call.clone(), TOOL_WAIT).await? {
+        Ok(reply) => Ok(tool_reply(true, tools::text_of(&reply))),
+        Err(e) if write && e == NOT_CONNECTED => {
+            local.send(LocalCmd::Queue(call)).await?;
+            Ok(tool_reply(
+                true,
+                "queued: the hub link dropped; the write lands when it returns",
+            ))
+        }
+        Err(e) if write && e == TIMED_OUT => Ok(tool_reply(
+            false,
+            "the hub did not confirm in time; the write may have landed, recall it before retrying",
+        )),
+        Err(e) if e == NOT_CONNECTED || e == TIMED_OUT => Ok(cached(local, &who, call).await?),
+        Err(e) => Ok(tool_reply(false, e)),
+    }
+}
+
+async fn cached(local: &Local, who: &Who, call: Call) -> Result<Value> {
+    let Call::Recall { query, .. } = call else {
+        return Ok(tool_reply(false, "the hub is offline"));
+    };
+    Ok(match local.cached(who.clone(), query).await? {
+        Ok(Reply::Hits(hits)) => tool_reply(true, tools::hits_text(&hits, "the offline cache")),
+        Ok(reply) => tool_reply(
+            true,
+            format!(
+                "{}
+(from the offline cache; links not shown)",
+                tools::text_of(&reply)
+            ),
+        ),
+        Err(e) => tool_reply(false, e),
+    })
+}
+
+fn tool_reply(ok: bool, text: impl Into<String>) -> Value {
+    json!({ "type": "tool", "ok": ok, "text": text.into() })
+}
+
+/// The context a hook injects, from the hub or (session starts) the cache.
+async fn inject(local: &Local, cfg: &CollectorConfig, env: &Envelope) -> Result<Value> {
+    let Some(what) = tools::injection_of(&env.payload) else {
+        return Ok(json!({ "type": "none" }));
+    };
+    let wanted = match what {
+        Injection::SessionStart => cfg.inject.session_start,
+        Injection::Prompt { .. } => cfg.inject.prompt,
+        Injection::Edit { .. } => cfg.inject.edits,
+    };
+    if !wanted {
+        return Ok(json!({ "type": "none" }));
+    }
+    let who = Who {
+        session: env.payload["session_id"].as_str().map(str::to_owned),
+        pid: env.pid,
+        cwd: env.payload["cwd"].as_str().map(str::to_owned),
+    };
+    let text = if local.connected().await? {
+        let what = match (&what, &who.session) {
+            (Injection::Prompt { .. }, Some(session)) => Injection::Prompt {
+                since: local.catch_up(session).await?,
+            },
+            _ => what.clone(),
+        };
+        let wait = if what == Injection::SessionStart {
+            START_WAIT
+        } else {
+            HOOK_WAIT
+        };
+        match local
+            .call_within(
+                Call::Inject {
+                    who: who.clone(),
+                    what: what.clone(),
+                },
+                wait,
+            )
+            .await?
+        {
+            Ok(Reply::Context(text)) => {
+                debug!(
+                    "inject {what:?}: {} chars",
+                    text.as_ref().map_or(0, String::len)
+                );
+                text
+            }
+            Ok(_) => None,
+            Err(e) => {
+                debug!("inject {what:?}: {e}; falling back to the cache");
+                local.offline_inject(who, what).await?
+            }
+        }
+    } else {
+        local.offline_inject(who, what).await?
+    };
+    Ok(match text {
+        Some(text) => json!({ "type": "context", "text": text }),
+        None => json!({ "type": "none" }),
+    })
 }
 
 /// The full id behind a key the mirror knows; unknown keys pass through

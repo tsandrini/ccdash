@@ -290,8 +290,21 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
-    Session { session: Box<Session> },
-    Removed { host: String, id: String },
-    RateLimits { rate_limits: RateLimits },
-    Hosts { hosts: Vec<HostStatus> },
+    Session {
+        session: Box<Session>,
+    },
+    Removed {
+        host: String,
+        id: String,
+    },
+    RateLimits {
+        rate_limits: RateLimits,
+    },
+    Hosts {
+        hosts: Vec<HostStatus>,
+    },
+    /// Notes of `workspace` changed; the panel reloads what it shows.
+    Notes {
+        workspace: String,
+    },
 }

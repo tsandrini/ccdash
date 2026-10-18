@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     fs::Permissions,
     os::unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -31,13 +31,15 @@ use crate::{
     agents,
     channel::ToChannel,
     config::CollectorConfig,
+    knowledge::{self, Note, Query},
     model::{HostStatus, RateLimits, ScopedLimit, Session, Snapshot, Update},
     niri, otlp, paths, procs,
-    protocol::{Call, TelemetryRecord, ToCollector, ToHub},
+    protocol::{Call, Injection, Reply, TelemetryRecord, ToCollector, ToHub, Who, WorkspaceDir},
     state::{AgentEntry, NiriEvent, ProcPoll, StoreMsg, Window},
     usage,
     util::{self, now_ms, pid_alive},
     wire::{self, Envelope},
+    workspace::Workspaces,
 };
 
 /// Everything the local actor reacts to.
@@ -52,7 +54,20 @@ pub enum LocalCmd {
     Resolve(String, oneshot::Sender<Option<Session>>),
     Pids(oneshot::Sender<Vec<(String, u32)>>),
     /// Something only the hub can do; answered with its result.
-    Call(Call, oneshot::Sender<Result<Session, String>>),
+    Call(Call, oneshot::Sender<Result<Reply, String>>),
+    /// Whether the hub link is up right now.
+    Connected(oneshot::Sender<bool>),
+    /// A knowledge write made while the hub is unreachable: parked in the
+    /// outbox, carried out when the link returns.
+    Queue(Call),
+    /// A read answered from the notes cache.
+    Cached(Who, Query, oneshot::Sender<Result<Reply, String>>),
+    /// A hook injection while the hub is unreachable: the session is
+    /// marked for a catch-up, and a session start is served from the cache.
+    OfflineInject(Who, Injection, oneshot::Sender<Option<String>>),
+    /// Takes the catch-up mark of a session: since when it has been
+    /// missing the hub, if it has.
+    CatchUp(String, oneshot::Sender<Option<i64>>),
     /// A `ccdash channel` connected for the Claude process `pid`; `u64`
     /// tells its connections apart.
     ChannelOpen(u32, u64, mpsc::Sender<ToChannel>),
@@ -110,14 +125,54 @@ impl Local {
         rx.await.context("collector stopped")
     }
 
-    pub async fn call(&self, call: Call) -> Result<Result<Session, String>> {
+    pub async fn call(&self, call: Call) -> Result<Result<Reply, String>> {
+        self.call_within(call, Duration::from_secs(15)).await
+    }
+
+    /// `call`, giving up after `limit`; the hub's late answer is dropped.
+    pub async fn call_within(&self, call: Call, limit: Duration) -> Result<Result<Reply, String>> {
         let (tx, rx) = oneshot::channel();
         self.send(LocalCmd::Call(call, tx)).await?;
-        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+        match tokio::time::timeout(limit, rx).await {
             Ok(result) => result.context("collector stopped"),
-            Err(_) => Ok(Err("the hub did not answer in time".into())),
+            Err(_) => Ok(Err(TIMED_OUT.into())),
         }
     }
+
+    pub async fn connected(&self) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(LocalCmd::Connected(tx)).await?;
+        rx.await.context("collector stopped")
+    }
+
+    pub async fn cached(&self, who: Who, query: Query) -> Result<Result<Reply, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(LocalCmd::Cached(who, query, tx)).await?;
+        rx.await.context("collector stopped")
+    }
+
+    pub async fn offline_inject(&self, who: Who, what: Injection) -> Result<Option<String>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(LocalCmd::OfflineInject(who, what, tx)).await?;
+        rx.await.context("collector stopped")
+    }
+
+    pub async fn catch_up(&self, session: &str) -> Result<Option<i64>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(LocalCmd::CatchUp(session.to_owned(), tx)).await?;
+        rx.await.context("collector stopped")
+    }
+}
+
+pub const NOT_CONNECTED: &str = "the hub is not connected";
+pub const TIMED_OUT: &str = "the hub did not answer in time";
+
+/// What the collector keeps on disk of the hub's notes.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct NotesCache {
+    workspaces: Vec<WorkspaceDir>,
+    /// Workspace → its live notes.
+    notes: HashMap<String, Vec<Note>>,
 }
 
 pub fn run(cfg: CollectorConfig) -> Result<()> {
@@ -145,7 +200,12 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
     let (hub_tx, hub_rx) = mpsc::unbounded_channel();
     let (local, rx) = Local::spawn();
     tokio::spawn(run_actor(
-        Actor::new(host.clone(), hub_tx, local.updates.clone()),
+        Actor::new(
+            host.clone(),
+            hub_tx,
+            local.updates.clone(),
+            paths::notes_cache(),
+        ),
         rx,
     ));
     tokio::spawn(link::run(
@@ -271,19 +331,27 @@ struct Actor {
     link_since: i64,
     hub_host: String,
     web_url: String,
-    workspaces: Vec<String>,
+    workspaces: Workspaces,
     sessions: HashMap<String, Session>,
     rate_limits: Option<RateLimits>,
     channels: HashMap<u32, (u64, mpsc::Sender<ToChannel>)>,
     /// Held prompts by ask id: the envelope (for a resend) and the hook's
     /// decision slot.
     held: HashMap<String, (Envelope, oneshot::Sender<Value>)>,
-    calls: HashMap<u64, oneshot::Sender<Result<Session, String>>>,
+    calls: HashMap<u64, oneshot::Sender<Result<Reply, String>>>,
     next_call: u64,
     windows: HashMap<u64, Window>,
     focused: Option<u64>,
     niri_seen: bool,
     updates: broadcast::Sender<Value>,
+    /// The hub's live notes by workspace and slug, kept on disk too.
+    notes: HashMap<String, HashMap<String, Note>>,
+    cache_path: PathBuf,
+    /// Sessions that asked while the hub was unreachable, with the moment
+    /// the link went down; the next prompt after reconnecting catches up.
+    offline: HashMap<String, i64>,
+    /// When the link went down, until it comes back.
+    down_at: Option<i64>,
 }
 
 impl Actor {
@@ -291,7 +359,17 @@ impl Actor {
         host: String,
         hub: mpsc::UnboundedSender<ToHub>,
         updates: broadcast::Sender<Value>,
+        cache_path: PathBuf,
     ) -> Self {
+        let cache: NotesCache = std::fs::read(&cache_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let notes = cache
+            .notes
+            .into_iter()
+            .map(|(ws, notes)| (ws, notes.into_iter().map(|n| (n.slug.clone(), n)).collect()))
+            .collect();
         Self {
             host,
             hub,
@@ -299,7 +377,7 @@ impl Actor {
             link_since: now_ms(),
             hub_host: String::new(),
             web_url: String::new(),
-            workspaces: Vec::new(),
+            workspaces: Workspaces::from_entries(&cache.workspaces),
             sessions: HashMap::new(),
             rate_limits: None,
             channels: HashMap::new(),
@@ -310,11 +388,100 @@ impl Actor {
             focused: None,
             niri_seen: false,
             updates,
+            notes,
+            cache_path,
+            offline: HashMap::new(),
+            down_at: None,
         }
     }
 
     fn to_hub(&self, msg: ToHub) {
         let _ = self.hub.send(msg);
+    }
+
+    /// Writes the notes cache; a torn file would only cost offline reads.
+    fn save_cache(&self) {
+        let cache = NotesCache {
+            workspaces: self.workspaces.entries(),
+            notes: self
+                .notes
+                .iter()
+                .map(|(ws, notes)| (ws.clone(), notes.values().cloned().collect()))
+                .collect(),
+        };
+        let tmp = self.cache_path.with_extension("json.tmp");
+        let result = serde_json::to_vec(&cache)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&tmp, bytes))
+            .and_then(|()| std::fs::set_permissions(&tmp, Permissions::from_mode(0o600)))
+            .and_then(|()| std::fs::rename(&tmp, &self.cache_path));
+        if let Err(e) = result {
+            warn!("notes cache: {e}");
+        }
+    }
+
+    /// The cached live notes of the workspace holding `cwd`.
+    fn cached_notes(&self, who: &Who) -> Result<(String, Option<String>, Vec<Note>), String> {
+        let cwd = who
+            .pid
+            .and_then(|pid| self.sessions.values().find(|s| s.pid == Some(pid)))
+            .map(|s| s.cwd.clone())
+            .or_else(|| {
+                who.session
+                    .as_deref()
+                    .and_then(|id| self.sessions.get(id))
+                    .map(|s| s.cwd.clone())
+            })
+            .or_else(|| who.cwd.clone())
+            .ok_or("cannot tell which session is asking")?;
+        let (ws, project) = self
+            .workspaces
+            .locate(&cwd)
+            .ok_or_else(|| format!("{cwd} is outside every ccdash workspace"))?;
+        let notes = self
+            .notes
+            .get(&ws)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        Ok((ws, project, notes))
+    }
+
+    fn cached(&self, who: &Who, query: &Query) -> Result<Reply, String> {
+        let (_, _, notes) = self.cached_notes(who)?;
+        if let Some(slug) = &query.slug {
+            let note = notes
+                .into_iter()
+                .find(|n| &n.slug == slug)
+                .ok_or_else(|| format!("no note {slug:?} in the offline cache"))?;
+            return Ok(Reply::Note(Box::new(knowledge::NoteView {
+                note,
+                links: Vec::new(),
+                backlinks: Vec::new(),
+            })));
+        }
+        Ok(Reply::Hits(knowledge::search_cached(&notes, query)))
+    }
+
+    fn offline_inject(&mut self, who: &Who, what: &Injection) -> Option<String> {
+        if let Some(session) = &who.session {
+            self.offline
+                .entry(session.clone())
+                .or_insert(self.link_since);
+        }
+        match what {
+            Injection::SessionStart => {
+                let (ws, project, notes) = self.cached_notes(who).ok()?;
+                let cards: Vec<knowledge::Card> = notes.iter().map(Note::card).collect();
+                knowledge::session_start(&cards, &ws, project.as_deref(), now_ms()).map(|text| {
+                    format!(
+                        "{text}
+(The ccdash hub is unreachable; this comes from the collector's cache and writes are queued.)
+"
+                    )
+                })
+            }
+            _ => None,
+        }
     }
 
     fn snapshot(&self, now: i64) -> Snapshot {
@@ -323,7 +490,7 @@ impl Actor {
         Snapshot {
             host: self.host.clone(),
             now,
-            workspaces: self.workspaces.clone(),
+            workspaces: self.workspaces.names(),
             hosts: vec![HostStatus {
                 name: self.host.clone(),
                 connected: self.connected,
@@ -375,7 +542,27 @@ impl Actor {
             } => {
                 self.hub_host = host;
                 self.web_url = web_url;
-                self.workspaces = workspaces;
+                self.workspaces = Workspaces::from_entries(&workspaces);
+            }
+            ToCollector::Notes { workspace, notes } => {
+                self.notes.insert(
+                    workspace,
+                    notes.into_iter().map(|n| (n.slug.clone(), n)).collect(),
+                );
+                self.save_cache();
+            }
+            ToCollector::NoteChanged { note } => {
+                let live = matches!(
+                    note.status,
+                    knowledge::Status::Active | knowledge::Status::Stale
+                );
+                let map = self.notes.entry(note.workspace.clone()).or_default();
+                if live {
+                    map.insert(note.slug.clone(), *note);
+                } else {
+                    map.remove(&note.slug);
+                }
+                self.save_cache();
             }
             ToCollector::Snapshot {
                 sessions,
@@ -399,7 +586,7 @@ impl Actor {
                     Update::RateLimits { rate_limits } => {
                         self.rate_limits = Some(rate_limits.clone());
                     }
-                    Update::Hosts { .. } => return,
+                    Update::Hosts { .. } | Update::Notes { .. } => return,
                 }
                 self.publish(serde_json::to_value(&update).unwrap_or(Value::Null));
             }
@@ -429,7 +616,7 @@ impl Actor {
             }
             ToCollector::Result { id, result } => {
                 if let Some(reply) = self.calls.remove(&id) {
-                    let _ = reply.send(result.map(|s| *s));
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -459,10 +646,11 @@ impl Actor {
     fn link_down(&mut self) {
         self.connected = false;
         self.link_since = now_ms();
+        self.down_at.get_or_insert(self.link_since);
         // NOTE: a held hook would otherwise wait for a decision nobody can give
         self.held.clear();
         for (_, reply) in self.calls.drain() {
-            let _ = reply.send(Err("the hub is not connected".into()));
+            let _ = reply.send(Err(NOT_CONNECTED.into()));
         }
         self.publish(self.tagged("snapshot", &self.snapshot(now_ms())));
     }
@@ -545,13 +733,26 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
             }
             LocalCmd::Call(call, reply) => {
                 if !a.connected {
-                    let _ = reply.send(Err("the hub is not connected".into()));
+                    let _ = reply.send(Err(NOT_CONNECTED.into()));
                     continue;
                 }
                 let id = a.next_call;
                 a.next_call += 1;
                 a.calls.insert(id, reply);
                 a.to_hub(ToHub::Call { id, call });
+            }
+            LocalCmd::Connected(reply) => {
+                let _ = reply.send(a.connected);
+            }
+            LocalCmd::Queue(call) => a.to_hub(ToHub::Queued { call, at: now_ms() }),
+            LocalCmd::Cached(who, query, reply) => {
+                let _ = reply.send(a.cached(&who, &query));
+            }
+            LocalCmd::OfflineInject(who, what, reply) => {
+                let _ = reply.send(a.offline_inject(&who, &what));
+            }
+            LocalCmd::CatchUp(session, reply) => {
+                let _ = reply.send(a.offline.remove(&session));
             }
             LocalCmd::ChannelOpen(pid, conn, tx) => {
                 a.channels.insert(pid, (conn, tx));
@@ -584,6 +785,18 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
             LocalCmd::LinkUp => {
                 a.connected = true;
                 a.link_since = now_ms();
+                // NOTE: every session that lived through the outage catches up at its next prompt
+                if let Some(down) = a.down_at.take() {
+                    let live: Vec<String> = a
+                        .sessions
+                        .values()
+                        .filter(|s| s.activity != crate::model::Activity::Gone)
+                        .map(|s| s.id.clone())
+                        .collect();
+                    for id in live {
+                        a.offline.entry(id).or_insert(down);
+                    }
+                }
                 a.resync();
             }
             LocalCmd::LinkDown => a.link_down(),

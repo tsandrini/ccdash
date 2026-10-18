@@ -21,6 +21,7 @@ pub struct HubConfig {
     pub store: Store,
     pub workspaces: Workspaces,
     pub notify: Notify,
+    pub knowledge: Knowledge,
 }
 
 /// `ccdash collector`: the hub link plus everything read on this machine.
@@ -38,6 +39,51 @@ pub struct CollectorConfig {
     pub telemetry: Telemetry,
     pub usage: Usage,
     pub queue: Queue,
+    pub inject: Inject,
+}
+
+/// The knowledge layer's lifecycle: a daily pass that flags memories.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Knowledge {
+    /// Whether the daily pass runs at all.
+    pub reflect: bool,
+    /// Memories not verified for this many days turn stale; 0 never.
+    pub stale_unverified_days: u32,
+    /// Memories not recalled for this many days turn stale; 0 never.
+    pub stale_unrecalled_days: u32,
+}
+
+/// What the hooks inject into sessions from the knowledge layer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Inject {
+    /// Open issues, memories, documents and recent progress at session start.
+    pub session_start: bool,
+    /// Other sessions active in the project, at every prompt.
+    pub prompt: bool,
+    /// Who else edited the file, before an edit.
+    pub edits: bool,
+}
+
+impl Default for Knowledge {
+    fn default() -> Self {
+        Self {
+            reflect: true,
+            stale_unverified_days: 90,
+            stale_unrecalled_days: 60,
+        }
+    }
+}
+
+impl Default for Inject {
+    fn default() -> Self {
+        Self {
+            session_start: true,
+            prompt: true,
+            edits: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -29,6 +29,9 @@ use crate::{
 };
 
 const TICK: Duration = Duration::from_secs(15);
+/// The lifecycle pass: once after start-up, then daily.
+const REFLECT_FIRST: Duration = Duration::from_secs(120);
+const REFLECT_EVERY: Duration = Duration::from_secs(24 * 3600);
 
 pub fn run(cfg: HubConfig) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
@@ -64,6 +67,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
         workspaces.clone(),
         store.clone(),
         notes,
+        cfg.knowledge.clone(),
     );
     let tokens = collect::Tokens::new(cfg.collect.tokens.clone());
     if cfg.collect.tokens.is_empty() {
@@ -85,6 +89,9 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
         ));
     }
     tokio::spawn(ticker(hub.sender()));
+    if cfg.knowledge.reflect {
+        tokio::spawn(reflector(hub.sender()));
+    }
     info!("ccdash hub up on {host}, web UI at {public_url}");
 
     let mut term = signal(SignalKind::terminate())?;
@@ -103,5 +110,15 @@ async fn ticker(tx: mpsc::Sender<Cmd>) {
         if tx.send(Cmd::Tick(now_ms())).await.is_err() {
             return;
         }
+    }
+}
+
+async fn reflector(tx: mpsc::Sender<Cmd>) {
+    tokio::time::sleep(REFLECT_FIRST).await;
+    loop {
+        if tx.send(Cmd::Reflect).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(REFLECT_EVERY).await;
     }
 }

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
+    knowledge::Upsert,
     model::{Activity, Session, Snapshot},
     paths,
     util::{now_ms, truncate},
@@ -28,6 +29,21 @@ fn request(request: &Value) -> Result<Value> {
         bail!("{}", reply["message"].as_str().unwrap_or("unknown error"));
     }
     Ok(reply)
+}
+
+/// Sends `notes` to the hub for the workspace holding `source`.
+pub fn import(source: &std::path::Path, notes: Vec<Upsert>) -> Result<()> {
+    if notes.is_empty() {
+        bail!("nothing to import from {}", source.display());
+    }
+    let n = notes.len();
+    let reply = request(&json!({ "cmd": "import", "dir": source, "notes": notes }))?;
+    println!(
+        "{n} notes from {}: {}",
+        source.display(),
+        reply["message"].as_str().unwrap_or("done")
+    );
+    Ok(())
 }
 
 pub fn status(as_json: bool) -> Result<()> {

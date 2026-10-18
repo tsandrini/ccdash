@@ -38,6 +38,12 @@ pub fn outbox_file() -> PathBuf {
     state_dir().join("outbox.ndjson")
 }
 
+/// The collector's copy of the workspaces' live notes, for reads while
+/// the hub is unreachable.
+pub fn notes_cache() -> PathBuf {
+    state_dir().join("notes-cache.json")
+}
+
 pub fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join("ccdash")
 }

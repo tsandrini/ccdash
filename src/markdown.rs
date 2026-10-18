@@ -5,13 +5,25 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
 
 pub fn render(text: &str) -> String {
+    render_with(text, false)
+}
+
+/// `render`, also keeping `note:<slug>` links, which the panel turns into
+/// note views.
+pub fn render_notes(text: &str) -> String {
+    render_with(text, true)
+}
+
+fn render_with(text: &str, notes: bool) -> String {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut in_unsafe_link = false;
     let events = Parser::new_ext(text, options).filter_map(|event| match event {
         Event::Html(raw) | Event::InlineHtml(raw) => Some(Event::Text(raw)),
         Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
-        Event::Start(Tag::Link { ref dest_url, .. }) if !safe_url(dest_url) => {
+        Event::Start(Tag::Link { ref dest_url, .. })
+            if !(safe_url(dest_url) || (notes && note_url(dest_url))) =>
+        {
             in_unsafe_link = true;
             None
         }
@@ -24,6 +36,11 @@ pub fn render(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 3 / 2);
     html::push_html(&mut out, events);
     out
+}
+
+fn note_url(url: &str) -> bool {
+    url.strip_prefix("note:")
+        .is_some_and(crate::knowledge::valid_slug)
 }
 
 fn safe_url(url: &str) -> bool {
@@ -51,6 +68,15 @@ mod tests {
         assert!(out.contains(r#"<a href="https://example.com">ok</a>"#));
         assert!(!out.contains("javascript:"));
         assert!(out.contains("bad") && out.contains("rel"));
+        assert_eq!(out.matches("<a ").count(), 1);
+    }
+
+    #[test]
+    fn note_links_only_where_asked() {
+        let text = "[a](note:a-b) [bad](note:Nope)";
+        assert_eq!(render(text).matches("<a ").count(), 0);
+        let out = render_notes(text);
+        assert!(out.contains(r#"<a href="note:a-b">a</a>"#), "{out}");
         assert_eq!(out.matches("<a ").count(), 1);
     }
 

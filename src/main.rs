@@ -11,6 +11,7 @@ mod conversation;
 mod emit;
 mod history;
 mod hub;
+mod knowledge;
 mod markdown;
 mod model;
 mod niri;
@@ -120,6 +121,17 @@ enum Command {
         /// Where the copy goes (replaced atomically).
         dest: PathBuf,
     },
+    /// Write every note of the hub's database as markdown with frontmatter:
+    /// `<dir>/<workspace>/<kind>/<slug>.md`. Reads the database directly,
+    /// so it works on a backup copy too.
+    Export {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// A database file to read instead of the configured one.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -131,6 +143,18 @@ enum Import {
         config: Option<PathBuf>,
         /// The database to read, e.g. a copy of `~/.local/state/ccdash/ccdash.db`.
         source: PathBuf,
+    },
+    /// A workspace's `.claude/memory` directory: one memory note per file,
+    /// keyed by its `name`, sent to the hub through this machine's
+    /// collector. Safe to repeat.
+    Memory { dir: PathBuf },
+    /// A markdown plan: the file as a document, its checkboxes as issues,
+    /// its `## Log` entries as progress notes. Safe to repeat.
+    Plan {
+        file: PathBuf,
+        /// The repo directory name the plan is about (default: none).
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -157,8 +181,21 @@ fn main() -> ExitCode {
         Command::Import {
             what: Import::Db { config, source },
         } => import_db(config, &source),
+        Command::Import {
+            what: Import::Memory { dir },
+        } => std::path::absolute(&dir)
+            .map_err(Into::into)
+            .and_then(|dir| Ok((hub::import::memory_dir(&dir)?, dir)))
+            .and_then(|(notes, dir)| client::import(&dir, notes)),
+        Command::Import {
+            what: Import::Plan { file, project },
+        } => std::path::absolute(&file)
+            .map_err(Into::into)
+            .and_then(|file| Ok((hub::import::plan_file(&file, project.as_deref())?, file)))
+            .and_then(|(notes, file)| client::import(&file, notes)),
         Command::Backup { config, dest } => config::load::<HubConfig>(config)
             .and_then(|cfg| hub::backup::backup(&cfg.store_path(), &dest)),
+        Command::Export { config, db, dir } => export(config, db, &dir),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -206,6 +243,21 @@ fn print_url(config: Option<PathBuf>, hub: bool, qr: bool) -> Result<()> {
         println!("{}", util::qr_text(&url)?);
     }
     println!("{url}");
+    Ok(())
+}
+
+fn export(config: Option<PathBuf>, db: Option<PathBuf>, dir: &Path) -> Result<()> {
+    let path = match db {
+        Some(db) => db,
+        None => config::load::<HubConfig>(config)?.store_path(),
+    };
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+    let n = knowledge::export(&conn, dir)?;
+    println!("{n} notes written under {}", dir.display());
     Ok(())
 }
 

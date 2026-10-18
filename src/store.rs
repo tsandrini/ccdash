@@ -14,9 +14,11 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
+use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::{
+    knowledge,
     model::{Kind, Stamped, Turn},
     paths,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
@@ -114,9 +116,16 @@ ON CONFLICT (id) DO UPDATE SET
 
 const PRUNE_EVERY_MS: i64 = 3_600_000;
 
+/// Work for the writer thread.
+enum Job {
+    Msg(String, StoreMsg),
+    /// Runs on the writer connection, between batches.
+    Exec(Box<dyn FnOnce(&mut Connection) + Send>),
+}
+
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::Sender<(String, StoreMsg)>,
+    tx: mpsc::Sender<Job>,
     path: PathBuf,
 }
 
@@ -137,7 +146,22 @@ impl Store {
 
     /// Queues `msg`, which came from `host`.
     pub fn send(&self, host: &str, msg: StoreMsg) {
-        let _ = self.tx.send((host.to_owned(), msg));
+        let _ = self.tx.send(Job::Msg(host.to_owned(), msg));
+    }
+
+    /// Runs `f` on the writer connection (the one place that writes) and
+    /// hands back its result; queued messages ahead of it land first.
+    pub async fn exec<R, F>(&self, f: F) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Connection) -> R + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let job = Job::Exec(Box::new(move |conn| {
+            let _ = tx.send(f(conn));
+        }));
+        self.tx.send(job).ok().context("store stopped")?;
+        rx.await.context("store stopped")
     }
 
     pub fn reader(&self) -> Result<Connection> {
@@ -167,16 +191,30 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(knowledge::SCHEMA)?;
     migrate(&conn)?;
     Ok(conn)
 }
 
-fn writer(mut conn: Connection, rx: mpsc::Receiver<(String, StoreMsg)>, retention_ms: i64) {
+fn writer(mut conn: Connection, rx: mpsc::Receiver<Job>, retention_ms: i64) {
     let mut last_prune = 0;
     while let Ok(first) = rx.recv() {
-        let batch: Vec<(String, StoreMsg)> = std::iter::once(first).chain(rx.try_iter()).collect();
+        let mut batch: Vec<(String, StoreMsg)> = Vec::new();
+        for job in std::iter::once(first).chain(rx.try_iter()) {
+            match job {
+                Job::Msg(host, msg) => batch.push((host, msg)),
+                Job::Exec(f) => {
+                    if let Err(e) = write_batch(&mut conn, &batch) {
+                        warn!("store: {e:#}");
+                    }
+                    batch.clear();
+                    f(&mut conn);
+                }
+            }
+        }
         if let Err(e) = write_batch(&mut conn, &batch) {
             warn!("store: {e:#}");
         }
@@ -191,6 +229,9 @@ fn writer(mut conn: Connection, rx: mpsc::Receiver<(String, StoreMsg)>, retentio
 }
 
 fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
     let tx = conn.transaction()?;
     for (host, msg) in batch {
         match msg {

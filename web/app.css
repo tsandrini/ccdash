@@ -2427,3 +2427,299 @@ dl.ask-preview {
   text-underline-offset: 2px;
   cursor: pointer;
 }
+
+/* --- projects view (knowledge) --- */
+
+#projects-toolbar {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.search-input,
+.text-input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--axis);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font: 14px var(--font);
+}
+
+.search-input {
+  flex: 1 1 240px;
+  max-width: 420px;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.toolbar-actions .btn {
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.workspace {
+  margin: 0 0 24px;
+}
+
+.workspace-title {
+  margin: 8px 0 12px;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.project {
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  box-shadow: 0 0 0 1px var(--border);
+}
+
+.project-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.project-head h3,
+.flagged h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.note-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px 20px;
+}
+
+.note-column h4,
+.note-refs h4 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 4px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.count {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 11px;
+}
+
+.note-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.note-list li + li {
+  border-top: 1px solid var(--border);
+}
+
+.note-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  width: 100%;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.note-row:hover {
+  background: var(--surface-2);
+}
+
+.note-title {
+  font-weight: 600;
+}
+
+.note-line {
+  flex-basis: 100%;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-results .note-line {
+  white-space: normal;
+}
+
+.note-line mark {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: color-mix(in oklab, var(--warning) 35%, transparent);
+  color: inherit;
+}
+
+.note-date {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.prio {
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.prio-high {
+  background: color-mix(in oklab, var(--critical) 18%, transparent);
+  color: var(--critical);
+}
+
+.prio-low {
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.kind {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+
+.kind-issue {
+  background: color-mix(in oklab, var(--permission) 18%, transparent);
+  color: var(--permission);
+}
+
+.kind-doc {
+  background: color-mix(in oklab, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+
+.kind-progress {
+  background: color-mix(in oklab, var(--your-turn) 18%, transparent);
+  color: var(--your-turn);
+}
+
+.badge-stale {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--warning) 25%, transparent);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.flagged {
+  margin-bottom: 14px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: color-mix(in oklab, var(--warning) 10%, var(--surface-1));
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--warning) 40%, transparent);
+}
+
+/* note dialog */
+
+#note {
+  width: min(860px, 100vw - 32px);
+}
+
+.note-title-big {
+  margin: 4px 0 2px;
+  font-size: 20px;
+  line-height: 1.25;
+}
+
+.note-meta {
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.note-body {
+  padding: 8px 20px 20px;
+}
+
+.note-summary {
+  margin: 8px 0 12px;
+  padding-left: 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-secondary);
+}
+
+.callout-warn {
+  background: color-mix(in oklab, var(--warning) 18%, var(--surface-2));
+}
+
+.note-refs {
+  margin-top: 16px;
+}
+
+.note-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.note-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  flex: 1 1 180px;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.field-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.note-textarea {
+  width: 100%;
+  min-height: 200px;
+  padding: 8px 10px;
+  border: 1px solid var(--axis);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+@media (max-width: 640px) {
+  .note-columns {
+    grid-template-columns: 1fr;
+  }
+}

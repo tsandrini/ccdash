@@ -33,6 +33,27 @@ impl Workspaces {
         self.dirs.iter().map(|(name, _)| name.clone()).collect()
     }
 
+    /// Name and directory of every workspace, for collectors.
+    pub fn entries(&self) -> Vec<crate::protocol::WorkspaceDir> {
+        self.dirs
+            .iter()
+            .map(|(name, dir)| crate::protocol::WorkspaceDir {
+                name: name.clone(),
+                dir: dir.clone(),
+            })
+            .collect()
+    }
+
+    /// Rebuilt from what a hub sent.
+    pub fn from_entries(entries: &[crate::protocol::WorkspaceDir]) -> Self {
+        Self {
+            dirs: entries
+                .iter()
+                .map(|e| (e.name.clone(), e.dir.clone()))
+                .collect(),
+        }
+    }
+
     pub fn dir(&self, name: &str) -> Option<&str> {
         self.dirs
             .iter()
@@ -42,11 +63,26 @@ impl Workspaces {
 
     /// The workspace holding `cwd` (the longest matching directory).
     pub fn of(&self, cwd: &str) -> Option<String> {
-        self.dirs
+        self.locate(cwd).map(|(name, _)| name)
+    }
+
+    /// The workspace holding `cwd` and the project inside it: the first
+    /// path component below the workspace directory (a repo clone), None
+    /// at the workspace root itself.
+    pub fn locate(&self, cwd: &str) -> Option<(String, Option<String>)> {
+        let cwd = cwd.trim_end_matches('/');
+        let (name, dir) = self
+            .dirs
             .iter()
             .filter(|(_, dir)| within(cwd, dir))
-            .max_by_key(|(_, dir)| dir.len())
-            .map(|(name, _)| name.clone())
+            .max_by_key(|(_, dir)| dir.len())?;
+        let project = cwd
+            .strip_prefix(dir.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split('/').next())
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned);
+        Some((name.clone(), project))
     }
 }
 
@@ -113,6 +149,14 @@ mod tests {
         );
         assert_eq!(ws.of("/home/u/PB/meteopress-old"), None);
         assert_eq!(ws.of("/srv/PB/tsandrini"), Some("tsandrini".into()));
+        assert_eq!(
+            ws.locate("/home/u/PB/meteopress/radar/src"),
+            Some(("meteopress".into(), Some("radar".into())))
+        );
+        assert_eq!(
+            ws.locate("/srv/PB/tsandrini/"),
+            Some(("tsandrini".into(), None))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "ccdash",
-  "description": "Replies from the ccdash dashboard, through a Claude Code channel",
+  "description": "Replies from the ccdash dashboard through a Claude Code channel, and the ccdash knowledge tools (memories, issues, progress, docs)",
   "homepage": "https://github.com/tsandrini/ccdash",
   "license": "EUPL-1.2"
 }

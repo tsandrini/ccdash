@@ -154,7 +154,13 @@ async fn session(
         tokio::select! {
             msg = rx.recv() => {
                 let Some(msg) = msg else { return Ok(()) };
-                let text = serde_json::to_string(&msg)?;
+                let text = match serde_json::to_string(&msg) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        warn!("unserializable message for the hub: {e}");
+                        continue;
+                    }
+                };
                 if let Err(e) = ws.send(Message::Text(text.into())).await {
                     link.queue.park(&msg);
                     return Err(e.into());

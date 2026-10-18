@@ -40,6 +40,9 @@
         <button role="tab" data-view="analytics" aria-selected="false">
           Analytics
         </button>
+        <button role="tab" data-view="projects" aria-selected="false">
+          Projects
+        </button>
       </nav>
       <div class="conn" id="conn" data-state="connecting" role="status">
         <span class="conn-dot"></span><span class="conn-label">connecting</span>
@@ -86,9 +89,15 @@
         <div class="toolbar" id="analytics-toolbar"></div>
         <div id="analytics"></div>
       </section>
+
+      <section class="view" id="view-projects" hidden>
+        <div class="toolbar" id="projects-toolbar"></div>
+        <div id="projects"></div>
+      </section>
     </main>
 
     <dialog id="detail" aria-labelledby="detail-title"></dialog>
+    <dialog id="note" aria-labelledby="note-title"></dialog>
 
     <dialog id="range-dialog" aria-label="Time range"></dialog>
     <dialog id="workspace-dialog" aria-label="Workspaces"></dialog>

@@ -132,7 +132,10 @@ async fn link(socket: WebSocket, host: String, hub: Hub) -> Result<()> {
                 }
                 out = rx.recv() => {
                     let Some(out) = out else { return Ok(()) };
-                    sink.send(Message::Text(serde_json::to_string(&out)?.into())).await?;
+                    match serde_json::to_string(&out) {
+                        Ok(text) => sink.send(Message::Text(text.into())).await?,
+                        Err(e) => warn!("collector {host}: unserializable message: {e}"),
+                    }
                 }
             }
         }
@@ -174,6 +177,7 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
         },
         ToHub::AskGone { id } => Cmd::AskGone { host, id },
         ToHub::Call { id, call } => Cmd::Call { host, id, call },
+        ToHub::Queued { call, at } => Cmd::Queued { host, call, at },
     })
 }
 

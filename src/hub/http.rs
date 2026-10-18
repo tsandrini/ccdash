@@ -1,5 +1,6 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
-//! replying to them and answering their prompts.
+//! replying to them and answering their prompts, and the knowledge layer
+//! (`/notes`, `/projects`: list, search, read, write, verify).
 //! Every `/api` route needs `Authorization: Bearer <token>`. `/act/{key}/…`
 //! takes the one-time key of a notification button instead, `/collect`
 //! a collector's token (see `super::collect`).
@@ -42,6 +43,7 @@ use crate::{
     config::HubConfig,
     conversation,
     history::{self, History},
+    knowledge::{self, Card, Filter, NoteKind, NoteOp, Status, Upsert},
     model::{Activity, Snapshot},
     paths,
     store::Store,
@@ -82,6 +84,10 @@ pub async fn serve(
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/stream", get(stream))
+        .route("/projects", get(projects))
+        .route("/notes", get(notes))
+        .route("/notes/{workspace}/{slug}", get(note).put(put_note))
+        .route("/notes/{workspace}/{slug}/op", post(note_op))
         .layer(middleware::from_fn_with_state(token.clone(), auth));
     let app = Router::new()
         .route("/", get(web::index))
@@ -382,6 +388,317 @@ async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
     });
     let events = tokio_stream::iter(first).chain(updates).map(Ok);
     Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+}
+
+// --- knowledge --------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct NotesQuery {
+    /// Comma-separated workspace names; every workspace when empty.
+    workspace: Option<String>,
+    /// Free text; without it the newest notes are listed.
+    q: Option<String>,
+    kind: Option<String>,
+    project: Option<String>,
+    /// Comma-separated statuses; default active and stale.
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+impl NotesQuery {
+    fn workspaces(&self, all: &Workspaces) -> Result<Vec<String>, ApiError> {
+        match self.workspace.as_deref().filter(|w| !w.is_empty()) {
+            None => Ok(all.names()),
+            Some(names) => names
+                .split(',')
+                .map(|name| {
+                    all.dir(name).map(|_| name.to_owned()).ok_or(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown workspace {name:?}"),
+                    ))
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What the Projects page shows: every workspace's live notes grouped by
+/// project, plus the notes the lifecycle pass flagged.
+async fn projects(
+    State(app): State<App>,
+    Query(query): Query<NotesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let names = query.workspaces(&app.workspaces)?;
+    let store = app.store.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let conn = store.reader()?;
+        let mut workspaces = Vec::new();
+        for ws in names {
+            let cards = knowledge::list(
+                &conn,
+                &ws,
+                &Filter {
+                    statuses: &[Status::Active, Status::Stale],
+                    ..Filter::default()
+                },
+            )?;
+            let closed = knowledge::list(
+                &conn,
+                &ws,
+                &Filter {
+                    kinds: &[NoteKind::Issue],
+                    statuses: &[Status::Archived],
+                    limit: 20,
+                    ..Filter::default()
+                },
+            )?;
+            let flagged: Vec<&Card> = cards.iter().filter(|c| c.status == Status::Stale).collect();
+            let mut by_project: std::collections::BTreeMap<Option<String>, Vec<&Card>> =
+                std::collections::BTreeMap::new();
+            for card in cards.iter().filter(|c| c.status == Status::Active) {
+                by_project.entry(card.project.clone()).or_default().push(card);
+            }
+            let projects: Vec<Value> = by_project
+                .into_iter()
+                .map(|(project, cards)| {
+                    let of = |kind: NoteKind| -> Vec<&Card> {
+                        cards.iter().copied().filter(|c| c.kind == kind).collect()
+                    };
+                    let mut issues = of(NoteKind::Issue);
+                    issues.sort_by(|a, b| b.priority.cmp(&a.priority).then(b.updated_at.cmp(&a.updated_at)));
+                    json!({
+                        "project": project,
+                        "docs": of(NoteKind::Doc),
+                        "issues": issues,
+                        "progress": of(NoteKind::Progress).into_iter().take(8).collect::<Vec<_>>(),
+                        "memories": of(NoteKind::Memory),
+                        "closed": closed.iter().filter(|c| c.project == project).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            workspaces.push(json!({
+                "name": ws,
+                "projects": projects,
+                "flagged": flagged,
+                "total": cards.len(),
+            }));
+        }
+        Ok(json!({ "workspaces": workspaces }))
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(out))
+}
+
+/// Search or list notes across the given workspaces.
+async fn notes(
+    State(app): State<App>,
+    Query(query): Query<NotesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let names = query.workspaces(&app.workspaces)?;
+    let kinds: Vec<NoteKind> = match query.kind.as_deref().filter(|k| !k.is_empty()) {
+        None => Vec::new(),
+        Some(k) => vec![NoteKind::parse(k).ok_or(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown kind {k:?}"),
+        ))?],
+    };
+    let statuses: Vec<Status> = match query.status.as_deref().filter(|s| !s.is_empty()) {
+        None => vec![Status::Active, Status::Stale],
+        Some(list) => list
+            .split(',')
+            .map(|s| {
+                Status::parse(s).ok_or(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown status {s:?}"),
+                ))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let limit = query.limit.unwrap_or(30).clamp(1, 200);
+    let store = app.store.clone();
+    let hits = tokio::task::spawn_blocking(move || -> Result<Vec<knowledge::Hit>> {
+        let conn = store.reader()?;
+        let mut hits = Vec::new();
+        for ws in &names {
+            match query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+                Some(text) => hits.extend(knowledge::search(
+                    &conn,
+                    ws,
+                    &knowledge::Query {
+                        text: Some(text.to_owned()),
+                        kinds: kinds.clone(),
+                        project: query.project.clone(),
+                        limit: Some(limit.min(50)),
+                        slug: None,
+                    },
+                )?),
+                None => hits.extend(
+                    knowledge::list(
+                        &conn,
+                        ws,
+                        &Filter {
+                            kinds: &kinds,
+                            statuses: &statuses,
+                            project: query.project.as_deref(),
+                            limit,
+                        },
+                    )?
+                    .into_iter()
+                    .map(|card| knowledge::Hit {
+                        snippet: card.excerpt.clone(),
+                        card,
+                    }),
+                ),
+            }
+        }
+        if query.q.is_none() {
+            hits.sort_by_key(|a| std::cmp::Reverse(a.card.updated_at));
+        }
+        hits.truncate(limit);
+        Ok(hits)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(json!({ "hits": hits })))
+}
+
+/// One note with its rendered body, links and backlinks.
+async fn note(
+    State(app): State<App>,
+    Path((workspace, slug)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let store = app.store.clone();
+    let view =
+        tokio::task::spawn_blocking(move || knowledge::view(&store.reader()?, &workspace, &slug))
+            .await
+            .map_err(anyhow::Error::from)??
+            .ok_or(ApiError(StatusCode::NOT_FOUND, "no such note".into()))?;
+    let html = knowledge::render_body(&view.note.body);
+    let mut value = serde_json::to_value(&view).map_err(anyhow::Error::from)?;
+    value["html"] = json!(html);
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+struct PutNote {
+    kind: NoteKind,
+    title: String,
+    body: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    status: Option<Status>,
+    #[serde(default)]
+    extra: Option<Value>,
+    /// The version the edit is based on; refused when the note moved on.
+    #[serde(default)]
+    base_version: Option<u32>,
+}
+
+/// Creates or replaces a note from the panel's editor.
+async fn put_note(
+    State(app): State<App>,
+    Path((workspace, slug)): Path<(String, String)>,
+    Json(body): Json<PutNote>,
+) -> Result<Json<Value>, ApiError> {
+    app.workspaces.dir(&workspace).ok_or(ApiError(
+        StatusCode::BAD_REQUEST,
+        format!("unknown workspace {workspace:?}"),
+    ))?;
+    let now = now_ms();
+    let (ws, s) = (workspace.clone(), slug.clone());
+    let result = app
+        .store
+        .exec(move |conn| -> Result<Result<knowledge::Note, String>> {
+            let old = knowledge::get(conn, &ws, &s)?;
+            if let (Some(old), Some(base)) = (&old, body.base_version)
+                && old.version != base
+            {
+                return Ok(Err(format!(
+                    "someone changed this note (version {}, you edited {base}); reload and retry",
+                    old.version
+                )));
+            }
+            let up = Upsert {
+                slug: s.clone(),
+                kind: body.kind,
+                project: body.project.filter(|p| !p.is_empty()),
+                title: body.title,
+                summary: body.summary.filter(|p| !p.trim().is_empty()),
+                status: body
+                    .status
+                    .or_else(|| old.as_ref().map(|o| o.status))
+                    .unwrap_or(Status::Active),
+                extra: body
+                    .extra
+                    .or_else(|| old.as_ref().map(|o| o.extra.clone()))
+                    .unwrap_or_else(|| json!({})),
+                body: body.body,
+                links: Vec::new(),
+                created_at: None,
+                updated_at: None,
+                verified: false,
+            };
+            knowledge::upsert(conn, &ws, &up, Some("panel"), now)?;
+            Ok(Ok(knowledge::get(conn, &ws, &s)?.context("note vanished")?))
+        })
+        .await??;
+    let note = result.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    app.hub.notes_changed(vec![note.clone()]).await?;
+    Ok(Json(json!({ "note": note })))
+}
+
+/// Runs a tool operation (verify, issue_update, …) from the panel on the
+/// note; `slug` in the path wins over one in the body.
+async fn note_op(
+    State(app): State<App>,
+    Path((workspace, slug)): Path<(String, String)>,
+    Json(mut op): Json<NoteOp>,
+) -> Result<Json<Value>, ApiError> {
+    app.workspaces.dir(&workspace).ok_or(ApiError(
+        StatusCode::BAD_REQUEST,
+        format!("unknown workspace {workspace:?}"),
+    ))?;
+    match &mut op {
+        NoteOp::Verify { slug: s }
+        | NoteOp::IssueUpdate { slug: s, .. }
+        | NoteOp::DocWrite { slug: s, .. } => *s = slug.clone(),
+        NoteOp::Remember { slug: s, .. } => *s = Some(slug.clone()),
+        NoteOp::IssueAdd { .. } | NoteOp::Progress { .. } => {}
+    }
+    let now = now_ms();
+    let ws = workspace.clone();
+    let result = app
+        .store
+        .exec(
+            move |conn| -> Result<(knowledge::Written, Vec<knowledge::Note>)> {
+                let w = knowledge::apply(conn, &ws, None, Some("panel"), &op, now)?;
+                let mut notes = Vec::new();
+                for s in [
+                    Some(w.slug.clone()),
+                    match &op {
+                        NoteOp::Remember { supersedes, .. } => supersedes.clone(),
+                        _ => None,
+                    },
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(n) = knowledge::get(conn, &ws, &s)? {
+                        notes.push(n);
+                    }
+                }
+                Ok((w, notes))
+            },
+        )
+        .await?
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
+    let (written, notes) = result;
+    app.hub.notes_changed(notes).await?;
+    Ok(Json(json!({ "written": written })))
 }
 
 struct ApiError(StatusCode, String);

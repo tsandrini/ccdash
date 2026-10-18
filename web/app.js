@@ -54,6 +54,12 @@ const state = {
   autoOpened: new Set(),
   /** Unsent reply text by session id. */
   drafts: new Map(),
+  /** The Projects view's payload. */
+  projects: null,
+  /** Search text in the Projects view; `kind:<k>` restricts the kind. */
+  noteQuery: "",
+  /** The note dialog: workspace, slug, loaded view, editing flag. */
+  note: null,
 };
 
 // --- DOM helpers ------------------------------------------------------------
@@ -414,6 +420,15 @@ function applyUpdate(update) {
   } else if (update.type === "hosts") {
     state.hosts = update.hosts;
     renderScopebar();
+  } else if (update.type === "notes") {
+    scheduleProjectsRefresh();
+    if (
+      state.note &&
+      state.note.workspace === update.workspace &&
+      !state.note.editing
+    )
+      refreshNote();
+    return;
   }
   scheduleRender();
 }
@@ -2690,6 +2705,7 @@ function setHost(host) {
   scheduleRender();
   if (!$("#view-history").hidden) loadHistory();
   if (!$("#view-analytics").hidden) loadAnalytics();
+  if (!$("#view-projects").hidden) loadProjects();
 }
 
 /** One host or all, in the same popover as the workspaces. */
@@ -2859,6 +2875,7 @@ function setPicked(picked, reload = true) {
   scheduleRender();
   if (!$("#view-history").hidden) loadHistory();
   if (!$("#view-analytics").hidden) loadAnalytics();
+  if (!$("#view-projects").hidden) loadProjects();
 }
 
 // --- history view -----------------------------------------------------------
@@ -5985,6 +6002,801 @@ function permissionsSection(data, width, half) {
   return parts;
 }
 
+// --- projects view (knowledge) ------------------------------------------------
+
+const KIND_LABEL = {
+  memory: "memory",
+  issue: "issue",
+  progress: "progress",
+  doc: "doc",
+};
+const STATUS_LABEL = (c) =>
+  c.kind === "issue"
+    ? c.status === "archived"
+      ? "closed"
+      : c.status === "active"
+        ? "open"
+        : c.status
+    : c.status;
+
+let projectsTimer = null;
+
+/** Reloads the Projects view at most once a second after a notes update. */
+function scheduleProjectsRefresh() {
+  if (projectsTimer) return;
+  projectsTimer = setTimeout(() => {
+    projectsTimer = null;
+    if (!$("#view-projects").hidden) loadProjects();
+  }, 1000);
+}
+
+async function loadProjects() {
+  if (!token()) return;
+  try {
+    const params = new URLSearchParams();
+    if (state.picked.length) params.set("workspace", state.picked.join(","));
+    state.projects = await getJson(`projects?${params}`);
+  } catch (e) {
+    if (e instanceof Unauthorized) return askToken();
+    state.projects = { error: String(e.message || e) };
+  }
+  renderProjects();
+}
+
+async function searchNotes(q) {
+  const params = new URLSearchParams({ q, limit: "50" });
+  if (state.picked.length) params.set("workspace", state.picked.join(","));
+  return (await getJson(`notes?${params}`)).hits;
+}
+
+function renderProjectsToolbar() {
+  const input = h("input", {
+    class: "search-input",
+    type: "search",
+    placeholder: "Search notes…",
+    value: state.noteQuery,
+    "aria-label": "Search notes",
+  });
+  let timer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      state.noteQuery = input.value.trim();
+      renderProjects();
+    }, 250);
+  });
+  const newButton = (kind, label) =>
+    h("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: label,
+      onclick: () => openEditor(null, kind),
+    });
+  fill(
+    $("#projects-toolbar"),
+    input,
+    h(
+      "div",
+      { class: "toolbar-actions" },
+      newButton("issue", "+ Issue"),
+      newButton("memory", "+ Memory"),
+      newButton("doc", "+ Doc"),
+    ),
+  );
+}
+
+function renderProjects() {
+  const root = $("#projects");
+  if (state.noteQuery) return renderSearch(root);
+  const data = state.projects;
+  if (!data) return fill(root, h("p", { class: "loading", text: "Loading…" }));
+  if (data.error)
+    return fill(root, h("p", { class: "empty", text: data.error }));
+  const workspaces = data.workspaces.filter((w) => w.total > 0);
+  if (!workspaces.length) {
+    return fill(
+      root,
+      h(
+        "p",
+        { class: "empty" },
+        "No notes yet. Sessions write them with the ccdash tools; ",
+        h("code", { text: "ccdash import memory" }),
+        " brings in memory files.",
+      ),
+    );
+  }
+  fill(
+    root,
+    workspaces.map((ws) =>
+      h(
+        "section",
+        { class: "workspace" },
+        workspaces.length > 1 || state.picked.length !== 1
+          ? h("h2", { class: "workspace-title", text: ws.name })
+          : null,
+        ws.flagged.length ? flaggedBlock(ws) : null,
+        ws.projects.map((p) => projectCard(ws.name, p)),
+      ),
+    ),
+  );
+}
+
+function flaggedBlock(ws) {
+  return h(
+    "div",
+    { class: "flagged" },
+    h(
+      "h3",
+      {},
+      `Flagged (${ws.flagged.length})`,
+      h("span", {
+        class: "muted",
+        text: " stale memories: verify, rewrite or archive",
+      }),
+    ),
+    noteList(ws.flagged, { reason: true }),
+  );
+}
+
+function projectCard(workspace, p) {
+  const column = (title, cards, opts = {}) =>
+    cards.length
+      ? h(
+          "div",
+          { class: "note-column" },
+          h(
+            "h4",
+            {},
+            title,
+            h("span", { class: "count", text: String(cards.length) }),
+          ),
+          noteList(cards.slice(0, opts.max || 12), opts),
+          cards.length > (opts.max || 12)
+            ? h("button", {
+                class: "link-btn",
+                type: "button",
+                text: `${cards.length - (opts.max || 12)} more…`,
+                onclick: () => {
+                  state.noteQuery =
+                    `kind:${opts.kind} ${p.project || ""}`.trim();
+                  renderProjects();
+                },
+              })
+            : null,
+        )
+      : null;
+  return h(
+    "article",
+    { class: "project" },
+    h(
+      "header",
+      { class: "project-head" },
+      h("h3", { text: p.project || "Workspace-wide" }),
+      h("span", {
+        class: "muted",
+        text: joinedText([
+          plural(p.issues.length, "open issue"),
+          p.closed.length ? `${p.closed.length} closed` : null,
+          plural(p.memories.length, "memory", "memories"),
+          p.docs.length ? plural(p.docs.length, "doc") : null,
+        ]),
+      }),
+    ),
+    h(
+      "div",
+      { class: "note-columns" },
+      column("Open issues", p.issues, { priority: true, kind: "issue" }),
+      column("Documents", p.docs, { kind: "doc" }),
+      column("Recent progress", p.progress, {
+        date: true,
+        max: 6,
+        kind: "progress",
+      }),
+      column("Memories", p.memories, { kind: "memory", max: 8 }),
+    ),
+  );
+}
+
+const joinedText = (items) => items.filter(Boolean).join(" · ");
+
+function noteList(cards, opts = {}) {
+  return h(
+    "ul",
+    { class: "note-list" },
+    cards.map((c) =>
+      h(
+        "li",
+        {},
+        h(
+          "button",
+          {
+            class: "note-row",
+            type: "button",
+            onclick: () => openNote(c.workspace, c.slug),
+          },
+          opts.priority && c.priority !== "normal"
+            ? h("span", { class: `prio prio-${c.priority}`, text: c.priority })
+            : null,
+          opts.date
+            ? h("span", {
+                class: "note-date mono",
+                text: dayFmt.format(new Date(c.updated_at)),
+              })
+            : null,
+          h("span", { class: "note-title", text: c.title }),
+          c.status !== "active"
+            ? h("span", { class: "badge-stale", text: STATUS_LABEL(c) })
+            : null,
+          h("span", {
+            class: "note-line muted",
+            text:
+              opts.reason && c.stale_reason
+                ? c.stale_reason
+                : c.summary || c.excerpt,
+          }),
+        ),
+      ),
+    ),
+  );
+}
+
+async function renderSearch(root) {
+  fill(root, h("p", { class: "loading", text: "Searching…" }));
+  let hits;
+  try {
+    let q = state.noteQuery;
+    let kind = null;
+    const m = q.match(/^kind:(\w+)\s*/);
+    if (m) {
+      kind = m[1];
+      q = q.slice(m[0].length);
+    }
+    const params = new URLSearchParams({ limit: "60" });
+    if (q) params.set("q", q);
+    if (kind) params.set("kind", kind);
+    if (state.picked.length) params.set("workspace", state.picked.join(","));
+    params.set("status", "active,stale,archived,superseded");
+    hits = (await getJson(`notes?${params}`)).hits;
+  } catch (e) {
+    return fill(root, h("p", { class: "empty", text: String(e.message || e) }));
+  }
+  if (state.noteQuery !== $("#projects-toolbar .search-input").value.trim())
+    return;
+  fill(
+    root,
+    h(
+      "section",
+      { class: "workspace" },
+      h("h2", { class: "workspace-title" }, `Results (${hits.length})`),
+      hits.length
+        ? h(
+            "ul",
+            { class: "note-list search-results" },
+            hits.map((hit) =>
+              h(
+                "li",
+                {},
+                h(
+                  "button",
+                  {
+                    class: "note-row",
+                    type: "button",
+                    onclick: () => openNote(hit.workspace, hit.slug),
+                  },
+                  h("span", {
+                    class: `kind kind-${hit.kind}`,
+                    text: KIND_LABEL[hit.kind],
+                  }),
+                  h("span", { class: "note-title", text: hit.title }),
+                  h("span", {
+                    class: "muted",
+                    text: joinedText([hit.workspace, hit.project]),
+                  }),
+                  hit.status !== "active"
+                    ? h("span", {
+                        class: "badge-stale",
+                        text: STATUS_LABEL(hit),
+                      })
+                    : null,
+                  snippetEl(hit.snippet),
+                ),
+              ),
+            ),
+          )
+        : h("p", { class: "empty", text: "Nothing matches." }),
+    ),
+  );
+}
+
+/** FTS snippets mark terms with [ ]. */
+function snippetEl(snippet) {
+  const el = h("span", { class: "note-line muted" });
+  const parts = snippet.split(/\[([^\]]+)\]/);
+  parts.forEach((part, i) => {
+    if (i % 2) el.append(h("mark", { text: part }));
+    else el.append(document.createTextNode(part));
+  });
+  return el;
+}
+
+// --- note dialog ------------------------------------------------------------
+
+async function openNote(workspace, slug) {
+  const dialog = $("#note");
+  state.note = { workspace, slug, view: null, editing: false };
+  fill(
+    dialog,
+    h(
+      "div",
+      { class: "note-body" },
+      h("p", { class: "loading", text: "Loading…" }),
+    ),
+  );
+  if (!dialog.open) dialog.showModal();
+  await refreshNote();
+}
+
+async function refreshNote() {
+  const current = state.note;
+  if (!current) return;
+  try {
+    const view = await getJson(
+      `notes/${encodeURIComponent(current.workspace)}/${encodeURIComponent(current.slug)}`,
+    );
+    if (state.note !== current) return;
+    current.view = view;
+  } catch (e) {
+    if (state.note !== current) return;
+    current.error = String(e.message || e);
+  }
+  renderNote();
+}
+
+function kindBadge(kind) {
+  return h("span", {
+    class: `kind kind-${kind}`,
+    text: KIND_LABEL[kind] || kind,
+  });
+}
+
+function renderNote() {
+  const dialog = $("#note");
+  const n = state.note;
+  if (!n) return;
+  if (n.editing) return renderEditor();
+  if (n.error) {
+    return fill(
+      dialog,
+      noteHead(null, n.slug),
+      h(
+        "div",
+        { class: "note-body" },
+        h("p", { class: "empty", text: n.error }),
+      ),
+    );
+  }
+  const v = n.view;
+  if (!v) return;
+  const meta = joined([
+    h("span", { text: `v${v.version}` }),
+    h("span", { text: `updated ${fmtStamp(v.updated_at)}` }),
+    v.verified_at
+      ? h("span", {
+          text: `verified ${dayFmt.format(new Date(v.verified_at))}`,
+        })
+      : null,
+    v.kind === "memory"
+      ? h("span", { text: plural(v.recalls, "recall") })
+      : null,
+    v.kind === "issue" ? h("span", { text: `priority ${v.priority}` }) : null,
+    v.created_by
+      ? h("span", {}, "by ", sessionRef(v.created_by, v.created_by.slice(0, 8)))
+      : null,
+  ]);
+  const actions = [
+    h("button", {
+      class: "btn btn-quiet",
+      type: "button",
+      text: "Edit",
+      onclick: () => {
+        n.editing = true;
+        renderNote();
+      },
+    }),
+    v.kind === "memory"
+      ? h("button", {
+          class: "btn btn-quiet",
+          type: "button",
+          text: "Verify",
+          title: "It is still true: resets the stale flag",
+          onclick: () => noteOp({ op: "verify", slug: v.slug }),
+        })
+      : null,
+    v.kind === "issue"
+      ? h("button", {
+          class: "btn btn-quiet",
+          type: "button",
+          text: v.status === "archived" ? "Reopen" : "Close",
+          onclick: () =>
+            noteOp({
+              op: "issue_update",
+              slug: v.slug,
+              status: v.status === "archived" ? "open" : "closed",
+            }),
+        })
+      : null,
+    v.kind !== "issue" && v.status !== "archived"
+      ? h("button", {
+          class: "btn btn-quiet",
+          type: "button",
+          text: "Archive",
+          onclick: () => saveNote({ status: "archived" }),
+        })
+      : null,
+  ];
+  const refs = (title, list) =>
+    list.length
+      ? h(
+          "div",
+          { class: "note-refs" },
+          h("h4", { text: title }),
+          h(
+            "ul",
+            { class: "note-list" },
+            list.map((l) =>
+              h(
+                "li",
+                {},
+                l.title
+                  ? h(
+                      "button",
+                      {
+                        class: "note-row",
+                        type: "button",
+                        onclick: () => openNote(v.workspace, l.slug),
+                      },
+                      kindBadge(l.note_kind),
+                      h("span", { class: "note-title", text: l.title }),
+                      h("span", { class: "muted", text: l.kind }),
+                      l.status && l.status !== "active"
+                        ? h("span", { class: "badge-stale", text: l.status })
+                        : null,
+                    )
+                  : h(
+                      "span",
+                      { class: "note-row muted" },
+                      h("code", { text: l.slug }),
+                      " (no such note yet)",
+                    ),
+              ),
+            ),
+          ),
+        )
+      : null;
+  const body = prose(v.html);
+  for (const a of body.querySelectorAll('a[href^="note:"]')) {
+    a.removeAttribute("target");
+    a.addEventListener("click", (event) => {
+      event.preventDefault();
+      openNote(v.workspace, a.getAttribute("href").slice(5));
+    });
+  }
+  fill(
+    dialog,
+    noteHead(v, v.slug, meta),
+    h(
+      "div",
+      { class: "note-body" },
+      v.status === "stale"
+        ? h(
+            "div",
+            { class: "callout callout-warn" },
+            `Flagged stale: ${v.stale_reason || "lifecycle"}. Verify it, rewrite it or archive it.`,
+          )
+        : null,
+      v.status === "superseded"
+        ? h(
+            "div",
+            { class: "callout" },
+            "Superseded by a newer note (see backlinks).",
+          )
+        : null,
+      v.summary ? h("p", { class: "note-summary", text: v.summary }) : null,
+      body,
+      refs("Links", v.links),
+      refs("Backlinks", v.backlinks),
+    ),
+    h("div", { class: "note-foot" }, actions),
+  );
+}
+
+function noteHead(v, slug, meta = null) {
+  return h(
+    "div",
+    { class: "detail-head note-head" },
+    h(
+      "div",
+      { class: "session-top" },
+      v ? kindBadge(v.kind) : null,
+      v && v.status !== "active"
+        ? h("span", { class: "badge-stale", text: STATUS_LABEL(v) })
+        : null,
+      h("span", {
+        class: "muted",
+        text: joinedText([v?.workspace, v?.project]),
+      }),
+      h("button", {
+        class: "detail-close",
+        type: "button",
+        "aria-label": "Close",
+        text: "✕",
+        onclick: () => $("#note").close(),
+      }),
+    ),
+    h("h2", {
+      id: "note-title",
+      class: "note-title-big",
+      text: v ? v.title : slug,
+    }),
+    h(
+      "div",
+      { class: "session-meta note-meta" },
+      h("code", { class: "mono", text: slug }),
+      meta ? h("span", { class: "sep" }, " · ") : null,
+      meta,
+    ),
+  );
+}
+
+async function noteOp(op) {
+  const n = state.note;
+  if (!n) return;
+  try {
+    await postJson(
+      `notes/${encodeURIComponent(n.workspace)}/${encodeURIComponent(n.slug)}/op`,
+      op,
+    );
+    await refreshNote();
+  } catch (e) {
+    alert(String(e.message || e));
+  }
+}
+
+/** PUTs the open note with `changes` applied over its current content. */
+async function saveNote(changes) {
+  const n = state.note;
+  if (!n || !n.view) return;
+  const v = n.view;
+  const body = {
+    kind: v.kind,
+    title: v.title,
+    body: v.body,
+    summary: v.summary,
+    project: v.project,
+    status: v.status,
+    extra: v.extra,
+    base_version: v.version,
+    ...changes,
+  };
+  await putNote(n.workspace, n.slug, body);
+}
+
+async function putNote(workspace, slug, body) {
+  const res = await api(
+    `notes/${encodeURIComponent(workspace)}/${encodeURIComponent(slug)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  const data = await res.json();
+  state.note = { workspace, slug, view: null, editing: false };
+  await refreshNote();
+  return data;
+}
+
+// --- note editor ------------------------------------------------------------
+
+/** Opens the dialog with an editor: for the note `view`, or a new note of `kind`. */
+function openEditor(view, kind) {
+  const dialog = $("#note");
+  const workspace = view?.workspace || state.picked[0] || state.workspaces[0];
+  state.note = { workspace, slug: view?.slug || "", view, editing: true, kind };
+  if (!dialog.open) dialog.showModal();
+  renderEditor();
+}
+
+function renderEditor() {
+  const dialog = $("#note");
+  const n = state.note;
+  const v = n.view;
+  const kind = v?.kind || n.kind || "memory";
+  const isNew = !v;
+  const field = (label, input) =>
+    h(
+      "label",
+      { class: "field" },
+      h("span", { class: "field-label", text: label }),
+      input,
+    );
+  const slugify = (text) =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80);
+  const title = h("input", {
+    class: "text-input",
+    value: v?.title || "",
+    required: true,
+    placeholder: "Title",
+  });
+  const slug = h("input", {
+    class: "text-input mono",
+    value: v?.slug || "",
+    placeholder: "slug (from the title when empty)",
+    pattern: "[a-z0-9][a-z0-9._-]*",
+    disabled: !isNew,
+  });
+  const workspaceSel = h(
+    "select",
+    { class: "text-input", disabled: !isNew },
+    state.workspaces.map((w) =>
+      h("option", { value: w, selected: w === n.workspace, text: w }),
+    ),
+  );
+  const project = h("input", {
+    class: "text-input",
+    value: v?.project || "",
+    placeholder: "repo directory, empty = workspace-wide",
+  });
+  const summary = h("input", {
+    class: "text-input",
+    value: v?.summary || "",
+    placeholder: "one line for indexes and injections",
+  });
+  const priority = h(
+    "select",
+    { class: "text-input" },
+    ["low", "normal", "high"].map((p) =>
+      h("option", {
+        value: p,
+        selected: (v?.priority || "normal") === p,
+        text: p,
+      }),
+    ),
+  );
+  const status = h(
+    "select",
+    { class: "text-input" },
+    (kind === "issue"
+      ? [
+          ["active", "open"],
+          ["archived", "closed"],
+        ]
+      : [
+          ["active", "active"],
+          ["stale", "stale"],
+          ["superseded", "superseded"],
+          ["archived", "archived"],
+        ]
+    ).map(([value, label]) =>
+      h("option", {
+        value,
+        selected: (v?.status || "active") === value,
+        text: label,
+      }),
+    ),
+  );
+  const body = h("textarea", {
+    class: "note-textarea mono",
+    rows: 18,
+    placeholder: "Markdown; link notes as [[slug]]",
+  });
+  body.value = v?.body || "";
+  const error = h("p", { class: "range-error", role: "alert", hidden: true });
+  const form = h(
+    "form",
+    {
+      class: "note-editor",
+      onsubmit: async (event) => {
+        event.preventDefault();
+        error.hidden = true;
+        const theSlug = isNew
+          ? slug.value.trim() || slugify(title.value)
+          : v.slug;
+        if (!theSlug) {
+          error.textContent = "The title gives no slug; set one.";
+          error.hidden = false;
+          return;
+        }
+        const extra = { ...(v?.extra || {}) };
+        if (kind === "issue") extra.priority = priority.value;
+        try {
+          await putNote(workspaceSel.value, theSlug, {
+            kind,
+            title: title.value.trim(),
+            body: body.value,
+            summary: summary.value.trim() || null,
+            project: project.value.trim() || null,
+            status: status.value,
+            extra,
+            base_version: v?.version,
+          });
+          if (!$("#view-projects").hidden) loadProjects();
+        } catch (e) {
+          error.textContent = String(e.message || e);
+          error.hidden = false;
+        }
+      },
+    },
+    h(
+      "div",
+      { class: "field-row" },
+      isNew ? field("Workspace", workspaceSel) : null,
+      field("Title", title),
+      isNew ? field("Slug", slug) : null,
+    ),
+    h(
+      "div",
+      { class: "field-row" },
+      field("Project", project),
+      kind === "issue" ? field("Priority", priority) : null,
+      field("Status", status),
+    ),
+    kind === "memory" || kind === "doc" ? field("Summary", summary) : null,
+    field("Body", body),
+    error,
+    h(
+      "div",
+      { class: "note-foot" },
+      h("button", {
+        class: "btn",
+        type: "submit",
+        text: isNew ? "Create" : "Save",
+      }),
+      h("button", {
+        class: "btn btn-quiet",
+        type: "button",
+        text: "Cancel",
+        onclick: () => {
+          if (isNew) return dialog.close();
+          n.editing = false;
+          renderNote();
+        },
+      }),
+    ),
+  );
+  fill(
+    dialog,
+    h(
+      "div",
+      { class: "detail-head note-head" },
+      h(
+        "div",
+        { class: "session-top" },
+        kindBadge(kind),
+        h("span", { class: "muted", text: isNew ? "new" : "editing" }),
+        h("button", {
+          class: "detail-close",
+          type: "button",
+          "aria-label": "Close",
+          text: "✕",
+          onclick: () => dialog.close(),
+        }),
+      ),
+      h("h2", {
+        id: "note-title",
+        class: "note-title-big",
+        text: isNew ? `New ${KIND_LABEL[kind]}` : v.title,
+      }),
+    ),
+    h("div", { class: "note-body" }, form),
+  );
+  title.focus();
+}
+
 // --- chrome -----------------------------------------------------------------
 
 function applyTheme() {
@@ -6014,8 +6826,10 @@ function showView(view) {
   $("#view-sessions").hidden = view !== "sessions";
   $("#view-history").hidden = view !== "history";
   $("#view-analytics").hidden = view !== "analytics";
+  $("#view-projects").hidden = view !== "projects";
   if (view === "history") loadHistory();
   else if (view === "analytics") loadAnalytics();
+  else if (view === "projects") loadProjects();
   else loadRecent();
 }
 
@@ -6031,10 +6845,17 @@ function start() {
   state.aRange = loadRange(ANALYTICS_RANGE_KEY, state.aRange);
   renderHistoryToolbar();
   renderAnalyticsToolbar();
+  renderProjectsToolbar();
   renderScopebar();
   $("#detail").addEventListener("close", () => {
     state.detailId = null;
     state.convo = null;
+  });
+  $("#note").addEventListener("close", () => {
+    state.note = null;
+  });
+  $("#note").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) event.currentTarget.close();
   });
   $("#detail").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) event.currentTarget.close();
