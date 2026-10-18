@@ -11,14 +11,14 @@ use crate::state::Window;
 use crate::{
     ask::Answer,
     knowledge::{Hit, Note, NoteOp, NoteView, Query, Upsert, Written},
-    model::{RateLimits, ScopedLimit, Session, Update},
+    model::{Claim, RateLimits, ScopedLimit, Session, Update},
     state::{AgentEntry, NiriEvent, ProcPoll},
     wire::Envelope,
 };
 
-/// 2: knowledge calls, the notes cache, `Queued`, workspace directories
-/// in `Welcome`, typed call results.
-pub const VERSION: u32 = 2;
+/// 3: session messages (`Tell` stores, `Injected` acknowledges), claims
+/// (`Claim`, `Release`, `Reply::Claimed`), `inbox` and `claim` on sessions.
+pub const VERSION: u32 = 3;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +82,11 @@ pub enum ToHub {
     Queued {
         call: Call,
         at: i64,
+    },
+    /// The UserPromptSubmit hook of `session` took the context the hub
+    /// sent, so the messages delivered in it were read.
+    Injected {
+        session: String,
     },
 }
 
@@ -158,11 +163,26 @@ pub enum Call {
         who: Who,
         what: Injection,
     },
-    /// A message to another session of the caller's workspace.
+    /// A message to another session of the caller's workspace, handed to
+    /// it at its next prompt.
     Tell {
         who: Who,
         to: String,
         text: String,
+    },
+    /// What the caller is working on; paths are relative to its cwd and
+    /// `until` is minutes from now.
+    Claim {
+        who: Who,
+        what: String,
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        until: Option<i64>,
+    },
+    /// Drops the caller's claim.
+    Release {
+        who: Who,
     },
     /// `ccdash import`: notes for the workspace holding `dir`.
     Import {
@@ -182,6 +202,8 @@ pub enum Reply {
     Note(Box<NoteView>),
     /// None when there is nothing to inject.
     Context(Option<String>),
+    /// The caller's claim after `Claim` or `Release`.
+    Claimed(Option<Claim>),
     Imported {
         added: usize,
         updated: usize,
@@ -353,10 +375,38 @@ mod tests {
         );
         let back: ToHub = serde_json::from_str(&text).unwrap();
         assert!(matches!(back, ToHub::Queued { at: 9, .. }));
+        let claim = ToHub::Queued {
+            call: Call::Claim {
+                who: Who {
+                    session: Some("s".into()),
+                    pid: None,
+                    cwd: None,
+                },
+                what: "w".into(),
+                paths: vec!["src".into()],
+                until: None,
+            },
+            at: 1,
+        };
+        assert!(claim.durable());
+        let back: ToHub = serde_json::from_str(&serde_json::to_string(&claim).unwrap()).unwrap();
+        assert!(
+            matches!(back, ToHub::Queued { call: Call::Claim { ref paths, .. }, .. } if paths == &["src"])
+        );
+        let injected: ToHub = serde_json::from_str(r#"{"type":"injected","session":"s"}"#).unwrap();
+        assert!(matches!(injected, ToHub::Injected { ref session } if session == "s"));
+        assert!(!injected.durable());
         for reply in [
             Reply::Hits(Vec::new()),
             Reply::Context(None),
             Reply::Context(Some("x".into())),
+            Reply::Claimed(None),
+            Reply::Claimed(Some(Claim {
+                what: "w".into(),
+                paths: vec!["/a".into()],
+                since: 1,
+                until: Some(2),
+            })),
             Reply::Imported {
                 added: 1,
                 updated: 0,

@@ -178,6 +178,7 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
         ToHub::AskGone { id } => Cmd::AskGone { host, id },
         ToHub::Call { id, call } => Cmd::Call { host, id, call },
         ToHub::Queued { call, at } => Cmd::Queued { host, call, at },
+        ToHub::Injected { session } => Cmd::Injected { host, session },
     })
 }
 

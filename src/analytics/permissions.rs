@@ -266,6 +266,7 @@ mod tests {
         };
         let session = SessionEvents {
             id: "a".into(),
+            host: "h".into(),
             cwd: "/w".into(),
             label: "a".into(),
             events: vec![

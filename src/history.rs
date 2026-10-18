@@ -1,6 +1,6 @@
 //! Activity timeline, usage and cost over a time window, for the web UI charts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
@@ -24,6 +24,21 @@ pub struct History {
     pub prompts: i64,
     /// Most used main-thread tools, by call count.
     pub tools: Vec<ToolCount>,
+    /// Per machine, most working time first; one row under a host filter.
+    pub hosts: Vec<HostTotals>,
+}
+
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub struct HostTotals {
+    pub host: String,
+    pub sessions: u32,
+    pub working_ms: i64,
+    pub permission_ms: i64,
+    /// Waits on you; parked time is apart.
+    pub your_turn_ms: i64,
+    pub parked_ms: i64,
+    pub prompts: i64,
+    pub cost_usd: f64,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -37,6 +52,7 @@ pub struct ToolCount {
 pub struct Lane {
     pub id: String,
     pub label: String,
+    pub host: String,
     pub cwd: String,
     pub live: bool,
     /// Started by Claude or `claude --bg`; its finished time is not a wait on you.
@@ -80,6 +96,42 @@ const TRIVIAL_MS: i64 = 30_000;
 pub fn history(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<History> {
     let lanes = lanes(conn, scope, live)?;
     let bucket_ms = ((scope.until - scope.since) / 288).max(60_000);
+    let mut hosts: BTreeMap<String, HostTotals> = BTreeMap::new();
+    fn host<'a>(hosts: &'a mut BTreeMap<String, HostTotals>, name: &str) -> &'a mut HostTotals {
+        hosts.entry(name.to_owned()).or_insert_with(|| HostTotals {
+            host: name.to_owned(),
+            ..HostTotals::default()
+        })
+    }
+    for lane in &lanes {
+        let h = host(&mut hosts, &lane.host);
+        h.sessions += 1;
+        for &(from, to, activity) in &lane.segments {
+            match activity {
+                Activity::Working => h.working_ms += to - from,
+                Activity::Permission => h.permission_ms += to - from,
+                Activity::YourTurn => h.your_turn_ms += to - from,
+                Activity::Parked => h.parked_ms += to - from,
+                Activity::Idle | Activity::Gone => {}
+            }
+        }
+    }
+    let mut prompts = 0;
+    for (name, n) in prompts_by_host(conn, scope)? {
+        prompts += n;
+        host(&mut hosts, &name).prompts += n;
+    }
+    let mut cost_usd = 0.0;
+    for (name, usd) in cost_by_host(conn, scope)? {
+        cost_usd += usd;
+        host(&mut hosts, &name).cost_usd += usd;
+    }
+    let mut hosts: Vec<HostTotals> = hosts.into_values().collect();
+    hosts.sort_by(|a, b| {
+        (b.working_ms + b.permission_ms + b.your_turn_ms)
+            .cmp(&(a.working_ms + a.permission_ms + a.your_turn_ms))
+            .then_with(|| a.host.cmp(&b.host))
+    });
     Ok(History {
         since: scope.since,
         until: scope.until,
@@ -87,17 +139,25 @@ pub fn history(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<His
         bucket_ms,
         lanes,
         usage: usage(conn, scope, bucket_ms)?,
-        cost_usd: cost(conn, scope)?,
-        prompts: conn.query_row(
-            &format!(
-                "SELECT count(*) FROM events e LEFT JOIN sessions x ON x.id = e.session
-                    WHERE e.kind = 'prompt' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}"
-            ),
-            named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
-            |r| r.get(0),
-        )?,
+        cost_usd,
+        prompts,
         tools: tools(conn, scope)?,
+        hosts,
     })
+}
+
+fn prompts_by_host(conn: &Connection, scope: &Scope) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT coalesce(x.host, e.host), count(*)
+            FROM events e LEFT JOIN sessions x ON x.id = e.session
+            WHERE e.kind = 'prompt' AND e.ts >= :since AND e.ts < :until AND {IN_SCOPE}
+            GROUP BY 1"
+    ))?;
+    let rows = stmt.query_map(
+        named_params! {":since": scope.since, ":until": scope.until, ":dirs": scope.dirs_param(), ":host": scope.host},
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// One lane per session active in the scope, ordered by first activity.
@@ -164,6 +224,7 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
         lanes.push(Lane {
             id: row.id,
             label,
+            host: row.host,
             cwd: row.cwd,
             live: current.is_some(),
             background,
@@ -345,11 +406,12 @@ fn usage(conn: &Connection, scope: &Scope, bucket_ms: i64) -> Result<Vec<UsagePo
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// API-equivalent cost accrued in the scope; the statusline reports a
-/// running total per session.
-fn cost(conn: &Connection, scope: &Scope) -> Result<f64> {
+/// API-equivalent cost accrued in the scope, per host; the statusline
+/// reports a running total per session.
+fn cost_by_host(conn: &Connection, scope: &Scope) -> Result<BTreeMap<String, f64>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT min(s.cost_usd), max(s.cost_usd), coalesce(x.started_at, 0)
+        "SELECT min(s.cost_usd), max(s.cost_usd), coalesce(x.started_at, 0),
+                coalesce(x.host, s.host)
             FROM samples s LEFT JOIN sessions x ON x.id = s.session
             WHERE s.ts >= :since AND s.ts < :until AND s.cost_usd IS NOT NULL AND {IN_SCOPE}
             GROUP BY s.session"
@@ -361,19 +423,20 @@ fn cost(conn: &Connection, scope: &Scope) -> Result<f64> {
                 r.get::<_, f64>(0)?,
                 r.get::<_, f64>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
             ))
         },
     )?;
-    let mut total = 0.0;
+    let mut totals = BTreeMap::new();
     for row in rows {
-        let (min, max, started_at) = row?;
-        total += if started_at >= scope.since {
+        let (min, max, started_at, host) = row?;
+        *totals.entry(host).or_insert(0.0) += if started_at >= scope.since {
             max
         } else {
             max - min
         };
     }
-    Ok(total)
+    Ok(totals)
 }
 
 #[cfg(test)]
@@ -514,5 +577,51 @@ mod tests {
         assert!((h.cost_usd - 0.9).abs() < 1e-9);
         assert_eq!(h.usage.len(), 1);
         assert_eq!(h.usage[0].five_hour, Some(13.0));
+        assert_eq!(h.hosts.len(), 1);
+        assert_eq!(h.hosts[0].host, "h");
+        assert!((h.hosts[0].cost_usd - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn totals_split_by_host() {
+        let conn = db();
+        session(&conn, "a", 0, None);
+        conn.execute(
+            "INSERT INTO sessions VALUES ('b', 'other', '/w', NULL, 'b', 'interactive', 0, NULL)",
+            [],
+        )
+        .unwrap();
+        transition(&conn, "a", 100, "idle", "working");
+        conn.execute(
+            "INSERT INTO events VALUES (100, 'other', 'b', 'activity', '{\"from\":\"idle\",\"to\":\"working\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events VALUES (100, 'other', 'b', 'prompt', '{\"text\":\"x\"}')",
+            [],
+        )
+        .unwrap();
+        let h = history(&conn, &scope(0, 1_000), &[]).unwrap();
+        assert_eq!(h.lanes.len(), 2);
+        assert_eq!(h.prompts, 1);
+        let by: Vec<(&str, u32, i64)> = h
+            .hosts
+            .iter()
+            .map(|x| (x.host.as_str(), x.sessions, x.prompts))
+            .collect();
+        assert_eq!(by, [("h", 1, 0), ("other", 1, 1)]);
+        let one = history(
+            &conn,
+            &Scope {
+                host: Some("other".into()),
+                ..scope(0, 1_000)
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(one.lanes.len(), 1);
+        assert_eq!(one.lanes[0].host, "other");
+        assert_eq!(one.hosts.len(), 1);
     }
 }

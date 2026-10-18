@@ -46,6 +46,7 @@ pub struct SlowCall {
     pub ts: i64,
     pub session: String,
     pub label: String,
+    pub host: String,
     pub cwd: String,
     pub tool: String,
     pub summary: String,
@@ -151,6 +152,7 @@ pub fn anatomy(sessions: &[SessionEvents], clock: &Clock, buckets: &mut [Bucket]
                             ts,
                             session: session.id.clone(),
                             label: session.label.clone(),
+                            host: session.host.clone(),
                             cwd: session.cwd.clone(),
                             tool: name.to_owned(),
                             summary: summary.to_owned(),
@@ -277,6 +279,7 @@ mod tests {
         let mut buckets = vec![Bucket::default()];
         let session = SessionEvents {
             id: "a".into(),
+            host: "h".into(),
             cwd: "/w".into(),
             label: "a".into(),
             events: vec![

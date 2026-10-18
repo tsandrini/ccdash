@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -12,13 +12,17 @@ use tracing::{info, warn};
 
 use crate::{
     ask::{self, Answer},
+    claims,
     config::Knowledge as KnowledgeCfg,
     knowledge::{self, Query},
-    model::{Activity, Ask, HostStatus, RateLimits, ScopedLimit, Session, Snapshot, Update},
+    messages,
+    model::{
+        Activity, Ask, HostStatus, Message, RateLimits, ScopedLimit, Session, Snapshot, Update,
+    },
     notify::{Composer, Note},
     paths,
     protocol::{Call, Injection, Reply, TelemetryRecord, ToCollector, Who},
-    state::{AgentEntry, Effects, NiriEvent, ProcPoll, State, StoreMsg},
+    state::{AgentEntry, Effects, NiriEvent, PREVIEW_LEN, ProcPoll, State, StoreMsg},
     store::{self, Store},
     util::{self, now_ms},
     wire::Envelope,
@@ -51,6 +55,27 @@ pub enum Cmd {
     Rename(String, String, oneshot::Sender<Result<Session, String>>),
     /// Sends a message to a session through its channel.
     Reply(String, String, oneshot::Sender<Result<Session, String>>),
+    /// The owner's message to the session `key` names, for its next prompt.
+    Message {
+        key: String,
+        text: String,
+        reply: oneshot::Sender<Result<Message, String>>,
+    },
+    /// The messages waiting for `session` changed.
+    Inbox {
+        session: String,
+        inbox: Vec<Message>,
+    },
+    /// An injection handed `session` its waiting messages; the hook's
+    /// acknowledgement marks them read.
+    Delivered {
+        session: String,
+    },
+    /// The prompt hook of `session` on `host` printed the hub's context.
+    Injected {
+        host: String,
+        session: String,
+    },
     /// Answers ask `ask` of the session `key` names.
     Answer {
         key: String,
@@ -173,6 +198,7 @@ impl Hub {
             reader,
             published: HashMap::new(),
             pending: HashMap::new(),
+            acks: HashSet::new(),
             updates: updates.clone(),
             notes,
             knowledge,
@@ -212,6 +238,18 @@ impl Hub {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Reply(key.to_owned(), text.to_owned(), tx))
             .await?;
+        rx.await.context("hub stopped")
+    }
+
+    /// Leaves the owner's message for the session's next prompt.
+    pub async fn message(&self, key: &str, text: &str) -> Result<Result<Message, String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Message {
+            key: key.to_owned(),
+            text: text.to_owned(),
+            reply,
+        })
+        .await?;
         rx.await.context("hub stopped")
     }
 
@@ -271,6 +309,8 @@ struct Core {
     published: HashMap<String, Session>,
     /// Open asks by id.
     pending: HashMap<String, Pending>,
+    /// Sessions whose prompt hook still has to acknowledge delivered messages.
+    acks: HashSet<String>,
     updates: broadcast::Sender<Update>,
     notes: Option<Notes>,
     knowledge: KnowledgeCfg,
@@ -286,6 +326,25 @@ struct Caller {
     project: Option<String>,
     session: Option<String>,
     title: Option<String>,
+    cwd: String,
+}
+
+impl Caller {
+    fn label(&self) -> String {
+        self.title
+            .clone()
+            .or_else(|| self.session.as_ref().map(|s| s.chars().take(8).collect()))
+            .unwrap_or_else(|| "another session".into())
+    }
+}
+
+/// What the core adds to an injection from the live state.
+#[derive(Debug, Default)]
+struct Around {
+    /// Other sessions of the project, one line each (prompts).
+    others: Vec<String>,
+    /// Live claims covering the file, one line each (edits).
+    claimed: Vec<String>,
 }
 
 async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
@@ -340,6 +399,13 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             Cmd::Reply(key, text, reply) => {
                 let _ = reply.send(core.reply(&key, &text));
             }
+            Cmd::Message { key, text, reply } => core.message(&key, &text, reply),
+            Cmd::Inbox { session, inbox } => core.set_inbox(&session, inbox),
+            Cmd::Delivered { session } => {
+                core.acks.insert(session.clone());
+                core.set_inbox(&session, Vec::new());
+            }
+            Cmd::Injected { host, session } => core.injected(&host, &session),
             Cmd::Answer {
                 key,
                 ask,
@@ -631,7 +697,23 @@ impl Core {
                 .map(|s| s.id.clone())
                 .or_else(|| who.session.clone()),
             title: session.and_then(|s| s.title.clone()),
+            cwd: cwd.to_owned(),
         })
+    }
+
+    /// The project directory holding `cwd`, else its workspace's, else
+    /// `cwd` itself: the base claims are shown and checked against.
+    fn root_of(&self, cwd: &str) -> String {
+        match self.workspaces.locate(cwd) {
+            Some((ws, project)) => {
+                let dir = self.workspaces.dir(&ws).unwrap_or(cwd);
+                match project {
+                    Some(p) => format!("{dir}/{p}"),
+                    None => dir.to_owned(),
+                }
+            }
+            None => cwd.to_owned(),
+        }
     }
 
     /// Carries out a knowledge call from `host`; with an `id` the result
@@ -658,7 +740,9 @@ impl Core {
             Call::Note { who, .. }
             | Call::Recall { who, .. }
             | Call::Inject { who, .. }
-            | Call::Tell { who, .. } => Some(who),
+            | Call::Tell { who, .. }
+            | Call::Claim { who, .. }
+            | Call::Release { who } => Some(who),
             _ => None,
         };
         let caller = match who {
@@ -723,20 +807,45 @@ impl Core {
             }
             Call::Inject { what, .. } => {
                 let c = caller.expect("located above");
-                let others = match &what {
-                    Injection::Prompt { .. } => self.others_active(&c, at),
-                    _ => Vec::new(),
+                let around = match &what {
+                    Injection::Prompt { .. } => Around {
+                        others: self.others_active(&c, at),
+                        ..Around::default()
+                    },
+                    Injection::Edit { path } => Around {
+                        claimed: self.claimed_by_others(&c, path, at),
+                        ..Around::default()
+                    },
+                    Injection::SessionStart => Around::default(),
                 };
                 tokio::spawn(async move {
+                    let session = c.session.clone();
                     let result = store
-                        .exec(move |conn| inject(conn, &c, &what, others, at))
+                        .exec(move |conn| inject(conn, &c, &what, &around, at))
                         .await;
-                    answer(flatten(result));
+                    let delivered = matches!(&result, Ok(Ok((_, true))));
+                    answer(match result {
+                        Ok(Ok((text, _))) => Ok(Reply::Context(text)),
+                        Ok(Err(e)) | Err(e) => Err(format!("{e:#}")),
+                    });
+                    if delivered && let Some(session) = session {
+                        let _ = cmds.send(Cmd::Delivered { session }).await;
+                    }
                 });
             }
             Call::Tell { to, text, .. } => {
                 let c = caller.expect("located above");
-                answer(self.tell_session(&c, &to, &text));
+                self.tell_session(&c, &to, &text, id.is_none(), at, answer);
+            }
+            Call::Claim {
+                what, paths, until, ..
+            } => {
+                let c = caller.expect("located above");
+                answer(self.claim(&c, Some((&what, &paths, until)), id.is_none(), at));
+            }
+            Call::Release { .. } => {
+                let c = caller.expect("located above");
+                answer(self.claim(&c, None, id.is_none(), at));
             }
             Call::Import { dir, notes } => {
                 let Some((workspace, _)) = self.workspaces.locate(&dir) else {
@@ -790,13 +899,14 @@ impl Core {
     }
 
     /// Live sessions of the caller's project, on any host, as lines for
-    /// the prompt injection.
+    /// the prompt injection; parked ones only when they hold a claim.
     fn others_active(&self, c: &Caller, now: i64) -> Vec<String> {
         let mut lines = Vec::new();
         for (host, state) in &self.states {
             for s in state.sessions() {
                 if Some(&s.id) == c.session.as_ref()
-                    || matches!(s.activity, Activity::Gone | Activity::Parked)
+                    || s.activity == Activity::Gone
+                    || (s.activity == Activity::Parked && s.claim.is_none())
                     || s.workspace.as_deref() != Some(c.workspace.as_str())
                 {
                     continue;
@@ -805,17 +915,13 @@ impl Core {
                 if project != c.project {
                     continue;
                 }
-                let label = s
-                    .title
-                    .clone()
-                    .or_else(|| s.name.clone())
-                    .unwrap_or_else(|| s.id.chars().take(8).collect());
                 let doing = match s.activity {
                     Activity::Working => "working",
                     Activity::Permission => "waiting for a permission",
                     Activity::YourTurn => "waiting for the user",
                     Activity::Idle => "idle",
-                    Activity::Gone | Activity::Parked => continue,
+                    Activity::Parked => "parked",
+                    Activity::Gone => continue,
                 };
                 let since = (now - s.activity_since).max(0) / MINUTE_MS;
                 let files = s
@@ -827,9 +933,19 @@ impl Core {
                         format!("; editing {}", shown.join(", "))
                     })
                     .unwrap_or_default();
+                let claim = s
+                    .claim
+                    .as_ref()
+                    .map(|claim| {
+                        format!(
+                            "; claims {}",
+                            claims::describe(claim, &self.root_of(&s.cwd), now)
+                        )
+                    })
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "- \"{label}\" on {host} ({}): {doing} for {since} min{files}",
-                    s.id.chars().take(8).collect::<String>()
+                    "- {}: {doing} for {since} min{files}{claim}",
+                    session_ref(s, host)
                 ));
             }
         }
@@ -837,28 +953,277 @@ impl Core {
         lines
     }
 
-    /// Passes `text` from the caller to another session of its workspace.
-    fn tell_session(&mut self, c: &Caller, to: &str, text: &str) -> Result<Reply, String> {
-        let (_, target) = self
-            .resolve(to)
-            .ok_or_else(|| format!("no session matches {to:?}"))?;
-        if target.workspace.as_deref() != Some(c.workspace.as_str()) {
-            return Err("that session works in another workspace".into());
+    /// Other live sessions of the caller's workspace whose claim covers
+    /// `path`, one line each.
+    fn claimed_by_others(&self, c: &Caller, path: &str, now: i64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (host, state) in &self.states {
+            for s in state.sessions() {
+                let Some(claim) = &s.claim else { continue };
+                if Some(&s.id) == c.session.as_ref()
+                    || s.activity == Activity::Gone
+                    || s.workspace.as_deref() != Some(c.workspace.as_str())
+                    || !claims::covers(claim, path)
+                {
+                    continue;
+                }
+                let since = (now - claim.since).max(0) / MINUTE_MS;
+                lines.push(format!(
+                    "{} claims {}, since {since} min ago",
+                    session_ref(s, host),
+                    claims::describe(claim, &self.root_of(&s.cwd), now)
+                ));
+            }
         }
-        if Some(&target.id) == c.session.as_ref() {
-            return Err("that is this session".into());
+        lines.sort();
+        lines
+    }
+
+    /// Stores `text` from the caller for another session of its
+    /// workspace, to be handed over at that session's next prompt. A
+    /// `replayed` message (queued while the hub was away) may name a
+    /// session that has ended meanwhile: it is kept for a resume.
+    fn tell_session(
+        &mut self,
+        c: &Caller,
+        to: &str,
+        text: &str,
+        replayed: bool,
+        at: i64,
+        answer: impl FnOnce(Result<Reply, String>) + Send + 'static,
+    ) {
+        let live = self.resolve(to).map(|(host, s)| {
+            (
+                s.id.clone(),
+                host.to_owned(),
+                s.workspace.clone(),
+                s.activity == Activity::Gone,
+            )
+        });
+        let target = match live {
+            Some((id, host, workspace, gone)) => {
+                if workspace.as_deref() != Some(c.workspace.as_str()) {
+                    return answer(Err("that session works in another workspace".into()));
+                }
+                if Some(&id) == c.session.as_ref() {
+                    return answer(Err("that is this session".into()));
+                }
+                if gone && !replayed {
+                    return answer(Err("that session has ended".into()));
+                }
+                Some((id, host))
+            }
+            None if replayed => None,
+            None => return answer(Err(format!("no session matches {to:?}"))),
+        };
+        let out = Stored {
+            workspace: c.workspace.clone(),
+            from_session: c.session.clone(),
+            from_host: Some(c.host.clone()),
+            from_label: c.label(),
+            text: text.to_owned(),
+        };
+        // NOTE: a replayed message may name a session the state has dropped
+        let (to, workspaces, workspace) =
+            (to.to_owned(), self.workspaces.clone(), c.workspace.clone());
+        let find = move |conn: &Connection| -> Result<(String, String)> {
+            let mut stmt = conn.prepare(
+                "SELECT id, host, cwd FROM sessions WHERE id = ?1 OR id LIKE ?1 || '%' LIMIT 2",
+            )?;
+            let rows: Vec<(String, String, String)> = stmt
+                .query_map([&to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let (id, host, cwd) = match rows.as_slice() {
+                [one] => one.clone(),
+                [] => bail!("no session matches {to:?}"),
+                _ => bail!("{to:?} matches more than one session"),
+            };
+            if workspaces.of(&cwd).as_deref() != Some(workspace.as_str()) {
+                bail!("that session works in another workspace");
+            }
+            Ok((id, host))
+        };
+        self.store_message(target, Some(Box::new(find)), out, at, move |result| {
+            answer(result.map(|_| Reply::Sent))
+        });
+    }
+
+    /// The owner's message to the session `key` names, from the panel.
+    fn message(&mut self, key: &str, text: &str, reply: oneshot::Sender<Result<Message, String>>) {
+        let found = self
+            .resolve(key)
+            .ok_or_else(|| format!("no session matches {key:?}"))
+            .and_then(|(host, s)| {
+                if s.activity == Activity::Gone {
+                    return Err("the session has ended".to_owned());
+                }
+                if !s.hooked {
+                    return Err(
+                        "the session runs without the ccdash hooks, so nothing reaches it".into(),
+                    );
+                }
+                Ok((
+                    s.id.clone(),
+                    host.to_owned(),
+                    s.workspace.clone().unwrap_or_default(),
+                ))
+            });
+        let (id, host, workspace) = match found {
+            Ok(found) => found,
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+        let out = Stored {
+            workspace,
+            from_session: None,
+            from_host: None,
+            from_label: messages::OWNER.into(),
+            text: text.to_owned(),
+        };
+        self.store_message(Some((id, host)), None, out, now_ms(), move |result| {
+            let _ = reply.send(result);
+        });
+    }
+
+    /// Stores a message for `target` (session id and host), found through
+    /// `find` on the sessions table when the live state has no such
+    /// session; refreshes the recipient's inbox.
+    fn store_message(
+        &self,
+        target: Option<(String, String)>,
+        find: Option<Finder>,
+        out: Stored,
+        at: i64,
+        done: impl FnOnce(Result<Message, String>) + Send + 'static,
+    ) {
+        let (store, cmds) = (self.store.clone(), self.cmds.clone());
+        tokio::spawn(async move {
+            let result = store
+                .exec(move |conn| -> Result<(Message, Vec<Message>)> {
+                    let (id, host) = match target {
+                        Some(target) => target,
+                        None => find.context("no recipient")?(conn)?,
+                    };
+                    let message = messages::send(
+                        conn,
+                        &messages::Outgoing {
+                            workspace: &out.workspace,
+                            from_session: out.from_session.as_deref(),
+                            from_host: out.from_host.as_deref(),
+                            from_label: &out.from_label,
+                            to_session: &id,
+                            to_host: Some(&host),
+                            text: &out.text,
+                        },
+                        at,
+                    )?;
+                    let inbox = messages::previews(&messages::pending(conn, &id)?, PREVIEW_LEN);
+                    Ok((message, inbox))
+                })
+                .await;
+            match result {
+                Ok(Ok((message, inbox))) => {
+                    let session = message.to_session.clone();
+                    done(Ok(message));
+                    let _ = cmds.send(Cmd::Inbox { session, inbox }).await;
+                }
+                Ok(Err(e)) | Err(e) => done(Err(format!("{e:#}"))),
+            }
+        });
+    }
+
+    /// Shows the messages waiting for `session`, wherever it runs.
+    fn set_inbox(&mut self, session: &str, inbox: Vec<Message>) {
+        let host = self
+            .states
+            .iter()
+            .find(|(_, st)| st.session(session).is_some())
+            .map(|(host, _)| host.clone());
+        let Some(host) = host else { return };
+        let mut fx = Effects::default();
+        if let Some(state) = self.states.get_mut(&host) {
+            state.set_inbox(session, inbox, &mut fx);
         }
-        let from = c
-            .title
+        self.flush(&host, fx);
+    }
+
+    /// The prompt hook of `session` printed the context that carried its
+    /// messages: they were read.
+    fn injected(&mut self, host: &str, session: &str) {
+        if !self.acks.remove(session)
+            || self
+                .states
+                .get(host)
+                .is_none_or(|st| st.session(session).is_none())
+        {
+            return;
+        }
+        let (store, session) = (self.store.clone(), session.to_owned());
+        tokio::spawn(async move {
+            let now = now_ms();
+            if let Ok(Err(e)) = store
+                .exec(move |conn| messages::acknowledge(conn, &session, now))
+                .await
+            {
+                warn!("marking messages read: {e:#}");
+            }
+        });
+    }
+
+    /// Sets the caller's claim (`what`, paths, minutes until it lapses) or
+    /// releases it. A `replayed` call may come before the collector has
+    /// reported the session again after a hub restart: the claim then
+    /// goes to the database and is restored with the session.
+    fn claim(
+        &mut self,
+        c: &Caller,
+        spec: Option<(&str, &[String], Option<i64>)>,
+        replayed: bool,
+        at: i64,
+    ) -> Result<Reply, String> {
+        let id = c
+            .session
             .clone()
-            .or_else(|| c.session.as_ref().map(|s| s.chars().take(8).collect()))
-            .unwrap_or_else(|| "another session".into());
-        let message = format!(
-            "Message from the Claude Code session \"{from}\" on {} (not from the user):\n{text}",
-            c.host
-        );
-        let key = target.id.clone();
-        self.reply(&key, &message).map(|_| Reply::Sent)
+            .ok_or("cannot tell which session is claiming")?;
+        let live = self
+            .states
+            .get(&c.host)
+            .and_then(|st| st.session(&id))
+            .is_some_and(|s| s.activity != Activity::Gone);
+        if !live && !replayed {
+            return Err("the hub does not see this session running".into());
+        }
+        let claim = match spec {
+            Some((what, paths, until)) => {
+                let root = self.root_of(&c.cwd);
+                let claim = claims::new(what, paths, until, &c.cwd, &root, at)?;
+                if claim.until.is_some_and(|u| u <= now_ms()) {
+                    return Err("that claim has already lapsed".into());
+                }
+                Some(claim)
+            }
+            None => None,
+        };
+        if !live {
+            let (store, saved) = (self.store.clone(), claim.clone());
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = store
+                    .exec(move |conn| claims::save(conn, &id, saved.as_ref()))
+                    .await
+                {
+                    warn!("storing a replayed claim: {e:#}");
+                }
+            });
+            return Ok(Reply::Claimed(claim));
+        }
+        let mut fx = Effects::default();
+        if let Some(state) = self.states.get_mut(&c.host) {
+            state.set_claim(&id, claim.clone(), &mut fx);
+        }
+        self.flush(&c.host, fx);
+        Ok(Reply::Claimed(claim))
     }
 
     fn collector_closed(&mut self, host: &str, conn: u64) {
@@ -1197,6 +1562,31 @@ impl Core {
     }
 }
 
+/// A message before its recipient is settled.
+struct Stored {
+    workspace: String,
+    from_session: Option<String>,
+    from_host: Option<String>,
+    from_label: String,
+    text: String,
+}
+
+/// Looks a recipient up on the sessions table: `(id, host)`.
+type Finder = Box<dyn FnOnce(&Connection) -> Result<(String, String)> + Send>;
+
+/// `"title" on host (id prefix)`, how injections name a session.
+fn session_ref(s: &Session, host: &str) -> String {
+    let label = s
+        .title
+        .clone()
+        .or_else(|| s.name.clone())
+        .unwrap_or_else(|| s.id.chars().take(8).collect());
+    format!(
+        "\"{label}\" on {host} ({})",
+        s.id.chars().take(8).collect::<String>()
+    )
+}
+
 fn flatten(result: Result<Result<Reply>>) -> Result<Reply, String> {
     match result {
         Ok(Ok(reply)) => Ok(reply),
@@ -1218,14 +1608,15 @@ fn recall(conn: &Connection, workspace: &str, query: &Query, now: i64) -> Result
     Ok(Reply::Hits(hits))
 }
 
-/// The text a hook injects.
+/// The text a hook injects, and whether it hands over waiting messages.
 fn inject(
     conn: &Connection,
     c: &Caller,
     what: &Injection,
-    others: Vec<String>,
+    around: &Around,
     now: i64,
-) -> Result<Reply> {
+) -> Result<(Option<String>, bool)> {
+    let mut delivered = false;
     let text = match what {
         Injection::SessionStart => {
             let cards: Vec<knowledge::Card> = knowledge::active(conn, &c.workspace)?
@@ -1258,10 +1649,17 @@ fn inject(
                     }
                 }
             }
-            if !others.is_empty() {
+            if let Some(session) = c.session.as_deref() {
+                let messages = messages::deliver(conn, session, now)?;
+                if !messages.is_empty() {
+                    delivered = true;
+                    out.push_str(&messages::injection(&messages, now));
+                }
+            }
+            if !around.others.is_empty() {
                 let scope = c.project.clone().unwrap_or_else(|| c.workspace.clone());
                 out.push_str(&format!("Also active in {scope} right now (ccdash):\n"));
-                for line in &others {
+                for line in &around.others {
                     out.push_str(line);
                     out.push('\n');
                 }
@@ -1270,10 +1668,18 @@ fn inject(
         }
         Injection::Edit { path } => {
             let Some(session) = c.session.as_deref() else {
-                return Ok(Reply::Context(None));
+                return Ok((None, false));
             };
+            let mut parts = Vec::new();
+            if !around.claimed.is_empty() {
+                parts.push(format!(
+                    "ccdash: this file is claimed by another session: {}. Coordinate through \
+                        `tell_session` before changing it.",
+                    around.claimed.join("; ")
+                ));
+            }
             let edits = knowledge::recent_edits(conn, session, path, now)?;
-            (!edits.is_empty()).then(|| {
+            if !edits.is_empty() {
                 let who: Vec<String> = edits
                     .iter()
                     .map(|e| {
@@ -1285,13 +1691,14 @@ fn inject(
                         format!("\"{label}\" on {} {ago} min ago", e.host)
                     })
                     .collect();
-                format!(
+                parts.push(format!(
                     "ccdash: another session edited this file recently ({}). Re-read it before \
                         changing it, and consider `tell_session` if you both work on it.",
                     who.join("; ")
-                )
-            })
+                ));
+            }
+            (!parts.is_empty()).then(|| parts.join("\n"))
         }
     };
-    Ok(Reply::Context(text))
+    Ok((text, delivered))
 }

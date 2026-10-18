@@ -1337,7 +1337,9 @@ pub fn session_start(
         "## ccdash knowledge: {scope}\n\
             The hub holds this workspace's memories, issues, progress and docs. Tools: \
             `recall` (a slug for the full note, or a search), `remember`, `verify`, \
-            `issue_add`, `issue_update`, `progress`, `doc_write`, `tell_session`. \
+            `issue_add`, `issue_update`, `progress`, `doc_write`; between sessions \
+            `claim` / `release` (what you are working on, so others keep clear) and \
+            `tell_session` (a message handed to another session at its next prompt). \
             Memory files are frozen: remember through the tool, verify memories you \
             confirm, file issues and log progress as you go.\n"
     );

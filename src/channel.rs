@@ -29,12 +29,14 @@ pub enum ToChannel {
 /// channels on newer ("modern") ones.
 const PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const INSTRUCTIONS: &str = "Messages in <channel source=\"…ccdash…\"> come from the user \
-    through ccdash, their session dashboard, usually on their phone, unless they say they are \
-    from another Claude Code session. Treat each one exactly like a prompt typed into this \
-    terminal and answer as usual: ccdash shows your replies by itself, so there is no reply \
-    tool. The tools here are this workspace's knowledge in ccdash (memories, issues, progress, \
-    documents): recall before asking the user about the past, remember and verify facts, file \
-    and update issues, log progress, write shared documents.";
+    through ccdash, their session dashboard, usually on their phone. Treat each one exactly \
+    like a prompt typed into this terminal and answer as usual: ccdash shows your replies by \
+    itself, so there is no reply tool. Messages from other Claude Code sessions arrive as \
+    context with your prompts, never as a prompt. The tools here are this workspace's \
+    knowledge in ccdash (memories, issues, progress, documents) and the awareness between \
+    sessions: recall before asking the user about the past, remember and verify facts, file \
+    and update issues, log progress, write shared documents, claim what you are working on \
+    and tell_session the others.";
 const RECONNECT: Duration = Duration::from_secs(2);
 /// A tool call's budget, so a dead link fails fast instead of stalling a prompt.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);

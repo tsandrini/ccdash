@@ -68,6 +68,8 @@ pub enum LocalCmd {
     /// Takes the catch-up mark of a session: since when it has been
     /// missing the hub, if it has.
     CatchUp(String, oneshot::Sender<Option<i64>>),
+    /// The prompt hook of this session printed the hub's context.
+    Injected(String),
     /// A `ccdash channel` connected for the Claude process `pid`; `u64`
     /// tells its connections apart.
     ChannelOpen(u32, u64, mpsc::Sender<ToChannel>),
@@ -753,6 +755,11 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
             }
             LocalCmd::CatchUp(session, reply) => {
                 let _ = reply.send(a.offline.remove(&session));
+            }
+            LocalCmd::Injected(session) => {
+                if a.connected {
+                    a.to_hub(ToHub::Injected { session });
+                }
             }
             LocalCmd::ChannelOpen(pid, conn, tx) => {
                 a.channels.insert(pid, (conn, tx));

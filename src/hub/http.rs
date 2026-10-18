@@ -44,6 +44,7 @@ use crate::{
     conversation,
     history::{self, History},
     knowledge::{self, Card, Filter, NoteKind, NoteOp, Status, Upsert},
+    messages,
     model::{Activity, Snapshot},
     paths,
     push::{self, Push},
@@ -54,6 +55,8 @@ use crate::{
 
 const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
+/// Messages shown with a session's conversation.
+const SESSION_MESSAGES: usize = 50;
 
 #[derive(Clone)]
 struct App {
@@ -83,6 +86,7 @@ pub async fn serve(
         .route("/sessions/{id}", get(session))
         .route("/sessions/{id}/title", post(rename))
         .route("/sessions/{id}/reply", post(reply))
+        .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
         .route("/pair", get(pair))
         .route("/history", get(history))
@@ -199,31 +203,34 @@ async fn session(
         session.activity_since
     };
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
-    let (conversation, stats, resources) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let conn = store.reader()?;
-        let conversation = conversation::conversation(&conn, &session_id, query.before, limit)?;
-        let (stats, resources) = match query.before {
-            None => (
-                Some(conversation::stats(
-                    &conn,
-                    &session_id,
-                    started_at,
-                    end,
-                    live,
-                )?),
-                Some(conversation::resources(&conn, &session_id, end - HOUR_MS)?),
-            ),
-            Some(_) => (None, None),
-        };
-        Ok((conversation, stats, resources))
-    })
-    .await
-    .map_err(anyhow::Error::from)??;
+    let (conversation, stats, resources, messages) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let conn = store.reader()?;
+            let conversation = conversation::conversation(&conn, &session_id, query.before, limit)?;
+            let (stats, resources, messages) = match query.before {
+                None => (
+                    Some(conversation::stats(
+                        &conn,
+                        &session_id,
+                        started_at,
+                        end,
+                        live,
+                    )?),
+                    Some(conversation::resources(&conn, &session_id, end - HOUR_MS)?),
+                    Some(messages::of_session(&conn, &session_id, SESSION_MESSAGES)?),
+                ),
+                Some(_) => (None, None, None),
+            };
+            Ok((conversation, stats, resources, messages))
+        })
+        .await
+        .map_err(anyhow::Error::from)??;
     Ok(Json(json!({
         "session": session,
         "conversation": conversation,
         "stats": stats,
         "resources": resources,
+        "messages": messages,
     })))
 }
 
@@ -263,6 +270,20 @@ async fn reply(
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))
+}
+
+/// Leaves a message for the session's next prompt: context, not a turn.
+async fn message(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<Reply>,
+) -> Result<Json<Value>, ApiError> {
+    let message = app
+        .hub
+        .message(&id, &body.text)
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "message": message })))
 }
 
 /// Answers one of the session's open prompts; the terminal dialog closes

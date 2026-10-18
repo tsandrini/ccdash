@@ -13,7 +13,7 @@ use crate::{
 
 /// Tool names, in the order `tools/list` shows them.
 #[cfg(test)]
-pub const NAMES: [&str; 8] = [
+pub const NAMES: [&str; 10] = [
     "recall",
     "remember",
     "verify",
@@ -22,6 +22,8 @@ pub const NAMES: [&str; 8] = [
     "progress",
     "doc_write",
     "tell_session",
+    "claim",
+    "release",
 ];
 
 /// The `tools/list` entries.
@@ -144,9 +146,10 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "tell_session",
-            "description": "Send a message to another running Claude Code session of this workspace (it arrives \
-                at its next turn as a message from you). Use it to hand over a finding or warn about a \
-                file you are about to change. Sessions are named by id prefix or title; recall nothing.",
+            "description": "Send a message to another running Claude Code session of this workspace. It is \
+                handed to that session as context with its next prompt (it never starts a turn there), \
+                so use it to hand over a finding, warn about a file you are about to change, or answer \
+                a message you got. Name the session by its id (the prefix shown next to it).",
             "inputSchema": {
                 "type": "object",
                 "required": ["session", "text"],
@@ -155,6 +158,32 @@ pub fn definitions() -> Vec<Value> {
                     "text": string("The message.")
                 }
             }
+        }),
+        json!({
+            "name": "claim",
+            "description": "Say what this session is working on so other sessions of the project keep clear: \
+                a short description and, when it helps, the files or directories it covers. The other \
+                sessions see it with their prompts and get a warning before editing a claimed file. \
+                Calling it again replaces the claim; it ends with release, after `until`, or when the \
+                session ends.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["what"],
+                "properties": {
+                    "what": string("What you are working on, in a few words."),
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files or directories the work touches, relative to the project (a directory covers everything under it); at most 20."
+                    },
+                    "until": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "Minutes until the claim lapses by itself (default: until released or the session ends)." }
+                }
+            }
+        }),
+        json!({
+            "name": "release",
+            "description": "Drop this session's claim once the work it covered is done or handed over.",
+            "inputSchema": { "type": "object", "properties": {} }
         }),
     ]
 }
@@ -249,6 +278,27 @@ pub fn call(name: &str, args: &Value, who: Who) -> Result<Call> {
                 text: need("text")?,
             });
         }
+        "claim" => {
+            let paths = args["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| {
+                    p.as_str()
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("paths are non-empty strings"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Call::Claim {
+                who,
+                what: need("what")?,
+                paths,
+                until: args["until"].as_i64(),
+            });
+        }
+        "release" => return Ok(Call::Release { who }),
         _ => bail!("unknown tool {name}"),
     };
     Ok(Call::Note { who, op })
@@ -257,7 +307,10 @@ pub fn call(name: &str, args: &Value, who: Who) -> Result<Call> {
 /// Whether a call changes something (and so is queued while the hub is
 /// unreachable) rather than reads.
 pub fn is_write(call: &Call) -> bool {
-    matches!(call, Call::Note { .. } | Call::Tell { .. })
+    matches!(
+        call,
+        Call::Note { .. } | Call::Tell { .. } | Call::Claim { .. } | Call::Release { .. }
+    )
 }
 
 /// What the tool answers for a hub reply.
@@ -266,7 +319,12 @@ pub fn text_of(reply: &Reply) -> String {
         Reply::Written(w) => written(w),
         Reply::Hits(hits) => hits_text(hits, "the hub"),
         Reply::Note(view) => note_text(view),
-        Reply::Sent => "delivered; it arrives at the session's next turn".into(),
+        Reply::Sent => "sent; the session gets it as context with its next prompt".into(),
+        Reply::Claimed(Some(c)) => format!(
+            "claimed: {}; other sessions of the project see it with their prompts",
+            crate::claims::describe(c, "", crate::util::now_ms())
+        ),
+        Reply::Claimed(None) => "released".into(),
         Reply::Imported {
             added,
             updated,
@@ -478,6 +536,23 @@ mod tests {
             )
             .unwrap(),
             Call::Tell { .. }
+        ));
+        let claim = call(
+            "claim",
+            &json!({"what": "the hub", "paths": [" src/hub ", "web/app.js"], "until": 30}),
+            who(),
+        )
+        .unwrap();
+        assert!(is_write(&claim));
+        assert!(matches!(
+            claim,
+            Call::Claim { ref paths, until: Some(30), .. } if paths == &["src/hub", "web/app.js"]
+        ));
+        assert!(call("claim", &json!({"paths": ["x"]}), who()).is_err());
+        assert!(call("claim", &json!({"what": "x", "paths": [1]}), who()).is_err());
+        assert!(matches!(
+            call("release", &json!({}), who()).unwrap(),
+            Call::Release { .. }
         ));
         assert!(call("nope", &json!({}), who()).is_err());
     }

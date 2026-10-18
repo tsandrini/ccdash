@@ -130,6 +130,7 @@ mod tests {
         Lane {
             id: "x".into(),
             label: "x".into(),
+            host: "h".into(),
             cwd: "/w".into(),
             live: false,
             background: false,

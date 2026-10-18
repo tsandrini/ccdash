@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use crate::{
     ask::Answer,
     model::{
-        Activity, Ask, AskKind, Kind, Limit, PARKED_AFTER_MS, ProcInfo, RateLimits, Resources,
-        ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn, WindowRef,
+        Activity, Ask, AskKind, Claim, Kind, Limit, Message, PARKED_AFTER_MS, ProcInfo, RateLimits,
+        Resources, ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
+        WindowRef,
     },
     util::{tail, truncate},
     wire::{Envelope, Source},
@@ -118,6 +119,11 @@ pub enum StoreMsg {
     },
     /// A scoped limit read from `/usage`.
     Limit { ts: i64, limit: ScopedLimit },
+    /// The session's claim changed; None drops it.
+    Claim {
+        session: String,
+        claim: Option<Claim>,
+    },
     /// One OpenTelemetry metric point or event Claude Code exported.
     Telemetry {
         ts: i64,
@@ -146,6 +152,8 @@ pub struct Restored {
     pub hooked: bool,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,
+    pub inbox: Vec<Message>,
+    pub claim: Option<Claim>,
 }
 
 #[derive(Debug, Default)]
@@ -274,7 +282,41 @@ impl State {
             if s.tasks.is_empty() {
                 s.tasks = saved.tasks;
             }
+            if s.inbox.is_empty() {
+                s.inbox = saved.inbox;
+            }
+            s.claim = s.claim.take().or(saved.claim);
         }
+    }
+
+    /// Shows the messages waiting for the session's next prompt; true
+    /// when that changed anything.
+    pub fn set_inbox(&mut self, id: &str, inbox: Vec<Message>, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if s.inbox == inbox {
+            return false;
+        }
+        s.inbox = inbox;
+        fx.touched.insert(id.to_owned());
+        true
+    }
+
+    /// Sets or clears what the session says it is working on.
+    pub fn set_claim(&mut self, id: &str, claim: Option<Claim>, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        if s.claim == claim {
+            return;
+        }
+        s.claim = claim.clone();
+        fx.store.push(StoreMsg::Claim {
+            session: id.to_owned(),
+            claim,
+        });
+        fx.touched.insert(id.to_owned());
     }
 
     pub fn apply(&mut self, env: &Envelope, fx: &mut Effects) {
@@ -1124,6 +1166,19 @@ impl State {
                 fx.touched.insert(s.id.clone());
             }
         }
+        let lapsed: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.claim
+                    .as_ref()
+                    .is_some_and(|c| c.until.is_some_and(|u| u <= now))
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in lapsed {
+            self.set_claim(&id, None, fx);
+        }
         let dead: Vec<String> = self
             .sessions
             .values()
@@ -1191,6 +1246,8 @@ impl State {
             channel: false,
             asks: Vec::new(),
             outbox: Vec::new(),
+            inbox: Vec::new(),
+            claim: None,
             resources: None,
             turn: None,
             tasks: Vec::new(),
@@ -1218,6 +1275,7 @@ impl State {
         record(&mut fx.store, ts, id, "end", json!({ "reason": reason }));
         fx.store.push(session_row(s, Some(ts)));
         fx.touched.insert(id.to_owned());
+        self.set_claim(id, None, fx);
     }
 
     fn is_terminal(&self, window: &Window) -> bool {

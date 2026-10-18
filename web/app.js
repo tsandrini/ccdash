@@ -452,6 +452,8 @@ const detailSignature = (s) =>
     s.turn?.ended_at,
     s.subagents.length,
     s.tasks.map((t) => t.status).join(),
+    s.inbox?.length,
+    s.claim?.since,
   ].join("|");
 
 // --- sessions view ----------------------------------------------------------
@@ -712,7 +714,14 @@ function card(s) {
       ? h("span", { class: "session-parent", text: parentText(s) })
       : null,
     s.hooked || s.activity === "gone"
-      ? [focusLines(s), taskBar(s.tasks), cardProgress(s), cardMeta(s)]
+      ? [
+          focusLines(s),
+          taskBar(s.tasks),
+          cardProgress(s),
+          claimLine(s),
+          inboxLine(s),
+          cardMeta(s),
+        ]
       : h("span", {
           class: "session-note",
           text: "Started before ccdash was installed, so only busy and idle are known. Resume it to see details.",
@@ -844,6 +853,50 @@ function cardMeta(s) {
     : null;
 }
 
+/** The claim's paths relative to the session's directory. */
+function claimPaths(s) {
+  const base = s.cwd.replace(/\/+$/, "");
+  return (s.claim?.paths || []).map((p) =>
+    p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p,
+  );
+}
+
+function claimText(s, withTime = false) {
+  const c = s.claim;
+  if (!c) return "";
+  const parts = [c.what];
+  const paths = claimPaths(s);
+  if (paths.length) parts.push(paths.join(", "));
+  if (withTime && c.until)
+    parts.push(`lapses in ${fmtDuration(Math.max(0, c.until - now()))}`);
+  return parts.join(" · ");
+}
+
+/** What the session says it is working on. */
+function claimLine(s, withTime = false) {
+  if (!s.claim || s.activity === "gone") return null;
+  return h(
+    "span",
+    { class: "session-claim", title: claimText(s, true) },
+    h("span", { class: "who", text: "Claims" }),
+    " ",
+    claimText(s, withTime),
+  );
+}
+
+/** Messages waiting for the session's next prompt. */
+function inboxLine(s) {
+  const n = s.inbox?.length || 0;
+  if (!n || s.activity === "gone") return null;
+  const last = s.inbox[n - 1];
+  return h(
+    "span",
+    { class: "session-inbox", title: last.text },
+    h("span", { class: "who", text: `${plural(n, "message")} waiting` }),
+    ` · from ${last.from_label}: ${plain(last.text)}`,
+  );
+}
+
 /** Last-hour activity bar; the newest stretch comes from the live state. */
 function strip(s) {
   const t1 = now();
@@ -908,6 +961,7 @@ function openDetail(id) {
     more: false,
     stats: null,
     resources: null,
+    messages: [],
     loaded: false,
   };
   state.autoOpened = new Set();
@@ -979,6 +1033,7 @@ function renderDetailHead() {
         })
       : null,
     h("div", { class: "session-where", title: s.cwd, text: s.cwd }),
+    s.claim ? h("div", { class: "detail-claim" }, claimLine(s, true)) : null,
     isAgent(s) ? parentLink(s) : null,
     h(
       "div",
@@ -1104,10 +1159,14 @@ function renderDetailFoot() {
   }
   const replySlot = foot.querySelector(".foot-reply");
   replySlot.hidden = !replies;
-  const mode = s.channel ? "composer" : "hint";
+  const mode = s.channel ? "both" : "note";
   if (replySlot.dataset.mode !== mode) {
     replySlot.dataset.mode = mode;
-    fill(replySlot, s.channel ? composer(s.id) : channelHint(s));
+    fill(
+      replySlot,
+      s.channel ? null : channelHint(s),
+      composer(s.id, s.channel),
+    );
   }
 }
 
@@ -1365,9 +1424,47 @@ function askPreview(input) {
 
 /** Message box sending to the session through its ccdash channel. Enter
  * sends on desktop; on phones Enter is a newline and the button sends. */
-function composer(id) {
+/** Text for the session: `Send` starts a turn through the channel (when
+ * `reply`), `Next prompt` leaves it as context for the next prompt. */
+function composer(id, reply) {
   const error = h("p", { class: "range-error", role: "alert", hidden: true });
-  const send = h("button", { class: "btn", type: "submit", text: "Send" });
+  const submit = async (kind) => {
+    const text = input.value.trim();
+    if (!text) return;
+    for (const b of buttons) b.disabled = true;
+    try {
+      const out = await postJson(`sessions/${encodeURIComponent(id)}/${kind}`, {
+        text,
+      });
+      if (out.session) state.sessions.set(out.session.id, out.session);
+      state.drafts.delete(id);
+      input.value = "";
+      grow();
+      error.hidden = true;
+      scheduleRender();
+      if (kind === "reply") setTimeout(scheduleRender, UNDELIVERED_MS + 500);
+      else loadConversation("refresh");
+      requestAnimationFrame(scrollToEnd);
+    } catch (e) {
+      if (e instanceof Unauthorized) return askToken();
+      error.textContent = e.message;
+      error.hidden = false;
+    } finally {
+      for (const b of buttons) b.disabled = false;
+    }
+  };
+  const send = reply
+    ? h("button", { class: "btn", type: "submit", text: "Send" })
+    : null;
+  const note = h("button", {
+    class: reply ? "btn btn-quiet" : "btn",
+    type: reply ? "button" : "submit",
+    text: "Next prompt",
+    title:
+      "Hand the text to Claude as context with its next prompt, without starting a turn",
+    onclick: reply ? () => submit("messages") : null,
+  });
+  const buttons = [send, note].filter(Boolean);
   const grow = () => {
     input.style.height = "auto";
     input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
@@ -1394,34 +1491,17 @@ function composer(id) {
     "form",
     {
       class: "composer",
-      onsubmit: async (event) => {
+      onsubmit: (event) => {
         event.preventDefault();
-        const text = input.value.trim();
-        if (!text) return;
-        send.disabled = true;
-        try {
-          const { session } = await postJson(
-            `sessions/${encodeURIComponent(id)}/reply`,
-            { text },
-          );
-          state.sessions.set(session.id, session);
-          state.drafts.delete(id);
-          input.value = "";
-          grow();
-          error.hidden = true;
-          scheduleRender();
-          setTimeout(scheduleRender, UNDELIVERED_MS + 500);
-          requestAnimationFrame(scrollToEnd);
-        } catch (e) {
-          if (e instanceof Unauthorized) return askToken();
-          error.textContent = e.message;
-          error.hidden = false;
-        } finally {
-          send.disabled = false;
-        }
+        submit(reply ? "reply" : "messages");
       },
     },
-    h("div", { class: "composer-row" }, input, send),
+    h(
+      "div",
+      { class: "composer-row" },
+      input,
+      h("div", { class: "composer-actions" }, send, note),
+    ),
     error,
   );
   requestAnimationFrame(grow);
@@ -1432,9 +1512,9 @@ function channelHint(s) {
   return h(
     "p",
     { class: "composer-hint" },
-    "To reply from here, the session needs the ccdash channel: exit it and run ",
+    "To start a turn from here, the session needs the ccdash channel: exit it and run ",
     h("code", { text: `claude --resume ${s.id}` }),
-    ".",
+    ". A message below still reaches it with its next prompt.",
   );
 }
 
@@ -1731,6 +1811,7 @@ async function loadConversation(mode) {
   }
   if (page.stats) c.stats = page.stats;
   if (page.resources) c.resources = page.resources;
+  if (page.messages) c.messages = page.messages;
   c.loaded = true;
   renderDetailBody();
 
@@ -1849,9 +1930,87 @@ function conversationTab(s) {
     out.push(h("p", { class: "muted center", text: "No messages yet." }));
   }
   const lastReply = lastReplyAt(c.exchanges);
-  for (const ex of c.exchanges) out.push(exchange(ex, lastReply));
-  out.push(h("div", { id: "live" }, outbox(s), liveBlock(s)));
+  const queue = messageQueue(c.messages, s);
+  let next = 0;
+  // NOTE: a message delivered at a prompt lands a moment after it
+  const flushBefore = (t) => {
+    while (next < queue.length && queue[next].at <= t + MESSAGE_SLACK_MS)
+      out.push(messageItem(queue[next++].m, s));
+  };
+  for (const ex of c.exchanges) {
+    flushBefore(ex.at);
+    out.push(exchange(ex, lastReply));
+  }
+  flushBefore(Infinity);
+  out.push(h("div", { id: "live" }, inboxBlock(s), outbox(s), liveBlock(s)));
   return out;
+}
+
+const MESSAGE_SLACK_MS = 3000;
+
+/** Loaded messages in timeline order: sent ones when they were sent,
+ * received ones when they were delivered (waiting ones show live). */
+function messageQueue(messages, s) {
+  return (messages || [])
+    .filter((m) => m.from_session === s.id || m.delivered_at !== null)
+    .map((m) => ({
+      at: m.from_session === s.id ? m.sent_at : m.delivered_at,
+      m,
+    }))
+    .sort((a, b) => a.at - b.at);
+}
+
+function messageItem(m, s, pending = false) {
+  const sent = m.from_session === s.id;
+  const other = sent ? state.sessions.get(m.to_session) : null;
+  const who = sent
+    ? [
+        "To ",
+        sessionRef(
+          m.to_session,
+          other ? label(other) : m.to_session.slice(0, 8),
+        ),
+        m.to_host && multiHost() ? ` on ${m.to_host}` : "",
+      ]
+    : [
+        "From ",
+        m.from_session
+          ? sessionRef(m.from_session, m.from_label)
+          : m.from_label,
+        m.from_host && multiHost() ? ` on ${m.from_host}` : "",
+      ];
+  const status = pending
+    ? "waiting for the next prompt"
+    : sent
+      ? m.read_at
+        ? "read"
+        : m.delivered_at
+          ? "delivered"
+          : "waiting for its next prompt"
+      : m.read_at
+        ? "read with the prompt"
+        : "delivered with the prompt";
+  return h(
+    "div",
+    {
+      class: `conv-message${sent ? " conv-message-sent" : ""}${pending ? " conv-message-pending" : ""}`,
+    },
+    h(
+      "div",
+      { class: "conv-message-head" },
+      h("span", { class: "who", text: "Message" }),
+      " ",
+      ...who,
+      ` · ${fmtStamp(m.sent_at)} · ${status}`,
+    ),
+    h("div", { class: "bubble", text: m.text }),
+  );
+}
+
+/** Messages the session gets with its next prompt. */
+function inboxBlock(s) {
+  if (!s.inbox?.length || s.activity === "gone") return null;
+  return s.inbox.map((m) => messageItem(m, s, true));
 }
 
 function lastReplyAt(exchanges) {
@@ -2339,6 +2498,17 @@ function detailsTab(s, stats) {
         ),
       );
     }
+  }
+  if (s.claim) {
+    out.push(
+      h("h3", { text: "Working on" }),
+      factList([
+        ["What", s.claim.what],
+        ["Paths", claimPaths(s).join(", ") || null],
+        ["Since", fmtStamp(s.claim.since)],
+        ["Lapses", s.claim.until ? fmtStamp(s.claim.until) : null],
+      ]),
+    );
   }
   const agents = children(s);
   if (agents.length) {
@@ -3162,11 +3332,36 @@ function renderHistory() {
   fill(
     $("#history"),
     tiles,
+    hostsTable(data, "By host", "Totals across the sessions on each machine", [
+      { key: "host", label: "Host", text: true },
+      { key: "sessions", label: "Sessions" },
+      { key: "working_ms", label: "Working", fmt: fmtDuration },
+      { key: "waited", label: "Waited", fmt: fmtDuration },
+      { key: "parked_ms", label: "Parked", fmt: fmtDuration },
+      { key: "prompts", label: "Prompts" },
+      { key: "cost_usd", label: "Cost", fmt: fmtUsd },
+    ]),
     timelineChart(data),
     projectsChart(data),
     toolsChart(data),
     usageChart(data),
   );
+}
+
+/** Whether the payload spans more than one machine (merged view). */
+const spansHosts = (data) => (data.hosts?.length || 0) > 1;
+/** ` · host` for per-session rows of a merged view. */
+const hostTag = (data, host) => (spansHosts(data) ? ` · ${host}` : "");
+
+/** A sortable per-host table, or nothing when one host covers the data. */
+function hostsTable(data, title, sub, columns) {
+  if (!spansHosts(data)) return null;
+  const rows = data.hosts.map((x) => ({
+    ...x,
+    waited: x.permission_ms + x.your_turn_ms,
+    lines: (x.lines_added ?? 0) + (x.lines_removed ?? 0),
+  }));
+  return chartFigure(title, sub, sortableTable(columns, rows, "working_ms"));
 }
 
 function statTile(name, value, sub) {
@@ -3662,7 +3857,7 @@ function timelineChart(data) {
         x: pad.left,
         y: top + 13,
         text: ellipsize(
-          `${lane.background ? "bg · " : ""}${lane.label} · ${place(lane.cwd)}`,
+          `${lane.background ? "bg · " : ""}${lane.label} · ${place(lane.cwd)}${hostTag(data, lane.host)}`,
           maxChars,
         ),
       }),
@@ -3699,19 +3894,28 @@ function timelineChart(data) {
     snap: snapMinute,
     onselect: brushHistory,
   });
+  const multi = spansHosts(data);
   figure.append(
     svg,
     tableView(
-      ["Session", "Working", "Needs permission", "Your turn", "Idle"],
+      [
+        "Session",
+        multi ? "Host" : null,
+        "Working",
+        "Needs permission",
+        "Your turn",
+        "Idle",
+      ].filter(Boolean),
       data.lanes.map((lane) => {
         const t = totals(lane);
         return [
           lane.label,
+          multi ? lane.host : null,
           fmtDuration(t.working),
           fmtDuration(t.permission),
           fmtDuration(t.your_turn),
           fmtDuration(t.idle),
-        ];
+        ].filter((v) => v !== null);
       }),
     ),
   );
@@ -4214,8 +4418,54 @@ function overviewSection(data, width, half) {
       "all sessions at once",
     ),
   );
+  const hostColumns = [
+    { key: "host", label: "Host", text: true },
+    { key: "sessions", label: "Sessions" },
+    { key: "working_ms", label: "Working", fmt: fmtDuration },
+    { key: "waited", label: "Waited", fmt: fmtDuration },
+    { key: "parked_ms", label: "Parked", fmt: fmtDuration },
+    { key: "prompts", label: "Prompts" },
+    {
+      key: "answer_p50_ms",
+      label: "Answer time",
+      fmt: (v, r) => (r.answers ? fmtDuration(v) : "–"),
+    },
+    { key: "cost_usd", label: "Cost", fmt: fmtUsd },
+    {
+      key: "lines",
+      label: "Lines",
+      fmt: (_, r) =>
+        `+${compact.format(r.lines_added)} −${compact.format(r.lines_removed)}`,
+    },
+    {
+      key: "tools",
+      label: "Tool calls",
+      fmt: (v, r) =>
+        r.tool_failures ? `${v} (${r.tool_failures} failed)` : String(v),
+    },
+  ];
+  if (data.telemetry) {
+    hostColumns.push(
+      { key: "tokens", label: "Tokens", fmt: fmtTokens },
+      { key: "api_requests", label: "API requests" },
+    );
+  }
+  hostColumns.push({
+    key: "cpu_secs",
+    label: "CPU",
+    fmt: (v) =>
+      v >= 3600
+        ? `${(v / 3600).toFixed(1)} core-h`
+        : `${Math.round(v / 60)} core-min`,
+  });
   return [
     tiles,
+    hostsTable(
+      data,
+      "By host",
+      "Each machine's share; the Host filter above narrows every section to one",
+      hostColumns,
+    ),
     dailyActivityChart(data, width),
     heatmapChart(data.heatmap, width),
     h(
@@ -4886,7 +5136,7 @@ function waitsSection(data, width, half) {
                 h(
                   "span",
                   { class: "muted" },
-                  `${place(l.cwd)} · handed over ${fmtStamp(l.start)}`,
+                  `${place(l.cwd)}${hostTag(data, l.host)} · handed over ${fmtStamp(l.start)}`,
                 ),
               ),
             ),
@@ -5596,7 +5846,7 @@ function turnsSection(data, width, half) {
                   { class: "muted" },
                   `${toolName(c.tool)}${c.ok ? "" : " · failed"} · `,
                   sessionRef(c.session, c.label),
-                  ` · ${fmtStamp(c.ts)}`,
+                  `${hostTag(data, c.host)} · ${fmtStamp(c.ts)}`,
                 ),
               ),
             ),
@@ -5748,6 +5998,9 @@ function contextSection(data, width, half) {
       ? sortableTable(
           [
             { key: "label", label: "Session", text: true },
+            spansHosts(data)
+              ? { key: "host", label: "Host", text: true }
+              : null,
             { key: "where", label: "Project", text: true },
             { key: "compactions", label: "Compactions" },
             {
@@ -5755,7 +6008,7 @@ function contextSection(data, width, half) {
               label: "Peak",
               fmt: (v) => (v === null ? "–" : pct(v)),
             },
-          ],
+          ].filter(Boolean),
           c.sessions.map((x) => ({
             ...x,
             where: place(x.cwd),

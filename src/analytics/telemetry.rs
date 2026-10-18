@@ -8,7 +8,7 @@ use rusqlite::{Connection, named_params};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::{Bucket, Clock, Projects, percentile, project};
+use super::{Bucket, Clock, Uses, percentile};
 use crate::workspace::{IN_SCOPE, Scope};
 
 #[derive(Debug, Default, Serialize)]
@@ -78,7 +78,7 @@ pub fn telemetry(
     scope: &Scope,
     clock: &Clock,
     buckets: &mut [Bucket],
-    projects: &mut Projects,
+    uses: &mut Uses,
 ) -> Result<Option<Telemetry>> {
     let last_at: Option<i64> = conn.query_row("SELECT max(ts) FROM telemetry", [], |r| r.get(0))?;
     let Some(last_at) = last_at else {
@@ -89,7 +89,7 @@ pub fn telemetry(
         ..Telemetry::default()
     };
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT t.ts, t.name, t.data, coalesce(x.cwd, '?')
+        "SELECT t.ts, t.name, t.data, coalesce(x.cwd, '?'), coalesce(x.host, t.host)
             FROM telemetry t LEFT JOIN sessions x ON x.id = t.session
             WHERE t.ts >= :since AND t.ts < :until AND {IN_SCOPE}
             ORDER BY t.ts"
@@ -102,6 +102,7 @@ pub fn telemetry(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         },
     )?;
@@ -111,7 +112,7 @@ pub fn telemetry(
     let mut edits: BTreeMap<String, EditUse> = BTreeMap::new();
     let mut decisions: BTreeMap<(String, String), u32> = BTreeMap::new();
     for row in rows {
-        let (ts, name, data, cwd) = row?;
+        let (ts, name, data, cwd, host) = row?;
         let Ok(data) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
@@ -140,7 +141,8 @@ pub fn telemetry(
                 out.tokens_cache_read += cache_read;
                 out.tokens_cache_write += cache_write;
                 out.cost_usd += count("cost");
-                project(projects, &cwd).tokens += total;
+                uses.each(&cwd, &host, |t| t.tokens += total);
+                uses.host(&host).api_requests += 1;
                 let model = text("model");
                 let (m, latencies, ttfts) = models.entry(model.clone()).or_insert_with(|| {
                     (

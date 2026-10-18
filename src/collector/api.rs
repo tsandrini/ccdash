@@ -158,7 +158,15 @@ async fn handle(stream: UnixStream, local: Local, cfg: Arc<CollectorConfig>) -> 
             Ok(Request::Channel { pid }) => return channel(lines, write, local, pid).await,
             Ok(Request::Ask { envelope }) => return ask(lines, write, local, envelope).await,
             Ok(Request::Tool { name, args, who }) => tool(&local, &name, &args, who).await?,
-            Ok(Request::Inject { envelope }) => inject(&local, &cfg, &envelope).await?,
+            Ok(Request::Inject { envelope }) => {
+                let (reply, ack) = inject(&local, &cfg, &envelope).await?;
+                send(&mut write, &reply).await?;
+                // NOTE: the hook has the context once the write went through
+                if let Some(session) = ack {
+                    local.send(LocalCmd::Injected(session)).await?;
+                }
+                continue;
+            }
             Ok(Request::Import { dir, notes }) => {
                 match local
                     .call_within(Call::Import { dir, notes }, Duration::from_secs(60))
@@ -240,10 +248,16 @@ fn tool_reply(ok: bool, text: impl Into<String>) -> Value {
     json!({ "type": "tool", "ok": ok, "text": text.into() })
 }
 
-/// The context a hook injects, from the hub or (session starts) the cache.
-async fn inject(local: &Local, cfg: &CollectorConfig, env: &Envelope) -> Result<Value> {
+/// The context a hook injects, from the hub or (session starts) the cache,
+/// and the session to acknowledge once a prompt hook has the hub's text.
+async fn inject(
+    local: &Local,
+    cfg: &CollectorConfig,
+    env: &Envelope,
+) -> Result<(Value, Option<String>)> {
+    let none = (json!({ "type": "none" }), None);
     let Some(what) = tools::injection_of(&env.payload) else {
-        return Ok(json!({ "type": "none" }));
+        return Ok(none);
     };
     let wanted = match what {
         Injection::SessionStart => cfg.inject.session_start,
@@ -251,13 +265,14 @@ async fn inject(local: &Local, cfg: &CollectorConfig, env: &Envelope) -> Result<
         Injection::Edit { .. } => cfg.inject.edits,
     };
     if !wanted {
-        return Ok(json!({ "type": "none" }));
+        return Ok(none);
     }
     let who = Who {
         session: env.payload["session_id"].as_str().map(str::to_owned),
         pid: env.pid,
         cwd: env.payload["cwd"].as_str().map(str::to_owned),
     };
+    let mut ack = None;
     let text = if local.connected().await? {
         let what = match (&what, &who.session) {
             (Injection::Prompt { .. }, Some(session)) => Injection::Prompt {
@@ -285,6 +300,9 @@ async fn inject(local: &Local, cfg: &CollectorConfig, env: &Envelope) -> Result<
                     "inject {what:?}: {} chars",
                     text.as_ref().map_or(0, String::len)
                 );
+                if text.is_some() && matches!(what, Injection::Prompt { .. }) {
+                    ack = who.session.clone();
+                }
                 text
             }
             Ok(_) => None,
@@ -297,8 +315,8 @@ async fn inject(local: &Local, cfg: &CollectorConfig, env: &Envelope) -> Result<
         local.offline_inject(who, what).await?
     };
     Ok(match text {
-        Some(text) => json!({ "type": "context", "text": text }),
-        None => json!({ "type": "none" }),
+        Some(text) => (json!({ "type": "context", "text": text }), ack),
+        None => (json!({ "type": "none" }), None),
     })
 }
 

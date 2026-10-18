@@ -32,6 +32,7 @@ pub struct ContextHealth {
 pub struct ContextSession {
     pub id: String,
     pub label: String,
+    pub host: String,
     pub cwd: String,
     pub compactions: u32,
     pub peak_pct: Option<f64>,
@@ -72,6 +73,7 @@ pub fn context(
             ContextSession {
                 id: session.id.clone(),
                 label: session.label.clone(),
+                host: session.host.clone(),
                 cwd: session.cwd.clone(),
                 compactions: compactions.len() as u32,
                 peak_pct: None,

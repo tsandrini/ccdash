@@ -582,6 +582,19 @@ main {
   color: var(--text-muted);
 }
 
+.session-claim,
+.session-inbox {
+  overflow: hidden;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-claim .session-claim {
+  white-space: normal;
+}
+
 .session-tasks {
   display: flex;
   align-items: center;
@@ -1022,6 +1035,40 @@ dl.ask-preview {
 .msg-pending .bubble {
   opacity: 0.75;
   box-shadow: inset 0 0 0 1px var(--axis);
+}
+
+/* Messages between sessions: context at a prompt, not a turn. */
+.conv-message {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 10px 0;
+}
+
+.conv-message-sent {
+  align-items: flex-end;
+}
+
+.conv-message-head {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.conv-message .bubble {
+  border-radius: 14px;
+  background: transparent;
+  outline: 1px dashed var(--axis);
+  outline-offset: -1px;
+}
+
+.conv-message-pending .bubble {
+  opacity: 0.75;
+}
+
+.composer-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .msg-pending time.stuck {

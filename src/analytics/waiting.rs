@@ -40,6 +40,7 @@ pub struct Tally {
 pub struct LateWait {
     pub session: String,
     pub label: String,
+    pub host: String,
     pub cwd: String,
     pub start: i64,
     pub ms: i64,
@@ -83,6 +84,7 @@ pub fn waiting(
                 out.late.push(LateWait {
                     session: lane.id.clone(),
                     label: lane.label.clone(),
+                    host: lane.host.clone(),
                     cwd: lane.cwd.clone(),
                     start: w.start,
                     ms,
@@ -130,6 +132,7 @@ mod tests {
         let lane = Lane {
             id: "a".into(),
             label: "a".into(),
+            host: "h".into(),
             cwd: "/w".into(),
             live: true,
             background: false,

@@ -256,12 +256,52 @@ pub struct Session {
     pub asks: Vec<Ask>,
     /// Replies sent through the channel that Claude has not picked up yet.
     pub outbox: Vec<Stamped>,
+    /// Messages waiting for the session's next prompt (text shortened).
+    #[serde(default)]
+    pub inbox: Vec<Message>,
+    /// What the session says it is working on.
+    #[serde(default)]
+    pub claim: Option<Claim>,
     pub resources: Option<Resources>,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,
     pub subagents: Vec<Subagent>,
     pub started_at: i64,
     pub last_event_at: i64,
+}
+
+/// A message from one session, or from the owner in the panel, to a
+/// session: handed to the recipient as context at its next prompt, never
+/// as a turn of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub id: i64,
+    pub workspace: String,
+    /// None when the owner sent it from the panel.
+    pub from_session: Option<String>,
+    pub from_host: Option<String>,
+    /// The sender's title or id prefix when it was sent; `the owner` from
+    /// the panel.
+    pub from_label: String,
+    pub to_session: String,
+    pub to_host: Option<String>,
+    pub text: String,
+    pub sent_at: i64,
+    /// Injected into the recipient's prompt.
+    pub delivered_at: Option<i64>,
+    /// The recipient's hook took the injection, so Claude read it.
+    pub read_at: Option<i64>,
+}
+
+/// What a session says it is working on, so the others keep clear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub what: String,
+    /// Absolute files or directories the claim covers.
+    pub paths: Vec<String>,
+    pub since: i64,
+    /// When it lapses by itself; None until released or the session ends.
+    pub until: Option<i64>,
 }
 
 /// A machine whose collector reports to the hub.

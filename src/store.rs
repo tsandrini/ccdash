@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::{
-    knowledge,
+    claims, knowledge, messages,
     model::{Kind, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
@@ -196,6 +196,8 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(knowledge::SCHEMA)?;
     conn.execute_batch(push::SCHEMA)?;
+    conn.execute_batch(messages::SCHEMA)?;
+    conn.execute_batch(claims::SCHEMA)?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -326,6 +328,7 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                     ],
                 )?;
             }
+            StoreMsg::Claim { session, claim } => claims::save(&tx, session, claim.as_ref())?,
         }
     }
     tx.commit()?;
@@ -338,6 +341,8 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
     conn.execute("DELETE FROM proc_samples WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM telemetry WHERE ts < ?1", [cutoff])?;
     conn.execute("DELETE FROM limit_samples WHERE ts < ?1", [cutoff])?;
+    messages::prune(conn, cutoff)?;
+    claims::prune(conn, now_ms())?;
     conn.execute(
         "DELETE FROM sessions WHERE started_at < ?1
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",
@@ -427,6 +432,7 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             apply_task(&mut tasks, &delta);
         }
     }
+    let now = now_ms();
     let restored = Restored {
         prompt: last_text("prompt")?,
         reply: last_text("reply")?,
@@ -434,6 +440,8 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         hooked,
         turn: last_turn(&conn, session)?,
         tasks,
+        inbox: messages::previews(&messages::pending(&conn, session)?, PREVIEW_LEN),
+        claim: claims::load(&conn, session, now)?,
     };
     conn.finish()?;
     Ok(restored)
