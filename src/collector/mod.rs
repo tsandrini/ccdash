@@ -10,7 +10,7 @@ mod link;
 mod queue;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::Permissions,
     os::unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
@@ -169,6 +169,7 @@ impl Local {
 }
 
 pub const NOT_CONNECTED: &str = "the hub is not connected";
+const DIRS_EVERY_MS: i64 = 60_000;
 pub const TIMED_OUT: &str = "the hub did not answer in time";
 
 /// What the collector keeps on disk of the hub's notes.
@@ -295,6 +296,26 @@ impl Local {
     }
 }
 
+/// Workspace name → the directories directly under it (hidden ones left
+/// out), for the workspaces whose directory exists on this machine.
+fn project_dirs(workspaces: &Workspaces) -> BTreeMap<String, Vec<String>> {
+    workspaces
+        .entries()
+        .into_iter()
+        .filter_map(|ws| {
+            let mut names: Vec<String> = std::fs::read_dir(&ws.dir)
+                .ok()?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.'))
+                .collect();
+            names.sort();
+            Some((ws.name, names))
+        })
+        .collect()
+}
+
 fn replace(path: &Path) -> Result<&Path> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -361,6 +382,10 @@ struct Actor {
     launch: Launch,
     /// `[attach] command`, for the hub's `Open`.
     attach: Vec<String>,
+    /// The project directories last reported (`ToHub::Dirs`), and when
+    /// they were last read.
+    dirs: BTreeMap<String, Vec<String>>,
+    dirs_at: i64,
 }
 
 impl Actor {
@@ -406,6 +431,23 @@ impl Actor {
                 stop: Vec::new(),
             },
             attach: Vec::new(),
+            dirs: BTreeMap::new(),
+            dirs_at: 0,
+        }
+    }
+
+    /// Tells the hub which project directories exist here: always after a
+    /// welcome, else when they changed, read at most once a minute.
+    fn report_dirs(&mut self, force: bool) {
+        let now = now_ms();
+        if !force && now - self.dirs_at < DIRS_EVERY_MS {
+            return;
+        }
+        self.dirs_at = now;
+        let dirs = project_dirs(&self.workspaces);
+        if force || dirs != self.dirs {
+            self.dirs = dirs.clone();
+            self.to_hub(ToHub::Dirs { dirs });
         }
     }
 
@@ -631,6 +673,7 @@ impl Actor {
                 self.hub_host = host;
                 self.web_url = web_url;
                 self.workspaces = Workspaces::from_entries(&workspaces);
+                self.report_dirs(true);
             }
             ToCollector::Notes { workspace, notes } => {
                 self.notes.insert(
@@ -779,6 +822,9 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
             LocalCmd::Agents(mut list, at) => {
                 for e in &mut list {
                     e.branch = a.branch_of(Some(&e.session_id), e.cwd.as_deref());
+                }
+                if a.connected {
+                    a.report_dirs(false);
                 }
                 let dead: Vec<u32> = a
                     .sessions

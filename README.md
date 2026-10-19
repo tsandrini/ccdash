@@ -332,8 +332,9 @@ the organization.
 
 **Start a session** on Now (and **Start** on a project page, with the
 project filled in) opens a sheet: a connected host, a workspace and one of
-its projects (as Projects lists them, or the workspace's own directory),
-the model, the permission mode (the host's default, plan, accept edits)
+its projects (the ones Projects lists that have a directory on that host,
+as its collector reports them, or the workspace's own directory), the
+model, the permission mode (the host's default, plan, accept edits)
 and the prompt, with templates, history and `[[note]]` links. The hub
 resolves the directory from the workspace and project; the panel never
 sends a path, and the hub refuses unknown hosts, projects, models, modes

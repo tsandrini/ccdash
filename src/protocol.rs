@@ -3,6 +3,8 @@
 //! the hub answers with `Welcome`; either side closes on a version it does
 //! not speak.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,11 +18,13 @@ use crate::{
     wire::Envelope,
 };
 
+/// 5: `Dirs`, the project directories under each workspace on the
+/// collector's machine (where sessions can start).
 /// 4: sessions started, stopped and opened from the panel (`Launch`,
 /// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
 /// on sessions, `branch` on agents entries and envelopes, `launch` on
 /// envelopes.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +108,12 @@ pub enum ToHub {
         session: String,
         #[serde(default)]
         error: Option<String>,
+    },
+    /// Workspace name → the directories directly under it on this machine;
+    /// a workspace whose directory is missing here is left out. Sent after
+    /// each welcome and when it changes.
+    Dirs {
+        dirs: BTreeMap<String, Vec<String>>,
     },
 }
 
@@ -467,6 +477,12 @@ mod tests {
                 ..
             }
         ));
+        let dirs = ToHub::Dirs {
+            dirs: BTreeMap::from([("w".to_owned(), vec!["ccdash".to_owned()])]),
+        };
+        let text = serde_json::to_string(&dirs).unwrap();
+        assert_eq!(text, r#"{"type":"dirs","dirs":{"w":["ccdash"]}}"#);
+        assert!(!dirs.durable());
         let injected: ToHub = serde_json::from_str(r#"{"type":"injected","session":"s"}"#).unwrap();
         assert!(matches!(injected, ToHub::Injected { ref session } if session == "s"));
         assert!(!injected.durable());

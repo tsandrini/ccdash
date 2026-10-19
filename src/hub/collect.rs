@@ -194,6 +194,7 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
             session,
             error,
         },
+        ToHub::Dirs { dirs } => Cmd::Dirs { host, dirs },
     })
 }
 

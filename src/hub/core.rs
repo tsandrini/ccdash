@@ -4,6 +4,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Workspace name → the directories under it on one host.
+pub type Dirs = BTreeMap<String, Vec<String>>;
+
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -181,6 +184,13 @@ pub enum Cmd {
         key: String,
         reply: oneshot::Sender<Result<Session, String>>,
     },
+    /// The project directories a collector found on its host.
+    Dirs {
+        host: String,
+        dirs: Dirs,
+    },
+    /// The connected hosts with their directories.
+    HostDirs(oneshot::Sender<Vec<(String, Dirs)>>),
 }
 
 /// A session to start, with the directory already resolved from a known
@@ -268,6 +278,7 @@ impl Hub {
             cmds: tx.clone(),
             launches: HashMap::new(),
             stops: HashMap::new(),
+            dirs: HashMap::new(),
         };
         tokio::spawn(run(core, rx));
         Self { tx, updates }
@@ -362,6 +373,13 @@ impl Hub {
         rx.await.context("hub stopped")
     }
 
+    /// Connected hosts and the project directories they reported.
+    pub async fn host_dirs(&self) -> Result<Vec<(String, Dirs)>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::HostDirs(tx)).await?;
+        rx.await.context("hub stopped")
+    }
+
     pub async fn launch_of(&self, id: &str) -> Result<Option<Launch>> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::LaunchOf(id.to_owned(), tx)).await?;
@@ -409,6 +427,8 @@ struct Core {
     launches: HashMap<String, Slot>,
     /// Who waits for a session's host to report its stop.
     stops: HashMap<String, Vec<oneshot::Sender<Result<Session, String>>>>,
+    /// The project directories each host reported.
+    dirs: HashMap<String, Dirs>,
 }
 
 /// The session behind a knowledge call, placed in its workspace.
@@ -606,6 +626,18 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::Open { key, reply } => {
                 let _ = reply.send(core.open(&key));
+            }
+            Cmd::Dirs { host, dirs } => {
+                core.dirs.insert(host, dirs);
+            }
+            Cmd::HostDirs(reply) => {
+                let mut hosts: Vec<(String, Dirs)> = core
+                    .links
+                    .keys()
+                    .map(|h| (h.clone(), core.dirs.get(h).cloned().unwrap_or_default()))
+                    .collect();
+                hosts.sort();
+                let _ = reply.send(hosts);
             }
         }
     }
@@ -2187,6 +2219,19 @@ mod tests {
         })
         .await
         .unwrap();
+        hub.send(Cmd::Dirs {
+            host: "navi".into(),
+            dirs: Dirs::from([("w".to_owned(), vec!["p".to_owned()])]),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            hub.host_dirs().await.unwrap(),
+            [(
+                "navi".to_owned(),
+                Dirs::from([("w".to_owned(), vec!["p".to_owned()])])
+            )]
+        );
         let first = hub.launch(req(None)).await.unwrap().unwrap();
         assert_eq!(first.state, LaunchState::Pending);
         let sent = next(&mut rx, |m| matches!(m, ToCollector::Launch { .. })).await;

@@ -10,6 +10,7 @@ import type {
 	Hit,
 	Launch,
 	LaunchBody,
+	LaunchTarget,
 	Message,
 	Note,
 	NoteOp,
@@ -61,6 +62,9 @@ export const answerAsk = (id: string, ask: string, answer: Answer) =>
 /** Starts a background session (or continues an ended one); the launch
  * moves on through `launch` updates on the stream. */
 export const startLaunch = (body: LaunchBody) => postJson<{ launch: Launch }>('launches', body);
+
+/** Connected hosts, their workspaces and the projects with notes and a directory there. */
+export const fetchTargets = () => getJson<{ hosts: LaunchTarget[] }>('launch-targets');
 
 export const fetchLaunch = (id: string) =>
 	getJson<{ launch: Launch }>(`launches/${encodeURIComponent(id)}`);

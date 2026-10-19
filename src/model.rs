@@ -441,6 +441,22 @@ pub enum Update {
     },
 }
 
+/// Where a session can start: a connected host and, per workspace whose
+/// directory it has, the projects that have notes and a directory there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct LaunchTarget {
+    pub host: String,
+    pub workspaces: Vec<TargetWorkspace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct TargetWorkspace {
+    pub name: String,
+    pub projects: Vec<String>,
+}
+
 /// A session the panel asked a host to start (or continue).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export_to = "types.ts")]

@@ -39,7 +39,7 @@ use ts_rs::TS;
 
 use super::{
     collect::{self, Tokens},
-    core::{Cmd, Hub, LaunchReq},
+    core::{Cmd, Dirs, Hub, LaunchReq},
     web,
 };
 use crate::{
@@ -54,7 +54,7 @@ use crate::{
         projects::{self, Graph, Projects},
     },
     messages,
-    model::{Activity, Session, Snapshot},
+    model::{Activity, LaunchTarget, Session, Snapshot, TargetWorkspace},
     paths,
     push::{self, Push},
     store::{self, Store},
@@ -133,6 +133,7 @@ pub async fn serve(
         .route("/sessions/{id}/forget", post(forget))
         .route("/sessions/{id}/open", post(open))
         .route("/launches", post(launch))
+        .route("/launch-targets", get(launch_targets))
         .route("/launches/{id}", get(launch_of))
         .route("/prompts", get(prompts))
         .route("/history", get(history))
@@ -506,33 +507,35 @@ async fn launch(
             }
             (s.cwd, Some(s.id))
         }
-        None => match &body.project {
-            None => (ws_dir, None),
-            Some(project) => {
-                let (store, ws, name) =
-                    (app.store.clone(), body.workspace.clone(), project.clone());
-                let known = tokio::task::spawn_blocking(move || -> Result<bool> {
-                    let view = projects::build(&store.reader()?, &ws, &[], now_ms())?;
-                    Ok(view
-                        .projects
-                        .iter()
-                        .any(|p| p.project.as_ref() == Some(&name)))
-                })
-                .await
-                .map_err(anyhow::Error::from)??;
-                let plain = !project.is_empty()
-                    && !project.contains('/')
-                    && project != "."
-                    && project != "..";
-                if !known || !plain {
+        None => {
+            let targets = targets_of(&app).await?;
+            let host = targets
+                .iter()
+                .find(|t| t.host == body.host)
+                .ok_or_else(|| {
+                    ApiError(
+                        StatusCode::CONFLICT,
+                        format!("{} is not connected", body.host),
+                    )
+                })?;
+            let ws = host
+                .workspaces
+                .iter()
+                .find(|w| w.name == body.workspace)
+                .ok_or_else(|| refuse(format!("{} has no directory {ws_dir}", body.host)))?;
+            match &body.project {
+                None => (ws_dir, None),
+                Some(project) if ws.projects.contains(project) => {
+                    (format!("{ws_dir}/{project}"), None)
+                }
+                Some(project) => {
                     return Err(refuse(format!(
-                        "{project:?} is not a known project of {}",
-                        body.workspace
+                        "{project:?} is not a known project of {} on {}",
+                        body.workspace, body.host
                     )));
                 }
-                (format!("{ws_dir}/{project}"), None)
             }
-        },
+        }
     };
     let launch = app
         .hub
@@ -549,6 +552,52 @@ async fn launch(
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok((StatusCode::ACCEPTED, Json(json!({ "launch": launch }))))
+}
+
+/// Where sessions can start: connected hosts, the workspaces whose
+/// directory they have, and the projects with notes and a directory there.
+async fn launch_targets(State(app): State<App>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({ "hosts": targets_of(&app).await? })))
+}
+
+async fn targets_of(app: &App) -> Result<Vec<LaunchTarget>, ApiError> {
+    let hosts = app.hub.host_dirs().await?;
+    let (store, names) = (app.store.clone(), app.workspaces.names());
+    let projects = tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
+        let conn = store.reader()?;
+        let now = now_ms();
+        names
+            .into_iter()
+            .map(|ws| Ok((ws.clone(), projects::names(&conn, &ws, now)?)))
+            .collect()
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(launch_targets_from(hosts, &projects))
+}
+
+/// Each host's workspaces (in the configured order) with the projects
+/// that have notes and a directory on that host.
+fn launch_targets_from(
+    hosts: Vec<(String, Dirs)>,
+    projects: &[(String, Vec<String>)],
+) -> Vec<LaunchTarget> {
+    hosts
+        .into_iter()
+        .map(|(host, dirs)| LaunchTarget {
+            host,
+            workspaces: projects
+                .iter()
+                .filter_map(|(ws, names)| {
+                    let here = dirs.get(ws)?;
+                    Some(TargetWorkspace {
+                        name: ws.clone(),
+                        projects: names.iter().filter(|p| here.contains(p)).cloned().collect(),
+                    })
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// A launch while the hub keeps it (15 minutes).
@@ -1284,6 +1333,49 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn targets_are_noted_projects_with_a_directory_on_the_host() {
+        let hosts = vec![
+            (
+                "navi".to_owned(),
+                Dirs::from([
+                    (
+                        "tsandrini".to_owned(),
+                        vec!["ccdash".into(), "femtimer".into()],
+                    ),
+                    ("meteopress".to_owned(), Vec::new()),
+                ]),
+            ),
+            ("flat".to_owned(), Dirs::new()),
+        ];
+        let projects = vec![
+            ("meteopress".to_owned(), vec!["radar".to_owned()]),
+            (
+                "tsandrini".to_owned(),
+                vec!["ccdash".to_owned(), "tsandrini".to_owned()],
+            ),
+            ("PesekMudra".to_owned(), vec!["site".to_owned()]),
+        ];
+        let targets = launch_targets_from(hosts, &projects);
+        assert_eq!(
+            targets[0],
+            LaunchTarget {
+                host: "navi".into(),
+                workspaces: vec![
+                    TargetWorkspace {
+                        name: "meteopress".into(),
+                        projects: Vec::new()
+                    },
+                    TargetWorkspace {
+                        name: "tsandrini".into(),
+                        projects: vec!["ccdash".into()]
+                    },
+                ],
+            }
+        );
+        assert!(targets[1].workspaces.is_empty());
     }
 
     #[tokio::test]

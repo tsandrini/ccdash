@@ -88,6 +88,33 @@ pub struct Doc {
     pub hot: bool,
 }
 
+/// The projects of a workspace's live notes and recently closed issues,
+/// the workspace-wide notes (None) first.
+fn project_names(live: &[Note], closed: &[Note]) -> Vec<Option<String>> {
+    let mut names: Vec<Option<String>> = live
+        .iter()
+        .chain(closed)
+        .map(|n| n.project.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The projects `GET /projects` lists for `workspace` (not the
+/// workspace-wide entry).
+pub fn names(conn: &Connection, workspace: &str, now: i64) -> Result<Vec<String>> {
+    let live = notes(conn, workspace, &[Status::Active, Status::Stale])?;
+    let closed: Vec<Note> = notes(conn, workspace, &[Status::Archived])?
+        .into_iter()
+        .filter(|n| n.kind == NoteKind::Issue && closed_at(n) >= now - DONE_MS)
+        .collect();
+    Ok(project_names(&live, &closed)
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 /// The workspace's Projects view; `sessions` are the live ones the hub
 /// sees (any workspace: they are filtered here).
 pub fn build(
@@ -160,14 +187,7 @@ pub fn build(
         .filter(|n| n.status == Status::Stale)
         .map(Note::card)
         .collect();
-    let mut names: Vec<Option<String>> = live
-        .iter()
-        .chain(closed.iter())
-        .map(|n| n.project.clone())
-        .collect();
-    names.sort();
-    names.dedup();
-    let projects = names
+    let projects = project_names(&live, &closed)
         .into_iter()
         .map(|project| {
             let of = |kind: NoteKind| -> Vec<&Note> {

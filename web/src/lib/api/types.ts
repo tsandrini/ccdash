@@ -336,6 +336,12 @@ permission_mode?: string,
  */
 resume?: string, };
 
+/**
+ * Where a session can start: a connected host and, per workspace whose
+ * directory it has, the projects that have notes and a directory there.
+ */
+export type LaunchTarget = { host: string, workspaces: Array<TargetWorkspace>, };
+
 export type Limit = { used_pct: number, 
 /**
  * Unix seconds.
@@ -771,6 +777,8 @@ export type Subscription = { id: number, endpoint: string, user_agent: string | 
  * Null for devices on the bootstrap token.
  */
 token_id: number | null, };
+
+export type TargetWorkspace = { name: string, projects: Array<string>, };
 
 /**
  * An entry of Claude's task list (TaskCreate/TaskUpdate or TodoWrite).

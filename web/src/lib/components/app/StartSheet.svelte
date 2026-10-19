@@ -1,19 +1,21 @@
 <script lang="ts">
 	// Starts a background session (`claude --bg` on a connected host, in a
-	// project the hub knows) or continues an ended one: host, workspace and
-	// project, the model, the permission mode, the prompt. Waits for the
-	// session to report and opens its page.
+	// project with notes and a directory on that host) or continues an
+	// ended one: host, workspace and project, the model, the permission
+	// mode, the prompt. Waits for the session to report and opens its page.
 	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
 	import { Unauthorized } from '#lib/api/client.js';
 	import {
 		fetchLaunch,
-		fetchProjects,
 		fetchPrompts,
+		fetchTargets,
 		startLaunch,
-		type Launch
+		type Launch,
+		type LaunchTarget
 	} from '#lib/api/index.js';
+	import type { StartPreset } from '#lib/starter.svelte.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Sheet from '#lib/components/ui/sheet/index.js';
 	import PromptField from '#lib/components/session/PromptField.svelte';
@@ -47,37 +49,71 @@
 	let mode = $state('');
 	let text = $state('');
 	let field = $state<PromptField | null>(null);
-	let projectsOf = $state<Record<string, string[]>>({});
+	/** Where sessions can start; null until loaded. */
+	let targets = $state<LaunchTarget[] | null>(null);
 	let pending = $state<string | null>(null);
 	let busy = $state(false);
 	let error = $state('');
 
 	const resume = $derived(starter.preset.resume);
 	const draftKey = $derived(resume ? `resume:${resume.id}` : 'start');
-	const connected = $derived(live.hosts.filter((h) => h.connected).map((h) => h.name));
-	const names = $derived(projectsOf[ws]);
+	const connected = $derived((targets ?? []).map((t) => t.host));
+	const workspacesHere = $derived(targets?.find((t) => t.host === host)?.workspaces ?? []);
+	const names = $derived(workspacesHere.find((w) => w.name === ws)?.projects);
 	const launch = $derived<Launch | undefined>(pending ? live.launches.get(pending) : undefined);
 	const ready = $derived(
 		Boolean(host && ws && (resume || project) && text.trim() && !busy && !pending)
 	);
 	const touch = () => matchMedia('(pointer: coarse)').matches;
 
-	// A fresh sheet: the preset, else the last choice and the scope.
+	// A fresh sheet: where sessions can start, then the preset, else the
+	// last choice and the scope.
 	$effect(() => {
 		if (!starter.open) return;
 		const preset = starter.preset;
 		untrack(() => {
-			const r = preset.resume;
-			const last = prefs.start;
-			host = r?.host ?? (connected.includes(last.host) ? last.host : connected[0]) ?? '';
-			ws = r?.workspace ?? preset.ws ?? scope.current.ws[0] ?? live.workspaces[0] ?? '';
-			project = r ? (r.project ?? ROOT) : preset.project === null ? ROOT : (preset.project ?? '');
-			model = last.model;
-			mode = last.mode;
+			model = prefs.start.model;
+			mode = prefs.start.mode;
 			pending = null;
 			error = '';
+			targets = null;
+			fetchTargets()
+				.then(({ hosts }) => {
+					if (!starter.open) return;
+					targets = hosts;
+					pick(preset, hosts);
+				})
+				.catch((e) => {
+					if (e instanceof Unauthorized) live.needToken = true;
+					else error = (e as Error).message;
+				});
 		});
 	});
+
+	function pick(preset: StartPreset, hosts: LaunchTarget[]) {
+		const r = preset.resume;
+		const last = prefs.start.host;
+		host = r?.host ?? (hosts.some((t) => t.host === last) ? last : hosts[0]?.host) ?? '';
+		const here = hosts.find((t) => t.host === host)?.workspaces ?? [];
+		const want = r?.workspace ?? preset.ws ?? scope.current.ws[0] ?? '';
+		ws = r?.workspace ?? (here.some((w) => w.name === want) ? want : (here[0]?.name ?? ''));
+		const known = here.find((w) => w.name === ws)?.projects ?? [];
+		project = r
+			? (r.project ?? ROOT)
+			: preset.project === null
+				? ROOT
+				: preset.project && known.includes(preset.project)
+					? preset.project
+					: '';
+	}
+
+	/** Another host: keep the workspace and project where that host has them. */
+	function pickHost() {
+		const here = workspacesHere;
+		if (!here.some((w) => w.name === ws)) ws = here[0]?.name ?? '';
+		const known = here.find((w) => w.name === ws)?.projects ?? [];
+		if (project !== ROOT && !known.includes(project)) project = '';
+	}
 
 	$effect(() => {
 		if (starter.open) text = prefs.draft(draftKey);
@@ -85,23 +121,6 @@
 
 	$effect(() => {
 		if (starter.open) prefs.setDraft(draftKey, text);
-	});
-
-	// The workspace's projects, as `/projects` lists them.
-	$effect(() => {
-		const name = ws;
-		if (!starter.open || resume || !name || projectsOf[name]) return;
-		fetchProjects({ workspace: name })
-			.then((data) => {
-				const list = (data.workspaces.find((w) => w.name === name)?.projects ?? [])
-					.map((p) => p.project)
-					.filter((p): p is string => Boolean(p));
-				projectsOf = { ...projectsOf, [name]: list };
-			})
-			.catch((e) => {
-				if (e instanceof Unauthorized) live.needToken = true;
-				else error = (e as Error).message;
-			});
 	});
 
 	// The launch moves on through the stream; polled too, for a missed update.
@@ -119,16 +138,17 @@
 	});
 
 	$effect(() => {
-		if (!launch) return;
-		if (launch.state === 'started') {
-			const session = launch.session;
+		// NOTE: `launch` derives from `pending`: read it before clearing that
+		const current = launch;
+		if (!current) return;
+		if (current.state === 'started') {
 			pending = null;
 			text = '';
 			starter.open = false;
-			goto(`/sessions/${session}`);
-		} else if (launch.state === 'failed') {
+			goto(`/sessions/${current.session}`);
+		} else if (current.state === 'failed') {
 			pending = null;
-			error = launch.error;
+			error = current.error;
 		}
 	});
 
@@ -153,7 +173,8 @@
 			});
 			prefs.setStart({ host, model, mode });
 			field?.remember(body);
-			live.launches.set(launch.id, launch);
+			// NOTE: the stream may have moved the launch on before this answer came
+			if (!live.launches.has(launch.id)) live.launches.set(launch.id, launch);
 			pending = launch.id;
 		} catch (e) {
 			if (e instanceof Unauthorized) live.needToken = true;
@@ -184,7 +205,9 @@
 			</Sheet.Description>
 		</Sheet.Header>
 
-		{#if !connected.length}
+		{#if !targets}
+			<p class="text-sm text-muted-foreground">Loading…</p>
+		{:else if !connected.length}
 			<p class="text-sm text-muted-foreground">
 				No host is connected: sessions start on a workstation whose ccdash collector is up.
 			</p>
@@ -193,20 +216,22 @@
 				<div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
 					<label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
 						Host
-						<select class={selectClass} bind:value={host}>
+						<select class={selectClass} bind:value={host} onchange={pickHost}>
 							{#each connected as h (h)}<option value={h}>{h}</option>{/each}
 						</select>
 					</label>
 					<label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
 						Workspace
 						<select class={selectClass} bind:value={ws} onchange={() => (project = '')}>
-							{#each live.workspaces as w (w)}<option value={w}>{w}</option>{/each}
+							{#each workspacesHere as w (w.name)}<option value={w.name}>{w.name}</option>{/each}
 						</select>
 					</label>
 					<label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
 						Project
 						<select class={selectClass} bind:value={project}>
-							<option value="" disabled>{names ? 'Pick a project' : 'Loading…'}</option>
+							<option value="" disabled
+								>{names?.length ? 'Pick a project' : 'No project here'}</option
+							>
 							{#each names ?? [] as p (p)}<option value={p}>{p}</option>{/each}
 							<option value={ROOT}>(the workspace itself)</option>
 						</select>
