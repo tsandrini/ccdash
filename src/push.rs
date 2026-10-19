@@ -39,9 +39,11 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
     created_at INTEGER NOT NULL,
     last_success_at INTEGER,
     last_failure_at INTEGER,
-    last_failure TEXT
+    last_failure TEXT,
+    token_id INTEGER
 );
 ";
+// NOTE: `token_id` is added to older databases by `store::ADDED_COLUMNS`
 
 /// One record of the default size: 4096 bytes less the tag and the
 /// delimiter; push services take about that much per message.
@@ -282,10 +284,13 @@ pub struct Subscription {
     pub last_success_at: Option<i64>,
     pub last_failure_at: Option<i64>,
     pub last_failure: Option<String>,
+    /// The device token that registered it; revoking the token drops it.
+    /// Null for devices on the bootstrap token.
+    pub token_id: Option<i64>,
 }
 
 const COLUMNS: &str = "id, endpoint, p256dh, auth, user_agent, created_at, \
-    last_success_at, last_failure_at, last_failure";
+    last_success_at, last_failure_at, last_failure, token_id";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Subscription> {
     Ok(Subscription {
@@ -298,6 +303,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Subscription> {
         last_success_at: r.get(6)?,
         last_failure_at: r.get(7)?,
         last_failure: r.get(8)?,
+        token_id: r.get(9)?,
     })
 }
 
@@ -309,24 +315,28 @@ pub fn subscriptions(conn: &Connection) -> Result<Vec<Subscription>> {
     Ok(rows)
 }
 
-/// Adds the subscription, or refreshes the keys of a known endpoint.
+/// Adds the subscription, or refreshes the keys (and the device token) of
+/// a known endpoint.
 pub fn subscribe(
     conn: &Connection,
     sub: &Subscribe,
     user_agent: Option<&str>,
+    token_id: Option<i64>,
     now: i64,
 ) -> Result<Subscription> {
     conn.execute(
-        "INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_agent, created_at, token_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT (endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
-                user_agent = excluded.user_agent, last_failure_at = NULL, last_failure = NULL",
+                user_agent = excluded.user_agent, token_id = excluded.token_id,
+                last_failure_at = NULL, last_failure = NULL",
         params![
             sub.endpoint,
             sub.keys.p256dh,
             sub.keys.auth,
             user_agent,
-            now
+            now,
+            token_id
         ],
     )?;
     conn.query_row(
@@ -740,7 +750,7 @@ mod tests {
         store
             .exec({
                 let sub = sub.clone();
-                move |conn| subscribe(conn, &sub, Some("Chrome"), 1).map(drop)
+                move |conn| subscribe(conn, &sub, Some("Chrome"), None, 1).map(drop)
             })
             .await
             .unwrap()
@@ -824,12 +834,20 @@ mod tests {
         };
         assert!(bad.validate().is_err());
 
-        let stored = subscribe(&conn, &sub, Some("Chrome"), 1_000).unwrap();
-        assert_eq!((stored.id, stored.created_at), (1, 1_000));
-        let again = subscribe(&conn, &sub, Some("Chrome 2"), 2_000).unwrap();
+        let stored = subscribe(&conn, &sub, Some("Chrome"), Some(7), 1_000).unwrap();
         assert_eq!(
-            (again.id, again.created_at, again.user_agent.as_deref()),
-            (1, 1_000, Some("Chrome 2"))
+            (stored.id, stored.created_at, stored.token_id),
+            (1, 1_000, Some(7))
+        );
+        let again = subscribe(&conn, &sub, Some("Chrome 2"), None, 2_000).unwrap();
+        assert_eq!(
+            (
+                again.id,
+                again.created_at,
+                again.user_agent.as_deref(),
+                again.token_id
+            ),
+            (1, 1_000, Some("Chrome 2"), None)
         );
         settle(
             &conn,
@@ -851,7 +869,7 @@ mod tests {
         settle(&conn, 1, &Outcome::Dropped { status: 410 }, 5_000).unwrap();
         assert!(subscriptions(&conn).unwrap().is_empty());
         assert!(!unsubscribe(&conn, &sub.endpoint).unwrap());
-        subscribe(&conn, &sub, None, 6_000).unwrap();
+        subscribe(&conn, &sub, None, None, 6_000).unwrap();
         assert!(unsubscribe(&conn, &sub.endpoint).unwrap());
 
         assert_eq!(topic("ask-1").len(), 32);

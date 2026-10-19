@@ -21,6 +21,9 @@ export const token = () => (browser ? (localStorage.getItem(TOKEN_KEY) ?? '') : 
 
 export const setToken = (value: string) => localStorage.setItem(TOKEN_KEY, value);
 
+/** After this device's token was revoked: the shell asks for a new one. */
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
 /** A bare token, or the token from a pasted `ccdash url` link. */
 export function tokenFrom(text: string): string {
 	const match = text.match(/token=([^&\s#]+)/);
@@ -60,8 +63,14 @@ export const postJson = async <T>(path: string, body: unknown): Promise<T> =>
 export const putJson = async <T>(path: string, body: unknown): Promise<T> =>
 	(await api(path, withBody('PUT', body))).json();
 
+export const patchJson = async <T>(path: string, body: unknown): Promise<T> =>
+	(await api(path, withBody('PATCH', body))).json();
+
 export const deleteJson = async <T>(path: string, body: unknown): Promise<T> =>
 	(await api(path, withBody('DELETE', body))).json();
+
+export const del = async <T>(path: string): Promise<T> =>
+	(await api(path, { method: 'DELETE' })).json();
 
 /** `a=1&b=2` from defined values only. */
 export function query(params: Record<string, string | number | undefined | null>): string {

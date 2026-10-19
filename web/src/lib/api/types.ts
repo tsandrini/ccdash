@@ -284,6 +284,8 @@ output?: string, } | { "kind": "permission", at: number, tool: string, summary: 
 
 export type Kind = "interactive" | "background";
 
+export type Label = { label: string, };
+
 export type Lane = { id: string, label: string, host: string, cwd: string, live: boolean, 
 /**
  * Started by Claude or `claude --bg`; its finished time is not a wait on you.
@@ -721,7 +723,12 @@ export type Subscribe = { endpoint: string, keys: SubscribeKeys, };
 
 export type SubscribeKeys = { p256dh: string, auth: string, };
 
-export type Subscription = { id: number, endpoint: string, user_agent: string | null, created_at: number, last_success_at: number | null, last_failure_at: number | null, last_failure: string | null, };
+export type Subscription = { id: number, endpoint: string, user_agent: string | null, created_at: number, last_success_at: number | null, last_failure_at: number | null, last_failure: string | null, 
+/**
+ * The device token that registered it; revoking the token drops it.
+ * Null for devices on the bootstrap token.
+ */
+token_id: number | null, };
 
 /**
  * An entry of Claude's task list (TaskCreate/TaskUpdate or TodoWrite).
@@ -751,6 +758,20 @@ sources: Array<SourceUse>, errors_by_status: Array<[string, number]>, edits: Arr
  * How tool calls were let through or refused.
  */
 decisions: Array<DecisionUse>, };
+
+/**
+ * A device's token as the panel sees it: never the secret.
+ */
+export type Token = { id: number, label: string, user_agent: string | null, created_at: number, last_seen_at: number | null, 
+/**
+ * Set while the pairing link waits to be opened; past it the token
+ * is dead.
+ */
+expires_at: number | null, 
+/**
+ * The token of the request that listed it.
+ */
+current: boolean, };
 
 export type ToolCount = { name: string, calls: number, failed: number, };
 

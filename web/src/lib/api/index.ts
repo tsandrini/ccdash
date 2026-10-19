@@ -1,6 +1,6 @@
 // Typed fetchers over the hub's routes (`src/hub/http.rs`).
 
-import { deleteJson, getJson, postJson, putJson, query } from './client';
+import { del, deleteJson, getJson, patchJson, postJson, putJson, query } from './client';
 import type {
 	Analytics,
 	Answer,
@@ -19,6 +19,7 @@ import type {
 	Session,
 	Stats,
 	Subscription,
+	Token,
 	Written
 } from './types';
 
@@ -58,8 +59,20 @@ export const answerAsk = (id: string, ask: string, answer: Answer) =>
 export const fetchPrompts = (params: { session?: string; workspace?: string; limit?: number }) =>
 	getJson<{ prompts: Prompt[] }>(`prompts${query(params)}`);
 
-export type Pair = { url: string; svg: string; lan: boolean };
-export const fetchPair = () => getJson<Pair>('pair');
+/** The devices with a token; `bootstrap` when this one is on the configured token. */
+export type Devices = { tokens: Token[]; bootstrap: boolean };
+export const fetchTokens = () => getJson<Devices>('tokens');
+
+/** A fresh device token: the link to open (shown this once) and its QR code. */
+export type Pairing = { token: Token; url: string; svg: string };
+export const mintToken = (label: string) => postJson<Pairing>('tokens', { label });
+
+export const relabelToken = (id: number, label: string) =>
+	patchJson<{ token: Token }>(`tokens/${id}`, { label });
+
+/** Revokes the token and drops the device's push subscriptions. */
+export const revokeToken = (id: number) =>
+	del<{ revoked: boolean; subscriptions: number }>(`tokens/${id}`);
 
 export const fetchHistory = (params: {
 	since?: number;

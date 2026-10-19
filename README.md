@@ -64,7 +64,7 @@ proxy that passes WebSockets through) in front of it:
 
   services.ccdash-hub = {
     enable = true;
-    tokenFile = "/run/agenix/ccdash-ui-token";            # web UI bearer token
+    tokenFile = "/run/agenix/ccdash-ui-token";            # the bootstrap token
     collectors = {
       desk = "/run/agenix/ccdash-collector-desk";          # one token per machine
       laptop = "/run/agenix/ccdash-collector-laptop";
@@ -118,7 +118,7 @@ ccdash url                # the hub's web address
 And on the hub:
 
 ```sh
-ccdash url --hub --config /etc/ccdash/hub.toml --qr   # pairing link with the token
+ccdash url --hub --config /etc/ccdash/hub.toml --qr   # pairing link for one device
 ccdash import db old.db --config /etc/ccdash/hub.toml # history of a pre-hub daemon
 ccdash backup --config /etc/ccdash/hub.toml copy.db   # what the nightly timer runs
 ```
@@ -186,12 +186,20 @@ cards name their machine and History and every analytics section carry a
 By host table. The scope, the range and the analytics section live in the
 URL, so links are shareable and the back button works.
 
-To connect a phone, scan `ccdash url --hub --qr` on the hub (or open
-"Connect a phone" in the web UI on a paired browser). The address carries
-the access token; each browser keeps it, so it is a one-time step per
-device. The token comes from `tokenFile`; rotate it and restart the hub to
-lock every device out. The DMS plugin opens the hub's address without a
-token, so pair the desktop browser once.
+To connect a phone, scan `ccdash url --hub --qr` on the hub (it reads the
+hub's database, so run it as root or the `ccdash` user) or open "Connect a
+phone" in the web UI on a paired browser. Every link carries a token minted
+for that one device: random, kept hashed by the hub, good for an hour until
+the link is opened, then for as long as the device keeps it. Settings ›
+Devices lists them with their browser and last use; rename one in place,
+or revoke it to sign the device out at its next request and end its push
+notifications (revoking the device you are on asks first). The token in
+`tokenFile` is the bootstrap one: the hub accepts it alongside the devices'
+own, which is how a browser paired before this and the panel on the hub
+keep working. A device on it sees "shared token" in Settings and can take
+a token of its own there. Rotating `tokenFile` (and restarting the hub)
+signs out only the devices still on it, nothing else. The DMS plugin opens
+the hub's address without a token, so pair the desktop browser once.
 
 The Tokens section, and the approval sources under Permissions, come from
 Claude Code's OpenTelemetry export. `claudeCode.telemetry.enable = true` sets
@@ -317,9 +325,10 @@ Sessions started before this (or without the wrapper) show how to restart
 them. Team and Enterprise accounts also need an admin to enable channels for
 the organization.
 
-Anyone holding the token can answer your sessions' prompts and, with the
+Anyone holding a token can answer your sessions' prompts and, with the
 channel, prompt them, so treat it like an SSH key: keep the port on your LAN
-or VPN, and delete the token file if a device goes missing.
+or VPN, and revoke the device in Settings if it goes missing (rotate
+`tokenFile` if it was on the bootstrap token).
 
 Claude Code reads hooks when a session starts, so sessions that were already
 running when ccdash was installed only show busy/idle until you restart
@@ -331,10 +340,12 @@ time of each session's process tree (Claude, its MCP servers and running
 commands) and its memory as PSS, so shared pages are not counted twice.
 Turn it off with `procs.enable = false`.
 
-The HTTP API needs the bearer token for everything (it can read sessions,
-rename them, answer their prompts and, with the channel, prompt them),
-except the notification buttons' one-time links and `/collect`, which
-takes a collector's token. Keep the hub behind your firewall or VPN.
+The HTTP API needs a bearer token for everything (it can read sessions,
+rename them, answer their prompts and, with the channel, prompt them): the
+bootstrap one from `tokenFile`, compared in constant time, or a device's
+own, looked up by its SHA-256. Only the notification buttons' one-time
+links and `/collect`, which takes a collector's token, differ. Keep the hub
+behind your firewall or VPN.
 
 ## Knowledge: memories, issues, progress, documents
 
@@ -432,6 +443,8 @@ Every row carries the host it came from. The database keeps 30 days
 - `sessions`: id, directory, title, kind, start and end
 - `notes`, `links`, `notes_fts`: the knowledge layer (not pruned)
 - `limit_samples`: per-model weekly limits from each `/usage` poll
+- `ui_tokens`, `push_subscriptions`: the devices' tokens (SHA-256, label,
+  browser, last use) and their push subscriptions (not pruned)
 - `telemetry` (with telemetry on): API requests (model, tokens, cost,
   latency), API errors, tool approval decisions, commits, pull requests,
   edit decisions and active time

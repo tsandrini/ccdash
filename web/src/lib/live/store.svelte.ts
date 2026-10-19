@@ -74,6 +74,13 @@ class Live {
 		this.conn = { kind, text };
 	}
 
+	/** After this device's token was revoked: the stream ends, the shell asks for a token. */
+	signOut() {
+		this.needToken = true;
+		this.setConn('offline', 'token needed');
+		this.#abort?.abort();
+	}
+
 	reconnectIfStale() {
 		if (this.#abort && Date.now() - this.#last > STALE_STREAM_MS) this.#abort.abort();
 	}
@@ -102,7 +109,7 @@ class Live {
 					}
 				}
 			} catch (e) {
-				if (e instanceof Unauthorized) {
+				if (e instanceof Unauthorized || this.needToken) {
 					this.needToken = true;
 					this.setConn('offline', 'token needed');
 					return;

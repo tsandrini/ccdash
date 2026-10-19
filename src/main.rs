@@ -26,6 +26,7 @@ mod protocol;
 mod push;
 mod state;
 mod store;
+mod tokens;
 mod usage;
 mod util;
 mod waits;
@@ -102,16 +103,21 @@ enum Command {
     /// MCP server for Claude Code's `--channels`: relays replies from
     /// ccdash into the session.
     Channel,
-    /// Print the web UI address; with a hub config, the access token too.
+    /// Print the web UI address; with a hub config, a pairing link for one
+    /// new device (good for an hour, revoked in Settings › Devices).
     Url {
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Read the hub configuration (default: this machine's collector one).
+        /// Read the hub configuration and mint a device token through its
+        /// store (default: this machine's collector config, no token).
         #[arg(long)]
         hub: bool,
         /// Also print a QR code to scan with the phone.
         #[arg(long)]
         qr: bool,
+        /// How Settings › Devices names the new device (with --hub).
+        #[arg(long, default_value = tokens::DEFAULT_LABEL)]
+        label: String,
     },
     /// Load data into the hub's database.
     Import {
@@ -181,7 +187,12 @@ fn main() -> ExitCode {
         Command::Rename { id, title } => client::rename(&id, &title.join(" ")),
         Command::Reply { id, text } => client::reply(&id, &text.join(" ")),
         Command::Channel => channel::run(),
-        Command::Url { config, hub, qr } => print_url(config, hub, qr),
+        Command::Url {
+            config,
+            hub,
+            qr,
+            label,
+        } => print_url(config, hub, qr, &label),
         Command::Import {
             what: Import::Db { config, source },
         } => import_db(config, &source),
@@ -223,13 +234,19 @@ fn logging() {
         .init();
 }
 
-/// The hub's web address: with the token from the hub config (`--hub`),
-/// or just the address a collector reports to.
-fn print_url(config: Option<PathBuf>, hub: bool, qr: bool) -> Result<()> {
+/// The hub's web address: with a fresh device token minted in the hub's
+/// store (`--hub`, on the hub), or just the address a collector reports
+/// to.
+fn print_url(config: Option<PathBuf>, hub: bool, qr: bool, label: &str) -> Result<()> {
     let url = if hub {
         let cfg: HubConfig = config::load(config)?;
-        let token = hub::http::load_token(&cfg)?;
-        util::web_url(&cfg.public_url(), &token)
+        let label = tokens::label(label).context("the label is empty")?;
+        let conn = store::open_writer(&cfg.store_path())?;
+        let (_, secret) = tokens::mint(&conn, &label, util::now_ms())?;
+        eprintln!(
+            "A pairing link for one device, good for an hour; revoke it in Settings › Devices."
+        );
+        util::web_url(&cfg.public_url(), &secret)
     } else {
         let cfg: CollectorConfig = config::load(config)?;
         let base = cfg

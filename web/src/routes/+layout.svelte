@@ -6,6 +6,7 @@
 	// pairing and old notifications are honoured.
 	import './layout.css';
 	import { onMount } from 'svelte';
+	import { browser } from '$app/env';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import MenuIcon from '@lucide/svelte/icons/menu';
@@ -35,22 +36,38 @@
 
 	const title = $derived(areas.find((a) => a.match(page.url.pathname))?.label ?? 'ccdash');
 
-	/** Links from pairing (`#token=`), notifications (`#session=`) and `#pair`. */
-	function takeHash() {
-		const hash = location.hash;
-		if (!hash) return;
-		const token = hash.match(/token=([^&]+)/);
-		const session = hash.match(/session=([^&]+)/);
+	/** What a link's hash asks: pairing (`#token=`), a notification's
+	 * session (`#session=`), `#pair`. */
+	function parseHash(hash: string) {
+		const token = hash.match(/token=([^&]+)/)?.[1];
+		const session = hash.match(/session=([^&]+)/)?.[1];
 		const pair = /(^#|&)pair(&|$)/.test(hash);
-		if (!token && !session && !pair) return;
+		if (!token && !session && !pair) return null;
+		return {
+			token: token && decodeURIComponent(token),
+			session: session && decodeURIComponent(session),
+			pair
+		};
+	}
+
+	/** Honours the link's hash and drops it from the address. */
+	function takeHash() {
+		const link = parseHash(location.hash);
+		if (!link) return;
 		history.replaceState(null, '', location.pathname + location.search);
-		if (token) {
-			setToken(decodeURIComponent(token[1]));
+		if (link.token) {
+			setToken(link.token);
 			live.run();
 			pwa.syncSubscription();
 		}
-		if (session) goto(`/sessions/${decodeURIComponent(session[1])}`);
-		else if (pair) goto('/settings');
+		if (link.session) goto(`/sessions/${link.session}`);
+		else if (link.pair) goto('/settings');
+	}
+
+	// NOTE: before the pages mount: their first fetch must carry a pairing link's token
+	if (browser) {
+		const token = parseHash(location.hash)?.token;
+		if (token) setToken(token);
 	}
 
 	onMount(() => {

@@ -22,6 +22,7 @@ use crate::{
     model::{Kind, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
+    tokens,
     util::{now_ms, truncate},
 };
 
@@ -102,6 +103,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("samples", "lines_added", "INTEGER"),
     ("samples", "lines_removed", "INTEGER"),
     ("claims", "issue", "TEXT"),
+    ("push_subscriptions", "token_id", "INTEGER"),
 ];
 
 const UPSERT_SESSION: &str = "
@@ -197,6 +199,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(knowledge::SCHEMA)?;
     conn.execute_batch(push::SCHEMA)?;
+    conn.execute_batch(tokens::SCHEMA)?;
     conn.execute_batch(messages::SCHEMA)?;
     conn.execute_batch(claims::SCHEMA)?;
     migrate(&conn)?;
@@ -344,6 +347,7 @@ fn prune(conn: &Connection, cutoff: i64) -> Result<()> {
     conn.execute("DELETE FROM limit_samples WHERE ts < ?1", [cutoff])?;
     messages::prune(conn, cutoff)?;
     claims::prune(conn, now_ms())?;
+    tokens::prune(conn, now_ms())?;
     conn.execute(
         "DELETE FROM sessions WHERE started_at < ?1
             AND (ended_at < ?1 OR (ended_at IS NULL AND id NOT IN (SELECT session FROM events)))",

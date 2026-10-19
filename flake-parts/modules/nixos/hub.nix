@@ -60,8 +60,11 @@ in
       type = types.str;
       example = "/run/agenix/ccdash-ui-token";
       description = ''
-        File holding the bearer token of the web UI and API, readable by
-        the `ccdash` user.
+        File holding the bootstrap bearer token of the web UI and API,
+        readable by the `ccdash` user. Devices paired through a link get
+        tokens of their own (Settings › Devices); the hub accepts this one
+        alongside them, so changing it signs out only the devices still on
+        it.
       '';
     };
 

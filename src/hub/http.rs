@@ -1,7 +1,9 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
 //! replying to them and answering their prompts, and the knowledge layer
-//! (`/notes`, `/projects`: list, search, read, write, verify).
-//! Every `/api` route needs `Authorization: Bearer <token>`. `/act/{key}/…`
+//! (`/notes`, `/projects`: list, search, read, write, verify), and the
+//! devices' tokens (`/tokens`). Every `/api` route needs
+//! `Authorization: Bearer <token>`: the bootstrap token from the
+//! configuration or a device's own (see `crate::tokens`). `/act/{key}/…`
 //! takes the one-time key of a notification button instead, `/collect`
 //! a collector's token (see `super::collect`).
 
@@ -17,7 +19,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -25,11 +27,11 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::broadcast};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::warn;
 use ts_rs::TS;
@@ -54,6 +56,7 @@ use crate::{
     paths,
     push::{self, Push},
     store::Store,
+    tokens,
     util::{self, now_ms},
     workspace::{Scope, Workspaces},
 };
@@ -68,13 +71,39 @@ pub struct App {
     hub: Hub,
     store: Store,
     workspaces: Arc<Workspaces>,
-    token: Arc<String>,
     /// Where phones open the UI.
     public_url: Arc<String>,
     /// Web Push, when it is on.
     push: Option<Arc<Push>>,
     /// The panel's files (see `web`).
     pub web_dir: Arc<PathBuf>,
+    /// Ids of tokens revoked since the start; open streams on them end.
+    revoked: broadcast::Sender<i64>,
+}
+
+/// What `auth` checks a bearer against.
+#[derive(Clone)]
+pub(crate) struct Guard {
+    /// The configured token (`http.token_file`): accepted as is.
+    bootstrap: Arc<String>,
+    /// The devices' tokens, hashed.
+    store: Store,
+}
+
+/// Who a request came from; on every `/api` request as an extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Auth {
+    Bootstrap,
+    Device(i64),
+}
+
+impl Auth {
+    fn device(self) -> Option<i64> {
+        match self {
+            Self::Device(id) => Some(id),
+            Self::Bootstrap => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -97,7 +126,6 @@ pub async fn serve(
         .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
         .route("/prompts", get(prompts))
-        .route("/pair", get(pair))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/stream", get(stream))
@@ -112,7 +140,15 @@ pub async fn serve(
             post(push_subscribe).delete(push_unsubscribe),
         )
         .route("/push/test", post(push_test))
-        .layer(middleware::from_fn_with_state(token.clone(), auth));
+        .route("/tokens", get(devices).post(mint))
+        .route("/tokens/{id}", patch(relabel).delete(revoke))
+        .layer(middleware::from_fn_with_state(
+            Guard {
+                bootstrap: token,
+                store: store.clone(),
+            },
+            auth,
+        ));
     let app = Router::new()
         .route("/act/{key}/{action}", post(button))
         .route(
@@ -125,10 +161,10 @@ pub async fn serve(
             hub,
             store,
             workspaces: Arc::new(workspaces),
-            token,
             public_url: Arc::new(public_url),
             push,
             web_dir: Arc::new(web_dir),
+            revoked: broadcast::channel(16).0,
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -168,17 +204,67 @@ pub fn load_token(cfg: &HubConfig) -> Result<String> {
     Ok(token)
 }
 
-async fn auth(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
+/// The bootstrap token in constant time, else a device's by its hash.
+async fn auth(State(guard): State<Guard>, mut request: Request, next: Next) -> Response {
     let given = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if given.is_some_and(|given| util::constant_time_eq(given.as_bytes(), token.as_bytes())) {
-        next.run(request).await
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let Some(given) = given else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let who = if util::constant_time_eq(given.as_bytes(), guard.bootstrap.as_bytes()) {
+        Auth::Bootstrap
     } else {
-        StatusCode::UNAUTHORIZED.into_response()
+        match guard.device(&given, user_agent(request.headers())).await {
+            Ok(Some(id)) => Auth::Device(id),
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(e) => {
+                warn!("auth: {e:#}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+    request.extensions_mut().insert(who);
+    next.run(request).await
+}
+
+impl Guard {
+    /// The device behind `secret`, if it is a live token; its first use
+    /// claims it and its seen stamp moves at most once a minute, written
+    /// before the request runs so what it reads is current.
+    async fn device(&self, secret: &str, user_agent: Option<String>) -> Result<Option<i64>> {
+        let store = self.store.clone();
+        let secret = secret.to_owned();
+        let now = now_ms();
+        let found =
+            tokio::task::spawn_blocking(move || tokens::lookup(&store.reader()?, &secret, now))
+                .await??;
+        let Some(token) = found else {
+            return Ok(None);
+        };
+        let stale = token.expires_at.is_some()
+            || token.user_agent != user_agent
+            || token
+                .last_seen_at
+                .is_none_or(|seen| now - seen >= tokens::SEEN_EVERY_MS);
+        if stale {
+            let id = token.id;
+            self.store
+                .exec(move |conn| tokens::touch(conn, id, user_agent.as_deref(), now))
+                .await??;
+        }
+        Ok(Some(token.id))
     }
+}
+
+fn user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| util::truncate(ua, 200))
 }
 
 async fn snapshot(State(app): State<App>) -> Result<Json<Snapshot>, ApiError> {
@@ -372,11 +458,86 @@ async fn button(
     Ok("done")
 }
 
-/// The address a phone opens, token included, and its QR code.
-async fn pair(State(app): State<App>) -> Result<Json<Value>, ApiError> {
-    let url = util::web_url(&app.public_url, &app.token);
+// --- devices ----------------------------------------------------------------
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct Label {
+    label: String,
+}
+
+impl Label {
+    fn clean(&self) -> Result<String, ApiError> {
+        tokens::label(&self.label).ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the label is empty".into(),
+        ))
+    }
+}
+
+/// The devices with a token, the caller's flagged `current`; `bootstrap`
+/// when the caller is on the configured token instead.
+async fn devices(
+    State(app): State<App>,
+    Extension(who): Extension<Auth>,
+) -> Result<Json<Value>, ApiError> {
+    let store = app.store.clone();
+    let now = now_ms();
+    let mut list = tokio::task::spawn_blocking(move || tokens::list(&store.reader()?, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    for token in &mut list {
+        token.current = who == Auth::Device(token.id);
+    }
+    Ok(Json(json!({
+        "tokens": list,
+        "bootstrap": who == Auth::Bootstrap,
+    })))
+}
+
+/// Mints a token for a new device: the address to open (the token in its
+/// fragment, shown this once) and its QR code. Unopened, it dies in an
+/// hour.
+async fn mint(State(app): State<App>, Json(body): Json<Label>) -> Result<Json<Value>, ApiError> {
+    let label = body.clean()?;
+    let now = now_ms();
+    let (token, secret) = app
+        .store
+        .exec(move |conn| tokens::mint(conn, &label, now))
+        .await??;
+    let url = util::web_url(&app.public_url, &secret);
     let svg = util::qr_svg(&url)?;
-    Ok(Json(json!({ "url": url, "svg": svg, "lan": true })))
+    Ok(Json(json!({ "token": token, "url": url, "svg": svg })))
+}
+
+async fn relabel(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Json(body): Json<Label>,
+) -> Result<Json<Value>, ApiError> {
+    let label = body.clean()?;
+    let now = now_ms();
+    let token = app
+        .store
+        .exec(move |conn| tokens::relabel(conn, id, &label, now))
+        .await??
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "no such device".into()))?;
+    Ok(Json(json!({ "token": token })))
+}
+
+/// Revokes a device's token and drops its push subscriptions; a stream it
+/// holds open ends.
+async fn revoke(State(app): State<App>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
+    let now = now_ms();
+    let subscriptions = app
+        .store
+        .exec(move |conn| tokens::revoke(conn, id, now))
+        .await??
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "no such device".into()))?;
+    let _ = app.revoked.send(id);
+    Ok(Json(
+        json!({ "revoked": true, "subscriptions": subscriptions }),
+    ))
 }
 
 /// Time range and workspace of a history or analytics request.
@@ -464,7 +625,10 @@ async fn analytics(
     Ok(Json(analytics))
 }
 
-async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn stream(
+    State(app): State<App>,
+    Extension(who): Extension<Auth>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let updates = BroadcastStream::new(app.hub.subscribe());
     let first = app
         .hub
@@ -477,7 +641,22 @@ async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
         Err(_) => Some(Event::default().event("lagged").data("")),
     });
     let events = tokio_stream::iter(first).chain(updates).map(Ok);
-    Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
+    let mut revoked = app.revoked.subscribe();
+    let signed_out = async move {
+        if let Auth::Device(id) = who {
+            while let Ok(revoked) = revoked.recv().await.or_else(|e| match e {
+                broadcast::error::RecvError::Lagged(_) => Ok(-1),
+                broadcast::error::RecvError::Closed => Err(()),
+            }) {
+                if revoked == id {
+                    return;
+                }
+            }
+        }
+        std::future::pending().await
+    };
+    Sse::new(futures_util::StreamExt::take_until(events, signed_out))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
 }
 
 // --- knowledge --------------------------------------------------------------
@@ -805,23 +984,22 @@ async fn push_info(State(app): State<App>) -> Result<Json<Value>, ApiError> {
     })))
 }
 
-/// Stores the browser's `PushSubscription` (idempotent per endpoint).
+/// Stores the browser's `PushSubscription` (idempotent per endpoint),
+/// tied to the device's token so revoking the token drops it.
 async fn push_subscribe(
     State(app): State<App>,
+    Extension(who): Extension<Auth>,
     headers: HeaderMap,
     Json(body): Json<push::Subscribe>,
 ) -> Result<Json<Value>, ApiError> {
     app.push()?;
     body.validate()
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")))?;
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|ua| util::truncate(ua, 200));
+    let user_agent = user_agent(&headers);
     let now = now_ms();
     let subscription = app
         .store
-        .exec(move |conn| push::subscribe(conn, &body, user_agent.as_deref(), now))
+        .exec(move |conn| push::subscribe(conn, &body, user_agent.as_deref(), who.device(), now))
         .await??;
     Ok(Json(json!({ "subscription": subscription })))
 }
@@ -877,5 +1055,101 @@ impl IntoResponse for ApiError {
             warn!("api {}: {}", self.0, self.1);
         }
         (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `GET /who` on a router behind `auth`: the status and who it saw.
+    async fn who(addr: std::net::SocketAddr, bearer: Option<String>) -> (u16, String) {
+        tokio::task::spawn_blocking(move || {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut req = agent.get(format!("http://{addr}/who"));
+            if let Some(bearer) = bearer {
+                req = req.header("Authorization", &format!("Bearer {bearer}"));
+            }
+            let res = req.call().unwrap();
+            let status = res.status().as_u16();
+            (status, res.into_body().read_to_string().unwrap_or_default())
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bearers_are_the_bootstrap_token_or_a_live_device() {
+        let dir = std::env::temp_dir().join(format!("ccdash-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("t.db"), 30).unwrap();
+        let guard = Guard {
+            bootstrap: Arc::new("boot".into()),
+            store: store.clone(),
+        };
+        let app = Router::new()
+            .route(
+                "/who",
+                get(|Extension(who): Extension<Auth>| async move { format!("{who:?}") }),
+            )
+            .layer(middleware::from_fn_with_state(guard, auth));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (device, secret) = store
+            .exec(|conn| tokens::mint(conn, "Phone", now_ms()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(who(addr, None).await.0, 401);
+        assert_eq!(who(addr, Some("nope".into())).await.0, 401);
+        assert_eq!(
+            who(addr, Some("boot".into())).await,
+            (200, "Bootstrap".into())
+        );
+        assert_eq!(
+            who(addr, Some(secret.clone())).await,
+            (200, format!("Device({})", device.id))
+        );
+        // the first use claimed the pairing link
+        let mut claimed = None;
+        for _ in 0..100 {
+            let token = tokens::get(&store.reader().unwrap(), device.id)
+                .unwrap()
+                .unwrap();
+            if token.expires_at.is_none() {
+                claimed = Some(token);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let claimed = claimed.expect("claimed");
+        assert!(claimed.last_seen_at.is_some());
+        assert!(claimed.user_agent.is_some());
+
+        // revoked: out at the next request, the bootstrap token unaffected
+        let id = device.id;
+        store
+            .exec(move |conn| tokens::revoke(conn, id, now_ms()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(who(addr, Some(secret)).await.0, 401);
+        assert_eq!(who(addr, Some("boot".into())).await.0, 200);
+
+        // an unopened link dies after its hour
+        let (late, secret) = store
+            .exec(|conn| tokens::mint(conn, "Lost", now_ms() - tokens::PAIRING_MS - 1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(late.expires_at.is_some());
+        assert_eq!(who(addr, Some(secret)).await.0, 401);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

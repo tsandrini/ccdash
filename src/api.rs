@@ -33,10 +33,12 @@ mod tests {
         crate::push::Subscribe::export_all(&cfg).unwrap();
         crate::push::Subscription::export_all(&cfg).unwrap();
         crate::push::Outcome::export_all(&cfg).unwrap();
+        crate::tokens::Token::export_all(&cfg).unwrap();
         crate::hub::http::Rename::export_all(&cfg).unwrap();
         crate::hub::http::Reply::export_all(&cfg).unwrap();
         crate::hub::http::PutNote::export_all(&cfg).unwrap();
         crate::hub::http::Unsubscribe::export_all(&cfg).unwrap();
+        crate::hub::http::Label::export_all(&cfg).unwrap();
     }
 
     #[test]
