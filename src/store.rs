@@ -411,12 +411,14 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             })
         }))
     };
-    let title = conn
-        .query_row("SELECT title FROM sessions WHERE id = ?1", [session], |r| {
-            r.get::<_, Option<String>>(0)
-        })
+    let (title, started_at) = conn
+        .query_row(
+            "SELECT title, started_at FROM sessions WHERE id = ?1",
+            [session],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
         .optional()?
-        .flatten();
+        .unwrap_or((None, None));
     let hooked = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND kind != 'activity')",
         [session],
@@ -438,6 +440,7 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         prompt: last_text("prompt")?,
         reply: last_text("reply")?,
         title,
+        started_at,
         hooked,
         turn: last_turn(&conn, session)?,
         tasks,

@@ -152,6 +152,8 @@ pub struct Restored {
     pub prompt: Option<Stamped>,
     pub reply: Option<Stamped>,
     pub title: Option<String>,
+    /// When the session first appeared, so a hub restart keeps its start.
+    pub started_at: Option<i64>,
     pub hooked: bool,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,
@@ -289,6 +291,9 @@ impl State {
             s.prompt = s.prompt.take().or(saved.prompt);
             s.reply = s.reply.take().or(saved.reply);
             s.title = s.title.take().or(saved.title);
+            if let Some(t) = saved.started_at {
+                s.started_at = s.started_at.min(t);
+            }
             s.hooked |= saved.hooked;
             s.turn = s.turn.take().or(saved.turn);
             if s.tasks.is_empty() {

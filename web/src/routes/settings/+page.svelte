@@ -8,7 +8,7 @@
 	import { Textarea } from '#lib/components/ui/textarea/index.js';
 	import { fmtDuration } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
-	import { DEFAULT_QUICK, prefs, type Theme } from '#lib/prefs.svelte.js';
+	import { DEFAULT_QUICK, prefs, SCHEMES, type Theme } from '#lib/prefs.svelte.js';
 	import { pwa } from '#lib/pwa.svelte.js';
 
 	let pair = $state<Pair | null>(null);
@@ -192,6 +192,22 @@
 				>
 			{/each}
 		</div>
+	</section>
+	<section class="flex flex-col gap-2">
+		<h2 class="text-base font-semibold">Colours</h2>
+		<div class="flex gap-2">
+			{#each SCHEMES as s (s.id)}
+				<Button
+					variant={prefs.scheme === s.id ? 'default' : 'outline'}
+					size="sm"
+					onclick={() => prefs.setScheme(s.id)}>{s.label}</Button
+				>
+			{/each}
+		</div>
+		<p class="text-xs text-muted-foreground">
+			Neutral is shadcn's palette as it was; ccdash is the warm one from the logo, with its blue as
+			the accent and a lighter dark, a first draft to iterate on.
+		</p>
 	</section>
 
 	<section class="flex flex-col gap-2">

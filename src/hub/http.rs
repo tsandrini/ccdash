@@ -873,6 +873,9 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.0.is_server_error() {
+            warn!("api {}: {}", self.0, self.1);
+        }
         (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }

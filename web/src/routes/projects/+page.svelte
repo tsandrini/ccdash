@@ -1,10 +1,11 @@
 <script lang="ts">
 	// The Projects overview: per workspace in scope, the flagged notes and
-	// a card per project; a search box over every note.
+	// a card per project; a search box over every note with kind, sort
+	// and retired-notes toggles.
 	import { untrack } from 'svelte';
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import PlusIcon from '@lucide/svelte/icons/plus';
-	import type { Hit } from '#lib/api/types.js';
+	import type { Hit, NoteKind } from '#lib/api/types.js';
 	import { Unauthorized } from '#lib/api/client.js';
 	import { fetchNotes } from '#lib/api/index.js';
 	import NoteRow from '#lib/components/notes/NoteRow.svelte';
@@ -14,12 +15,22 @@
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { plural } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
-	import { newNoteHref, projectHref } from '#lib/notes.js';
+	import { KIND_LABEL, KINDS, newNoteHref, projectHref } from '#lib/notes.js';
 	import { notePanel } from '#lib/notepanel.svelte.js';
 	import { projects } from '#lib/projects.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
 
+	type Sort = 'relevance' | 'updated' | 'recalls';
+	const SORTS: { id: Sort; label: string }[] = [
+		{ id: 'relevance', label: 'Best match' },
+		{ id: 'updated', label: 'Newest' },
+		{ id: 'recalls', label: 'Most recalled' }
+	];
+
 	let query = $state('');
+	let kind = $state<NoteKind | ''>('');
+	let sort = $state<Sort>('relevance');
+	let retired = $state(true);
 	let hits = $state<Hit[] | null>(null);
 	let searching = $state(false);
 	let timer: ReturnType<typeof setTimeout> | null = null;
@@ -34,24 +45,25 @@
 	$effect(() => {
 		const q = query.trim();
 		const { workspace } = scope.params();
+		const [k, r] = [kind, retired];
 		if (timer) clearTimeout(timer);
-		if (!q) {
+		if (!q && !k) {
 			hits = null;
 			return;
 		}
-		timer = setTimeout(() => untrack(() => search(q, workspace)), 250);
+		timer = setTimeout(() => untrack(() => search(q, workspace, k, r)), 250);
 	});
 
-	async function search(q: string, workspace?: string) {
+	async function search(q: string, workspace: string | undefined, k: NoteKind | '', r: boolean) {
 		searching = true;
 		const m = q.match(/^kind:(\w+)\s*/);
 		try {
 			hits = (
 				await fetchNotes({
-					q: m ? q.slice(m[0].length) : q,
-					kind: m?.[1],
+					q: (m ? q.slice(m[0].length) : q) || undefined,
+					kind: m?.[1] ?? (k || undefined),
 					workspace,
-					status: 'active,stale,archived,superseded',
+					status: r ? 'active,stale,archived,superseded' : 'active,stale',
 					limit: 60
 				})
 			).hits;
@@ -64,26 +76,65 @@
 	}
 
 	const workspaces = $derived((projects.data?.workspaces ?? []).filter((w) => w.total > 0));
+	/** The hits in the picked order (the hub's is by match). */
+	const shown = $derived(
+		hits
+			? sort === 'relevance'
+				? hits
+				: [...hits].sort((a, b) =>
+						sort === 'updated' ? b.updated_at - a.updated_at : b.recalls - a.recalls
+					)
+			: null
+	);
 </script>
 
 <div class="mx-auto flex max-w-6xl flex-col gap-5 p-3 sm:p-4">
-	<div class="flex items-center gap-2">
+	<div class="flex flex-col gap-2">
 		<Input
 			type="search"
 			bind:value={query}
-			placeholder="Search notes… (kind:issue narrows)"
+			placeholder="Search notes…"
 			aria-label="Search notes"
 			class="max-w-md"
 		/>
+		<div class="flex flex-wrap items-center gap-1.5 text-xs">
+			<Button
+				variant={kind === '' ? 'secondary' : 'ghost'}
+				size="xs"
+				aria-pressed={kind === ''}
+				onclick={() => (kind = '')}>All kinds</Button
+			>
+			{#each KINDS as k (k)}
+				<Button
+					variant={kind === k ? 'secondary' : 'ghost'}
+					size="xs"
+					aria-pressed={kind === k}
+					onclick={() => (kind = kind === k ? '' : k)}>{KIND_LABEL[k]}</Button
+				>
+			{/each}
+			<span class="mx-1 h-4 border-l" aria-hidden="true"></span>
+			{#each SORTS as s (s.id)}
+				<Button
+					variant={sort === s.id ? 'secondary' : 'ghost'}
+					size="xs"
+					aria-pressed={sort === s.id}
+					onclick={() => (sort = s.id)}>{s.label}</Button
+				>
+			{/each}
+			<span class="mx-1 h-4 border-l" aria-hidden="true"></span>
+			<label class="inline-flex items-center gap-1.5 text-muted-foreground">
+				<input type="checkbox" bind:checked={retired} class="accent-primary" /> retired too
+			</label>
+		</div>
 	</div>
-	{#if hits}
+	{#if shown}
 		<section class="flex flex-col gap-2">
 			<h2 class="text-base font-semibold">
-				{searching ? 'Searching…' : `Results (${hits.length})`}
+				{searching ? 'Searching…' : `Results (${shown.length})`}
 			</h2>
-			{#if hits.length}
+			{#if shown.length}
 				<ul class="divide-y rounded-lg border bg-card">
-					{#each hits as hit (hit.workspace + hit.slug)}
+					{#each shown as hit (hit.workspace + hit.slug)}
 						<li>
 							<NoteRow
 								card={hit}

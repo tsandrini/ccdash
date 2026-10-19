@@ -9,6 +9,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import MenuIcon from '@lucide/svelte/icons/menu';
+	import PanelLeftIcon from '@lucide/svelte/icons/panel-left';
 	import SearchIcon from '@lucide/svelte/icons/search';
 	import * as Sheet from '#lib/components/ui/sheet/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
@@ -69,7 +70,9 @@
 <TooltipProvider delayDuration={300}>
 	<div class="flex h-full">
 		<aside
-			class="hidden w-52 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex"
+			class="hidden w-52 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground {prefs.sidebar
+				? 'md:flex'
+				: ''}"
 		>
 			<a href="/" class="flex items-center gap-2 px-4 py-3 font-semibold">
 				<img src="/icon.svg" alt="" width="20" height="20" />
@@ -100,7 +103,18 @@
 						<Nav onnavigate={() => (drawer = false)} />
 					</Sheet.Content>
 				</Sheet.Root>
-				<h1 class="truncate text-sm font-semibold md:hidden">{title}</h1>
+				<Button
+					variant="ghost"
+					size="icon"
+					class="hidden md:inline-flex"
+					aria-label={prefs.sidebar ? 'Hide the sidebar' : 'Show the sidebar'}
+					aria-pressed={!prefs.sidebar}
+					title="Sidebar"
+					onclick={() => prefs.setSidebar(!prefs.sidebar)}
+				>
+					<PanelLeftIcon />
+				</Button>
+				<h1 class="truncate text-sm font-semibold {prefs.sidebar ? 'md:hidden' : ''}">{title}</h1>
 				<div class="hidden items-center gap-1.5 sm:flex">
 					<ScopeChips />
 					<RangePicker />

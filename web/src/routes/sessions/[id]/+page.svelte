@@ -138,6 +138,11 @@
 							><Meter pct={s.context_pct} label="context" /> {Math.round(s.context_pct)}%</span
 						>
 					{/if}
+					{#if known(s.lines_added) || known(s.lines_removed)}
+						<span class="text-xs text-muted-foreground tabular-nums" title="Lines added and removed"
+							>+{s.lines_added ?? 0} −{s.lines_removed ?? 0}</span
+						>
+					{/if}
 					{#if s.cost_usd}<span class="text-xs text-muted-foreground">{fmtUsd(s.cost_usd)}</span
 						>{/if}
 					{#if s.remote_url}

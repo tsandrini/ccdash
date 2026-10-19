@@ -115,6 +115,65 @@
 	--seq-6: #b7d3f6;
 }
 
+/* ccdash's own scheme (Settings › Colours): the logo's warm neutrals, its
+blue as the accent, a lighter dark than shadcn's. The chart and state
+colours stay the validated ones. */
+:root[data-scheme='ccdash'] {
+	--background: #f6f6f2;
+	--foreground: #1b1b19;
+	--card: #fcfcfa;
+	--card-foreground: #1b1b19;
+	--popover: #fcfcfa;
+	--popover-foreground: #1b1b19;
+	--primary: #2a78d6;
+	--primary-foreground: #ffffff;
+	--secondary: #ecebe6;
+	--secondary-foreground: #1b1b19;
+	--muted: #ecebe6;
+	--muted-foreground: #6b6a64;
+	--accent: #e4edf9;
+	--accent-foreground: #1b1b19;
+	--border: #e1e0d9;
+	--input: #dcdbd3;
+	--ring: #2a78d6;
+	--sidebar: #efeeea;
+	--sidebar-foreground: #1b1b19;
+	--sidebar-primary: #2a78d6;
+	--sidebar-primary-foreground: #ffffff;
+	--sidebar-accent: #e2e1db;
+	--sidebar-accent-foreground: #1b1b19;
+	--sidebar-border: #dcdbd3;
+	--sidebar-ring: #2a78d6;
+}
+
+.dark[data-scheme='ccdash'] {
+	--background: #1c1c1a;
+	--foreground: #ecebe6;
+	--card: #262624;
+	--card-foreground: #ecebe6;
+	--popover: #262624;
+	--popover-foreground: #ecebe6;
+	--primary: #3987e5;
+	--primary-foreground: #ffffff;
+	--secondary: #32322f;
+	--secondary-foreground: #ecebe6;
+	--muted: #32322f;
+	--muted-foreground: #a3a29b;
+	--accent: #2c3b50;
+	--accent-foreground: #ecebe6;
+	--border: rgb(255 255 255 / 0.12);
+	--input: rgb(255 255 255 / 0.16);
+	--ring: #3987e5;
+	--sidebar: #1a1a19;
+	--sidebar-foreground: #ecebe6;
+	--sidebar-primary: #3987e5;
+	--sidebar-primary-foreground: #ffffff;
+	--sidebar-accent: #2b2b29;
+	--sidebar-accent-foreground: #ecebe6;
+	--sidebar-border: rgb(255 255 255 / 0.1);
+	--sidebar-ring: #3987e5;
+}
+
 @theme inline {
 	--radius-sm: calc(var(--radius) - 4px);
 	--radius-md: calc(var(--radius) - 2px);
@@ -255,6 +314,22 @@
 	box-shadow:
 		inset 1px 0 0 var(--working),
 		inset -1px 0 0 var(--working);
+}
+
+/* The project pages' optional grid (Settings-free: the button on the page). */
+.board-grid {
+	background-image:
+		linear-gradient(
+			to right,
+			color-mix(in oklab, var(--border) 50%, transparent) 1px,
+			transparent 1px
+		),
+		linear-gradient(
+			to bottom,
+			color-mix(in oklab, var(--border) 50%, transparent) 1px,
+			transparent 1px
+		);
+	background-size: 24px 24px;
 }
 
 /* Folded text with a fade, unfolded by a button. */
