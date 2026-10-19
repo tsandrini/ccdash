@@ -101,6 +101,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("samples", "model", "TEXT"),
     ("samples", "lines_added", "INTEGER"),
     ("samples", "lines_removed", "INTEGER"),
+    ("claims", "issue", "TEXT"),
 ];
 
 const UPSERT_SESSION: &str = "

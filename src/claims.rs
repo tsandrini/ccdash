@@ -6,15 +6,17 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::Claim;
+use crate::{knowledge::valid_slug, model::Claim};
 
+// NOTE: `issue` is added to older databases by `store::ADDED_COLUMNS`
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS claims (
     session TEXT PRIMARY KEY,
     what TEXT NOT NULL,
     paths TEXT NOT NULL,
     since INTEGER NOT NULL,
-    until INTEGER
+    until INTEGER,
+    issue TEXT
 );
 ";
 
@@ -27,11 +29,13 @@ const MINUTE_MS: i64 = 60_000;
 
 /// A claim made at `now` by a session running in `cwd`: `paths` resolve
 /// against `cwd` and must stay under `root` (the project, else the
-/// workspace); `until_min` is minutes from now.
+/// workspace); `until_min` is minutes from now; `issue` names the issue
+/// the work is on (a slug; whether it exists is not checked here).
 pub fn new(
     what: &str,
     paths: &[String],
     until_min: Option<i64>,
+    issue: Option<&str>,
     cwd: &str,
     root: &str,
     now: i64,
@@ -63,9 +67,15 @@ pub fn new(
         Some(min) => Some(now + min.min(MAX_UNTIL_MIN) * MINUTE_MS),
         None => None,
     };
+    let issue = match issue.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(i) if valid_slug(i) => Some(i.to_owned()),
+        Some(i) => return Err(format!("{i:?} is not an issue slug")),
+        None => None,
+    };
     Ok(Claim {
         what,
         paths: absolute,
+        issue,
         since: now,
         until,
     })
@@ -120,12 +130,15 @@ pub fn relative<'a>(path: &'a str, base: &str) -> &'a str {
         .unwrap_or(path)
 }
 
-/// `"what" (a, b; lapses in 42 min)`, paths relative to `base`.
+/// `"what" (a, b; on issue x; lapses in 42 min)`, paths relative to `base`.
 pub fn describe(claim: &Claim, base: &str, now: i64) -> String {
     let mut details: Vec<String> = Vec::new();
     if !claim.paths.is_empty() {
         let paths: Vec<&str> = claim.paths.iter().map(|p| relative(p, base)).collect();
         details.push(paths.join(", "));
+    }
+    if let Some(issue) = &claim.issue {
+        details.push(format!("on issue {issue}"));
     }
     if let Some(until) = claim.until {
         let left = (until - now).max(0) / MINUTE_MS;
@@ -143,15 +156,18 @@ pub fn save(conn: &Connection, session: &str, claim: Option<&Claim>) -> Result<(
     match claim {
         Some(c) => {
             conn.execute(
-                "INSERT INTO claims (session, what, paths, since, until) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO claims (session, what, paths, since, until, issue)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                     ON CONFLICT (session) DO UPDATE SET what = excluded.what,
-                    paths = excluded.paths, since = excluded.since, until = excluded.until",
+                    paths = excluded.paths, since = excluded.since, until = excluded.until,
+                    issue = excluded.issue",
                 params![
                     session,
                     c.what,
                     serde_json::to_string(&c.paths)?,
                     c.since,
-                    c.until
+                    c.until,
+                    c.issue
                 ],
             )?;
         }
@@ -166,7 +182,7 @@ pub fn save(conn: &Connection, session: &str, claim: Option<&Claim>) -> Result<(
 pub fn load(conn: &Connection, session: &str, now: i64) -> Result<Option<Claim>> {
     let claim = conn
         .query_row(
-            "SELECT what, paths, since, until FROM claims WHERE session = ?1",
+            "SELECT what, paths, since, until, issue FROM claims WHERE session = ?1",
             [session],
             |r| {
                 Ok(Claim {
@@ -174,6 +190,7 @@ pub fn load(conn: &Connection, session: &str, now: i64) -> Result<Option<Claim>>
                     paths: serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(),
                     since: r.get(2)?,
                     until: r.get(3)?,
+                    issue: r.get(4)?,
                 })
             },
         )
@@ -206,6 +223,7 @@ mod tests {
                 "/ws/repo/web".into(),
             ],
             Some(30),
+            Some(" repo--reply-path "),
             "/ws/repo",
             root,
             1_000,
@@ -225,20 +243,33 @@ mod tests {
         assert!(covers(&claim, "/ws/repo/src/protocol.rs"));
         assert!(!covers(&claim, "/ws/repo/src/hubs/x.rs"));
         assert!(!covers(&claim, "/ws/repo/src/protocol.rs.bak"));
+        assert_eq!(claim.issue.as_deref(), Some("repo--reply-path"));
         assert_eq!(
             describe(&claim, root, 1_000 + 5 * MINUTE_MS),
-            "\"the hub's reply path\" (src/hub, src/protocol.rs, web; lapses in 25 min)"
+            "\"the hub's reply path\" (src/hub, src/protocol.rs, web; on issue repo--reply-path; \
+                lapses in 25 min)"
         );
 
-        assert!(new("x", &["../other".into()], None, "/ws/repo", root, 0).is_err());
-        assert!(new("x", &["/ws/other".into()], None, "/ws/repo", root, 0).is_err());
-        assert!(new("", &[], None, "/ws/repo", root, 0).is_err());
-        assert!(new("x", &[], Some(0), "/ws/repo", root, 0).is_err());
-        let bare = new("just thinking", &[], None, "/ws/repo/sub", root, 0).unwrap();
+        assert!(new("x", &["../other".into()], None, None, "/ws/repo", root, 0).is_err());
+        assert!(new("x", &["/ws/other".into()], None, None, "/ws/repo", root, 0).is_err());
+        assert!(new("", &[], None, None, "/ws/repo", root, 0).is_err());
+        assert!(new("x", &[], Some(0), None, "/ws/repo", root, 0).is_err());
+        assert!(new("x", &[], None, Some("Not A Slug"), "/ws/repo", root, 0).is_err());
+        let bare = new(
+            "just thinking",
+            &[],
+            None,
+            Some(" "),
+            "/ws/repo/sub",
+            root,
+            0,
+        )
+        .unwrap();
+        assert_eq!(bare.issue, None);
         assert_eq!(describe(&bare, root, 0), "\"just thinking\"");
         assert_eq!(relative("/ws/repo/web", ""), "/ws/repo/web");
         assert_eq!(relative("/ws/repo", "/ws/repo/"), "/ws/repo");
-        let capped = new("x", &[], Some(10_000), "/ws/repo", root, 0).unwrap();
+        let capped = new("x", &[], Some(10_000), None, "/ws/repo", root, 0).unwrap();
         assert_eq!(capped.until, Some(MAX_UNTIL_MIN * MINUTE_MS));
     }
 
@@ -250,6 +281,7 @@ mod tests {
         let claim = Claim {
             what: "x".into(),
             paths: vec!["/a".into()],
+            issue: Some("i".into()),
             since: 1,
             until: Some(100),
         };

@@ -105,6 +105,15 @@ answers: number, answer_p50_ms: number | null, prompts: number, cost_usd: number
  */
 turns: number, turn_claude_ms: number, turn_tools_ms: number, turn_permission_ms: number, compactions: number, compactions_auto: number, tokens_input: number, tokens_output: number, tokens_cache_read: number, tokens_cache_write: number, api_requests: number, api_errors: number, commits: number, pull_requests: number, active_user_secs: number, active_cli_secs: number, };
 
+/**
+ * A note in a list: everything but the body, plus its first lines.
+ */
+export type Card = { workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
+/**
+ * The issue a progress entry is on.
+ */
+issue: string | null, excerpt: string, };
+
 export type Choice = { label: string, description: string, };
 
 /**
@@ -114,7 +123,11 @@ export type Claim = { what: string,
 /**
  * Absolute files or directories the claim covers.
  */
-paths: Array<string>, since: number, 
+paths: Array<string>, 
+/**
+ * The issue (slug) the work is on, so the board shows it in progress.
+ */
+issue: string | null, since: number, 
 /**
  * When it lapses by itself; None until released or the session ends.
  */
@@ -143,6 +156,12 @@ export type Conversation = { exchanges: Array<Exchange>,
 more: boolean, };
 
 export type DecisionUse = { source: string, decision: string, count: number, };
+
+export type Doc = { hot: boolean, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
+/**
+ * The issue a progress entry is on.
+ */
+issue: string | null, excerpt: string, };
 
 export type EditUse = { language: string, accepted: number, rejected: number, };
 
@@ -182,6 +201,16 @@ at_reset_avg: number | null, at_reset_recent: number | null,
  */
 full_at: number | null, };
 
+/**
+ * `GET /graph`: the workspace's notes and the links between them
+ * (backlinks are the same edges seen from the other end).
+ */
+export type Graph = { nodes: Array<GraphNode>, edges: Array<GraphEdge>, };
+
+export type GraphEdge = { src: number, dst: number, kind: LinkKind, };
+
+export type GraphNode = { id: number, slug: string, kind: NoteKind, title: string, project: string | null, status: Status, created_at: number, updated_at: number, recalls: number, };
+
 export type Histogram = { counts: [number, number, number, number, number, number], median_ms: number | null, };
 
 export type History = { since: number, until: number, now: number, bucket_ms: number, lanes: Array<Lane>, usage: Array<UsagePoint>, cost_usd: number, prompts: number, 
@@ -201,7 +230,11 @@ export type Hit = {
 /**
  * Matching passage with `[`…`]` around the terms (FTS) or the excerpt.
  */
-snippet: string, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, excerpt: string, };
+snippet: string, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
+/**
+ * The issue a progress entry is on.
+ */
+issue: string | null, excerpt: string, };
 
 /**
  * A machine whose collector reports to the hub.
@@ -227,6 +260,17 @@ answers: number, answer_p50_ms: number | null, sessions: number, working_ms: num
  * Waits on you; parked time is apart.
  */
 your_turn_ms: number, parked_ms: number, prompts: number, cost_usd: number, lines_added: number, lines_removed: number, tools: number, tool_failures: number, compactions: number, tokens: number, cpu_secs: number, peak_mem_bytes: number, };
+
+export type Issue = { in_progress: boolean, 
+/**
+ * The live session working on it: by claim, else the one that last
+ * logged progress or commented today.
+ */
+working: Working | null, last_progress: Card | null, closed_at: number | null, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
+/**
+ * The issue a progress entry is on.
+ */
+issue: string | null, excerpt: string, };
 
 export type Item = { "kind": "tool", at: number, name: string, summary: string, ms: number | null, ok: boolean, 
 /**
@@ -427,11 +471,38 @@ export type ProcInfo = { pid: number, name: string,
  */
 cmd: string, cpu_pct: number, mem_bytes: number, started_at: number, };
 
+export type Project = { project: string | null, 
+/**
+ * Open issues, highest priority first.
+ */
+issues: Array<Issue>, 
+/**
+ * Issues closed in the last 7 days, newest first.
+ */
+closed: Array<Issue>, 
+/**
+ * Hot documents first, then by update.
+ */
+docs: Array<Doc>, 
+/**
+ * Newest first.
+ */
+progress: Array<Card>, 
+/**
+ * Active memories first, then the flagged ones; by recalls within.
+ */
+memories: Array<Card>, };
+
 export type ProjectUse = { cwd: string, sessions: number, working_ms: number, permission_ms: number, 
 /**
  * Waits on you; parked time is apart.
  */
 your_turn_ms: number, parked_ms: number, prompts: number, cost_usd: number, lines_added: number, lines_removed: number, tools: number, tool_failures: number, compactions: number, tokens: number, cpu_secs: number, peak_mem_bytes: number, };
+
+/**
+ * `GET /projects`.
+ */
+export type Projects = { workspaces: Array<WorkspaceProjects>, };
 
 /**
  * A prompt as typed, for the composer's history.
@@ -541,6 +612,10 @@ parent: string | null, pid: number | null, cwd: string,
  * Configured workspace holding `cwd`.
  */
 workspace: string | null, 
+/**
+ * The project inside the workspace: the repo directory `cwd` is in.
+ */
+project: string | null, 
 /**
  * Name from `claude agents`.
  */
@@ -752,6 +827,27 @@ export type WaitingTally = { waits: number, ms: number, };
 export type Window = { start: number, end: number, peak: number, };
 
 export type WindowRef = { id: number, title: string, };
+
+export type Working = { session: string, host: string, label: string, 
+/**
+ * The session's claim names the issue (else it is inferred from
+ * what it wrote).
+ */
+claimed: boolean, };
+
+export type WorkspaceProjects = { name: string, 
+/**
+ * By project name; the workspace-wide notes come first (`project` None).
+ */
+projects: Array<Project>, 
+/**
+ * Notes the lifecycle pass flagged stale, any project.
+ */
+flagged: Array<Card>, 
+/**
+ * Live notes in the workspace.
+ */
+total: number, };
 
 /**
  * What a write did.

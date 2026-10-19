@@ -368,7 +368,10 @@ impl State {
             && cwd != s.cwd
         {
             s.cwd = cwd.to_owned();
-            s.workspace = self.workspaces.of(cwd);
+            (s.workspace, s.project) = match self.workspaces.locate(cwd) {
+                Some((ws, project)) => (Some(ws), project),
+                None => (None, None),
+            };
         }
         if let Some(mode) = str_of(p, "permission_mode") {
             s.permission_mode = Some(mode.to_owned());
@@ -1239,6 +1242,9 @@ impl State {
             pid: None,
             cwd: cwd.unwrap_or_default().to_owned(),
             workspace: cwd.and_then(|cwd| self.workspaces.of(cwd)),
+            project: cwd
+                .and_then(|cwd| self.workspaces.locate(cwd))
+                .and_then(|(_, p)| p),
             name: None,
             title: None,
             activity: Activity::Idle,

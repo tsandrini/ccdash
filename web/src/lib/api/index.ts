@@ -1,17 +1,24 @@
 // Typed fetchers over the hub's routes (`src/hub/http.rs`).
 
-import { deleteJson, getJson, postJson, query } from './client';
+import { deleteJson, getJson, postJson, putJson, query } from './client';
 import type {
 	Answer,
 	Conversation,
+	Graph,
 	History,
 	Hit,
 	Message,
+	Note,
+	NoteOp,
+	NoteView,
+	Projects,
 	Prompt,
 	PushOutcome,
+	PutNote,
 	Session,
 	Stats,
-	Subscription
+	Subscription,
+	Written
 } from './types';
 
 export type { Unauthorized } from './client';
@@ -68,6 +75,28 @@ export const fetchNotes = (params: {
 	status?: string;
 	limit?: number;
 }) => getJson<{ hits: Hit[] }>(`notes${query(params)}`);
+
+export const fetchProjects = (params: { workspace?: string }) =>
+	getJson<Projects>(`projects${query(params)}`);
+
+/** One workspace's notes and links; `status` as for notes. */
+export const fetchGraph = (workspace: string, status?: string) =>
+	getJson<Graph>(`graph${query({ workspace, status })}`);
+
+const notePath = (ws: string, slug: string) =>
+	`notes/${encodeURIComponent(ws)}/${encodeURIComponent(slug)}`;
+
+/** The note with its links and backlinks, plus the body rendered. */
+export type NotePage = NoteView & { html: string };
+export const fetchNote = (ws: string, slug: string) => getJson<NotePage>(notePath(ws, slug));
+
+/** Creates or replaces a note; 409 when `base_version` is behind. */
+export const putNote = (ws: string, slug: string, body: PutNote) =>
+	putJson<{ note: Note }>(notePath(ws, slug), body);
+
+/** A tool operation (verify, issue_update, …) on the note. */
+export const noteOp = (ws: string, slug: string, op: NoteOp) =>
+	postJson<{ written: Written }>(`${notePath(ws, slug)}/op`, op);
 
 export type PushInfo = { enabled: boolean; key: string | null; subscriptions: Subscription[] };
 export const fetchPush = () => getJson<PushInfo>('push');

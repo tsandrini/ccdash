@@ -7,6 +7,16 @@ const TOKEN_KEY = 'ccdash.token';
 
 export class Unauthorized extends Error {}
 
+/** A rejected request, with the hub's status (409 for a version conflict). */
+export class ApiError extends Error {
+	constructor(
+		message: string,
+		public status: number
+	) {
+		super(message);
+	}
+}
+
 export const token = () => (browser ? (localStorage.getItem(TOKEN_KEY) ?? '') : '');
 
 export const setToken = (value: string) => localStorage.setItem(TOKEN_KEY, value);
@@ -31,7 +41,7 @@ export async function api(path: string, init: RequestInit = {}): Promise<Respons
 		} catch {
 			// not JSON
 		}
-		throw new Error(message || `${res.status} ${res.statusText}`);
+		throw new ApiError(message || `${res.status} ${res.statusText}`, res.status);
 	}
 	return res;
 }

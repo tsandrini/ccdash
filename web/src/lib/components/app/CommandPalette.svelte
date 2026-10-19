@@ -7,6 +7,7 @@
 	import { areas } from '#lib/nav.js';
 	import { palette } from '#lib/palette.svelte.js';
 	import { ACTIVITY, label, shown } from '#lib/session.js';
+	import { KIND_LABEL, noteHref } from '#lib/notes.js';
 	import { Unauthorized } from '#lib/api/client.js';
 
 	let hits = $state<Hit[]>([]);
@@ -42,10 +43,7 @@
 		const onNote = palette.onNote;
 		palette.close();
 		if (onNote) onNote(hit);
-		else
-			location.assign(
-				`/v1/#note=${encodeURIComponent(hit.workspace)}/${encodeURIComponent(hit.slug)}`
-			);
+		else goto(noteHref(hit.workspace, hit.slug));
 	}
 
 	function go(href: string, legacy = false) {
@@ -98,7 +96,9 @@
 				{#each hits as hit (hit.workspace + hit.slug)}
 					<Command.Item value="note {hit.title} {hit.slug}" onSelect={() => pickNote(hit)}>
 						<span class="truncate">{hit.title}</span>
-						<span class="ml-auto text-xs text-muted-foreground">{hit.kind} · {hit.workspace}</span>
+						<span class="ml-auto text-xs text-muted-foreground"
+							>{KIND_LABEL[hit.kind]} · {hit.workspace}</span
+						>
 					</Command.Item>
 				{/each}
 			</Command.Group>

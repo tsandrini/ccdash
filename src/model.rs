@@ -242,6 +242,9 @@ pub struct Session {
     pub cwd: String,
     /// Configured workspace holding `cwd`.
     pub workspace: Option<String>,
+    /// The project inside the workspace: the repo directory `cwd` is in.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Name from `claude agents`.
     pub name: Option<String>,
     /// Conversation title from the statusline (also the window title).
@@ -290,6 +293,55 @@ pub struct Session {
     pub last_event_at: i64,
 }
 
+impl Session {
+    /// An idle interactive session with nothing reported yet, for tests.
+    #[cfg(test)]
+    pub fn stub(host: &str, id: &str, cwd: &str) -> Self {
+        Self {
+            host: host.into(),
+            id: id.into(),
+            short_id: None,
+            kind: Kind::Interactive,
+            parent: None,
+            pid: None,
+            cwd: cwd.into(),
+            workspace: None,
+            project: None,
+            name: None,
+            title: None,
+            activity: Activity::Idle,
+            activity_since: 0,
+            waiting_for: None,
+            tool: None,
+            prompt: None,
+            reply: None,
+            message: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            context_pct: None,
+            cost_usd: None,
+            lines_added: None,
+            lines_removed: None,
+            remote_url: None,
+            window: None,
+            hooked: true,
+            renaming: false,
+            channel: false,
+            asks: Vec::new(),
+            outbox: Vec::new(),
+            inbox: Vec::new(),
+            claim: None,
+            resources: None,
+            turn: None,
+            tasks: Vec::new(),
+            subagents: Vec::new(),
+            started_at: 0,
+            last_event_at: 0,
+        }
+    }
+}
+
 /// A message from one session, or from the owner in the panel, to a
 /// session: handed to the recipient as context at its next prompt, never
 /// as a turn of its own.
@@ -321,6 +373,9 @@ pub struct Claim {
     pub what: String,
     /// Absolute files or directories the claim covers.
     pub paths: Vec<String>,
+    /// The issue (slug) the work is on, so the board shows it in progress.
+    #[serde(default)]
+    pub issue: Option<String>,
     pub since: i64,
     /// When it lapses by itself; None until released or the session ends.
     pub until: Option<i64>,

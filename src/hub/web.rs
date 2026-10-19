@@ -1,7 +1,8 @@
 //! The panel's files, served from a directory (`http.web_dir`): the built
 //! app at `/`, with `index.html` for every path that names no file (the
-//! app routes on the client), and the previous panel under `/v1/` until
-//! it is retired. Inline scripts of a page are hashed into its CSP.
+//! app routes on the client; only the hashed assets under `_app/` 404),
+//! and the previous panel under `/v1/` until it is retired. Inline
+//! scripts of a page are hashed into its CSP.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -36,9 +37,9 @@ fn file(root: &Path, path: &str) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut file = root.join(&rel);
-    // NOTE: judged on the request path: the root directory's own name may
-    // carry a version with dots (a Nix store path)
-    if rel.extension().is_none() && !file.is_file() {
+    // NOTE: a note slug may contain dots (`/notes/ws/a.b`), so a missing
+    // file is a client route unless it is a built asset
+    if !file.is_file() && !rel.starts_with("_app") {
         file = root.join("index.html");
     }
     let Ok(bytes) = std::fs::read(&file) else {
@@ -203,12 +204,15 @@ mod tests {
         };
         assert_eq!(body("/").await.2, "<p>new</p>");
         assert_eq!(body("/sessions/abc").await.2, "<p>new</p>");
+        assert_eq!(body("/notes/ws/a.b.c").await.2, "<p>new</p>");
         assert_eq!(body("/_app/immutable/x.js").await.2, "1");
+        assert_eq!(body("/_app/immutable/y.js").await.0, StatusCode::NOT_FOUND);
         assert_eq!(
             body("/_app/immutable/x.js").await.1[header::CACHE_CONTROL],
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(body("/missing.js").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(body("/missing.js").await.2, "<p>new</p>");
+        assert_eq!(body("/v1/missing.js").await.2, "<p>old</p>");
         assert_eq!(body("/v1").await.2, "<p>old</p>");
         assert_eq!(body("/v1/").await.2, "<p>old</p>");
         assert_eq!(body("/v1/app.js").await.2, "2");

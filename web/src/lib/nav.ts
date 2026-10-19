@@ -43,11 +43,10 @@ export const areas: Area[] = [
 		badge: (sessions) => sessions.filter((s) => s.activity !== 'gone').length
 	},
 	{
-		href: '/v1/#view=projects',
+		href: '/projects',
 		label: 'Projects',
 		icon: FolderKanbanIcon,
-		legacy: true,
-		match: () => false
+		match: (path) => under('/projects')(path) || under('/notes')(path)
 	},
 	{
 		href: '/v1/#view=history',

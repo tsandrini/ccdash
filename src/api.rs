@@ -26,6 +26,8 @@ mod tests {
         crate::knowledge::NoteOp::export_all(&cfg).unwrap();
         crate::knowledge::Upsert::export_all(&cfg).unwrap();
         crate::knowledge::Query::export_all(&cfg).unwrap();
+        crate::knowledge::projects::Projects::export_all(&cfg).unwrap();
+        crate::knowledge::projects::Graph::export_all(&cfg).unwrap();
         crate::history::History::export_all(&cfg).unwrap();
         crate::analytics::Analytics::export_all(&cfg).unwrap();
         crate::push::Subscribe::export_all(&cfg).unwrap();

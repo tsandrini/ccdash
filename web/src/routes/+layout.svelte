@@ -16,6 +16,7 @@
 	import ConnState from '#lib/components/app/ConnState.svelte';
 	import LoginDialog from '#lib/components/app/LoginDialog.svelte';
 	import Nav from '#lib/components/app/Nav.svelte';
+	import NotePanel from '#lib/components/notes/NotePanel.svelte';
 	import ScopeChips from '#lib/components/app/ScopeChips.svelte';
 	import ThemeToggle from '#lib/components/app/ThemeToggle.svelte';
 	import { setToken } from '#lib/api/client.js';
@@ -127,3 +128,4 @@
 
 <LoginDialog />
 <CommandPalette />
+<NotePanel />

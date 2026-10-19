@@ -45,6 +45,12 @@
 	--good: #0ca30c;
 	--warning: #fab219;
 	--critical: #d03b3b;
+	/* note kinds: three categorical hues (all pairs distinct for colour-blind
+	readers); progress is the neutral fold and differs by shape too */
+	--kind-memory: #2a78d6;
+	--kind-issue: #eb6834;
+	--kind-doc: #1baf7a;
+	--kind-progress: #8a8984;
 }
 
 .dark {
@@ -83,6 +89,10 @@
 	--permission: #d95926;
 	--your-turn: #199e70;
 	--idle: #4a4a46;
+	--kind-memory: #3987e5;
+	--kind-issue: #d95926;
+	--kind-doc: #199e70;
+	--kind-progress: #8f8e88;
 }
 
 @theme inline {
@@ -129,6 +139,10 @@
 	--color-good: var(--good);
 	--color-warning: var(--warning);
 	--color-critical: var(--critical);
+	--color-kind-memory: var(--kind-memory);
+	--color-kind-issue: var(--kind-issue);
+	--color-kind-doc: var(--kind-doc);
+	--color-kind-progress: var(--kind-progress);
 	--font-mono: ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, monospace;
 }
 

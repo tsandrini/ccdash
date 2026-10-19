@@ -1,9 +1,14 @@
 <script lang="ts">
 	// Server-rendered markdown (src/markdown.rs, raw HTML escaped), folded
-	// when long with a button to unfold.
+	// when long with a button to unfold; `note:` links (`[[slug]]` in notes)
+	// go to `onnote` instead of a new tab.
 	import { Button } from '#lib/components/ui/button/index.js';
 
-	let { html, clamp = false }: { html: string; clamp?: boolean } = $props();
+	let {
+		html,
+		clamp = false,
+		onnote
+	}: { html: string; clamp?: boolean; onnote?: (slug: string) => void } = $props();
 
 	let el = $state<HTMLDivElement | null>(null);
 	// svelte-ignore state_referenced_locally
@@ -13,6 +18,14 @@
 	$effect(() => {
 		if (!el) return;
 		for (const a of el.querySelectorAll('a')) {
+			const note = a.getAttribute('href')?.match(/^note:(.+)$/);
+			if (note && onnote) {
+				a.onclick = (event) => {
+					event.preventDefault();
+					onnote(note[1]);
+				};
+				continue;
+			}
 			a.target = '_blank';
 			a.rel = 'noopener noreferrer';
 		}

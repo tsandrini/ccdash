@@ -342,6 +342,14 @@ impl Caller {
     }
 }
 
+/// A `claim` call's arguments, as the tool passed them.
+struct ClaimSpec<'a> {
+    what: &'a str,
+    paths: &'a [String],
+    until: Option<i64>,
+    issue: Option<&'a str>,
+}
+
 /// What the core adds to an injection from the live state.
 #[derive(Debug, Default)]
 struct Around {
@@ -843,10 +851,20 @@ impl Core {
                 self.tell_session(&c, &to, &text, id.is_none(), at, answer);
             }
             Call::Claim {
-                what, paths, until, ..
+                what,
+                paths,
+                until,
+                issue,
+                ..
             } => {
                 let c = caller.expect("located above");
-                answer(self.claim(&c, Some((&what, &paths, until)), id.is_none(), at));
+                let spec = ClaimSpec {
+                    what: &what,
+                    paths: &paths,
+                    until,
+                    issue: issue.as_deref(),
+                };
+                answer(self.claim(&c, Some(spec), id.is_none(), at));
             }
             Call::Release { .. } => {
                 let c = caller.expect("located above");
@@ -1184,7 +1202,7 @@ impl Core {
     fn claim(
         &mut self,
         c: &Caller,
-        spec: Option<(&str, &[String], Option<i64>)>,
+        spec: Option<ClaimSpec<'_>>,
         replayed: bool,
         at: i64,
     ) -> Result<Reply, String> {
@@ -1201,9 +1219,11 @@ impl Core {
             return Err("the hub does not see this session running".into());
         }
         let claim = match spec {
-            Some((what, paths, until)) => {
+            Some(spec) => {
                 let root = self.root_of(&c.cwd);
-                let claim = claims::new(what, paths, until, &c.cwd, &root, at)?;
+                let claim = claims::new(
+                    spec.what, spec.paths, spec.until, spec.issue, &c.cwd, &root, at,
+                )?;
                 if claim.until.is_some_and(|u| u <= now_ms()) {
                     return Err("that claim has already lapsed".into());
                 }

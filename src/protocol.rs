@@ -170,8 +170,8 @@ pub enum Call {
         to: String,
         text: String,
     },
-    /// What the caller is working on; paths are relative to its cwd and
-    /// `until` is minutes from now.
+    /// What the caller is working on; paths are relative to its cwd,
+    /// `until` is minutes from now and `issue` the slug of the issue.
     Claim {
         who: Who,
         what: String,
@@ -179,6 +179,8 @@ pub enum Call {
         paths: Vec<String>,
         #[serde(default)]
         until: Option<i64>,
+        #[serde(default)]
+        issue: Option<String>,
     },
     /// Drops the caller's claim.
     Release {
@@ -385,6 +387,7 @@ mod tests {
                 what: "w".into(),
                 paths: vec!["src".into()],
                 until: None,
+                issue: Some("i".into()),
             },
             at: 1,
         };
@@ -404,6 +407,7 @@ mod tests {
             Reply::Claimed(Some(Claim {
                 what: "w".into(),
                 paths: vec!["/a".into()],
+                issue: None,
                 since: 1,
                 until: Some(2),
             })),

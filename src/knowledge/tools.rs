@@ -176,7 +176,8 @@ pub fn definitions() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Files or directories the work touches, relative to the project (a directory covers everything under it); at most 20."
                     },
-                    "until": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "Minutes until the claim lapses by itself (default: until released or the session ends)." }
+                    "until": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "Minutes until the claim lapses by itself (default: until released or the session ends)." },
+                    "issue": slug("The open issue this work is on (as `recall` lists them); the Projects board shows it in progress with this session.")
                 }
             }
         }),
@@ -296,6 +297,7 @@ pub fn call(name: &str, args: &Value, who: Who) -> Result<Call> {
                 what: need("what")?,
                 paths,
                 until: args["until"].as_i64(),
+                issue: text("issue"),
             });
         }
         "release" => return Ok(Call::Release { who }),
@@ -539,14 +541,15 @@ mod tests {
         ));
         let claim = call(
             "claim",
-            &json!({"what": "the hub", "paths": [" src/hub ", "web/app.js"], "until": 30}),
+            &json!({"what": "the hub", "paths": [" src/hub ", "web/app.js"], "until": 30, "issue": "hub--x"}),
             who(),
         )
         .unwrap();
         assert!(is_write(&claim));
         assert!(matches!(
             claim,
-            Call::Claim { ref paths, until: Some(30), .. } if paths == &["src/hub", "web/app.js"]
+            Call::Claim { ref paths, until: Some(30), issue: Some(ref i), .. }
+                if paths == &["src/hub", "web/app.js"] && i == "hub--x"
         ));
         assert!(call("claim", &json!({"paths": ["x"]}), who()).is_err());
         assert!(call("claim", &json!({"what": "x", "paths": [1]}), who()).is_err());

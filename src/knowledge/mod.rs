@@ -4,6 +4,7 @@
 //! connection; the hub calls it on the writer thread, the panel on a
 //! reader. `tools` turns tool calls into operations and results into text.
 
+pub mod projects;
 pub mod tools;
 
 use std::{collections::BTreeMap, fmt, path::Path};
@@ -234,6 +235,7 @@ impl Note {
             verified_at: self.verified_at,
             recalls: self.recalls,
             priority: priority_of(&self.extra),
+            issue: self.extra["issue"].as_str().map(str::to_owned),
             excerpt: excerpt(&self.body),
         }
     }
@@ -260,6 +262,8 @@ pub struct Card {
     pub verified_at: Option<i64>,
     pub recalls: u32,
     pub priority: Priority,
+    /// The issue a progress entry is on.
+    pub issue: Option<String>,
     pub excerpt: String,
 }
 

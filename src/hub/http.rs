@@ -45,7 +45,10 @@ use crate::{
     config::HubConfig,
     conversation,
     history::{self, History},
-    knowledge::{self, Card, Filter, NoteKind, NoteOp, Status, Upsert},
+    knowledge::{
+        self, Filter, NoteKind, NoteOp, Status, Upsert,
+        projects::{self, Graph, Projects},
+    },
     messages,
     model::{Activity, Snapshot},
     paths,
@@ -98,7 +101,8 @@ pub async fn serve(
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/stream", get(stream))
-        .route("/projects", get(projects))
+        .route("/projects", get(projects_view))
+        .route("/graph", get(graph))
         .route("/notes", get(notes))
         .route("/notes/{workspace}/{slug}", get(note).put(put_note))
         .route("/notes/{workspace}/{slug}/op", post(note_op))
@@ -512,72 +516,70 @@ impl NotesQuery {
     }
 }
 
-/// What the Projects page shows: every workspace's live notes grouped by
-/// project, plus the notes the lifecycle pass flagged.
-async fn projects(
+/// What the Projects pages show: every workspace's live notes grouped by
+/// project, the issues with their derived state (from the live sessions'
+/// claims and the recent writes), plus the notes the lifecycle pass
+/// flagged.
+async fn projects_view(
     State(app): State<App>,
     Query(query): Query<NotesQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Projects>, ApiError> {
     let names = query.workspaces(&app.workspaces)?;
+    let sessions = app.hub.snapshot().await?.sessions;
     let store = app.store.clone();
-    let out = tokio::task::spawn_blocking(move || -> Result<Value> {
+    let now = now_ms();
+    let workspaces = tokio::task::spawn_blocking(move || -> Result<_> {
         let conn = store.reader()?;
-        let mut workspaces = Vec::new();
-        for ws in names {
-            let cards = knowledge::list(
-                &conn,
-                &ws,
-                &Filter {
-                    statuses: &[Status::Active, Status::Stale],
-                    ..Filter::default()
-                },
-            )?;
-            let closed = knowledge::list(
-                &conn,
-                &ws,
-                &Filter {
-                    kinds: &[NoteKind::Issue],
-                    statuses: &[Status::Archived],
-                    limit: 20,
-                    ..Filter::default()
-                },
-            )?;
-            let flagged: Vec<&Card> = cards.iter().filter(|c| c.status == Status::Stale).collect();
-            let mut by_project: std::collections::BTreeMap<Option<String>, Vec<&Card>> =
-                std::collections::BTreeMap::new();
-            for card in cards.iter().filter(|c| c.status == Status::Active) {
-                by_project.entry(card.project.clone()).or_default().push(card);
-            }
-            let projects: Vec<Value> = by_project
-                .into_iter()
-                .map(|(project, cards)| {
-                    let of = |kind: NoteKind| -> Vec<&Card> {
-                        cards.iter().copied().filter(|c| c.kind == kind).collect()
-                    };
-                    let mut issues = of(NoteKind::Issue);
-                    issues.sort_by(|a, b| b.priority.cmp(&a.priority).then(b.updated_at.cmp(&a.updated_at)));
-                    json!({
-                        "project": project,
-                        "docs": of(NoteKind::Doc),
-                        "issues": issues,
-                        "progress": of(NoteKind::Progress).into_iter().take(8).collect::<Vec<_>>(),
-                        "memories": of(NoteKind::Memory),
-                        "closed": closed.iter().filter(|c| c.project == project).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            workspaces.push(json!({
-                "name": ws,
-                "projects": projects,
-                "flagged": flagged,
-                "total": cards.len(),
-            }));
-        }
-        Ok(json!({ "workspaces": workspaces }))
+        names
+            .iter()
+            .map(|ws| projects::build(&conn, ws, &sessions, now))
+            .collect::<Result<Vec<_>>>()
     })
     .await
     .map_err(anyhow::Error::from)??;
-    Ok(Json(out))
+    Ok(Json(Projects { workspaces }))
+}
+
+#[derive(Deserialize)]
+struct GraphQuery {
+    workspace: String,
+    /// Comma-separated statuses; default active and stale.
+    status: Option<String>,
+}
+
+/// The notes of one workspace and the links between them.
+async fn graph(
+    State(app): State<App>,
+    Query(query): Query<GraphQuery>,
+) -> Result<Json<Graph>, ApiError> {
+    app.workspaces.dir(&query.workspace).ok_or(ApiError(
+        StatusCode::BAD_REQUEST,
+        format!("unknown workspace {:?}", query.workspace),
+    ))?;
+    let statuses = parse_statuses(query.status.as_deref())?;
+    let store = app.store.clone();
+    let graph = tokio::task::spawn_blocking(move || {
+        projects::graph(&store.reader()?, &query.workspace, &statuses)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(graph))
+}
+
+/// `active,stale`; the default without a list.
+fn parse_statuses(list: Option<&str>) -> Result<Vec<Status>, ApiError> {
+    match list.filter(|s| !s.is_empty()) {
+        None => Ok(vec![Status::Active, Status::Stale]),
+        Some(list) => list
+            .split(',')
+            .map(|s| {
+                Status::parse(s).ok_or(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown status {s:?}"),
+                ))
+            })
+            .collect(),
+    }
 }
 
 /// Search or list notes across the given workspaces.
@@ -593,18 +595,7 @@ async fn notes(
             format!("unknown kind {k:?}"),
         ))?],
     };
-    let statuses: Vec<Status> = match query.status.as_deref().filter(|s| !s.is_empty()) {
-        None => vec![Status::Active, Status::Stale],
-        Some(list) => list
-            .split(',')
-            .map(|s| {
-                Status::parse(s).ok_or(ApiError(
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown status {s:?}"),
-                ))
-            })
-            .collect::<Result<_, _>>()?,
-    };
+    let statuses = parse_statuses(query.status.as_deref())?;
     let limit = query.limit.unwrap_or(30).clamp(1, 200);
     let store = app.store.clone();
     let hits = tokio::task::spawn_blocking(move || -> Result<Vec<knowledge::Hit>> {
