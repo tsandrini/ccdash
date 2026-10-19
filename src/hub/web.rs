@@ -36,8 +36,9 @@ fn file(root: &Path, path: &str) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut file = root.join(&rel);
-    let spa = file.extension().is_none();
-    if !file.is_file() && spa {
+    // NOTE: judged on the request path: the root directory's own name may
+    // carry a version with dots (a Nix store path)
+    if rel.extension().is_none() && !file.is_file() {
         file = root.join("index.html");
     }
     let Ok(bytes) = std::fs::read(&file) else {
@@ -183,7 +184,8 @@ mod tests {
 
     #[tokio::test]
     async fn serves_the_app_and_the_old_panel() {
-        let dir = std::env::temp_dir().join(format!("ccdash-web-{}", std::process::id()));
+        // NOTE: a dotted directory name, like a store path's
+        let dir = std::env::temp_dir().join(format!("ccdash-web-0.1.0-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("_app/immutable")).unwrap();
         std::fs::create_dir_all(dir.join("v1")).unwrap();
         std::fs::write(dir.join("index.html"), "<p>new</p>").unwrap();
