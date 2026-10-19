@@ -24,13 +24,16 @@ niri window events ────────────────┘          
 - Every session reports through Claude Code hooks to a small **collector**
   on the same machine, which forwards everything to the **hub** over one
   WebSocket (`/collect`, a token per machine) and carries out what comes
-  back: replies into sessions, prompt answers, renames. While the hub is
+  back: replies into sessions, prompt answers, renames, sessions to start,
+  stop or open. It also reads each session's git branch from `.git/HEAD`
+  (worktrees included), without running git. While the hub is
   unreachable, hook events wait in an on-disk queue and Claude Code runs
   as if ccdash were not there.
 - The hub keeps every machine's live state in memory and history in
   SQLite, and serves the **web UI**, meant for the phone: it reads,
   renames sessions, answers their permission prompts, questions and plans,
-  and (with the channel enabled) sends them messages. "Open in Claude"
+  (with the channel enabled) sends them messages, and starts, continues
+  and stops sessions in known projects. "Open in Claude"
   opens a session in the Claude app through Remote Control. Every view can
   be narrowed to one host.
 - **Notifications** reach the phone (and a watch mirroring it) with
@@ -40,8 +43,8 @@ niri window events ────────────────┘          
   (mirrored from the hub): a bar indicator, a quick list, and a full
   dashboard tab. Clicking a session focuses its terminal window in niri.
 
-Only public Claude Code interfaces are used (`claude agents --json`, hooks,
-the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
+Only public Claude Code interfaces are used (`claude agents --json`,
+`claude --bg`, `claude stop`, `claude attach`, hooks, the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
 [OpenTelemetry](https://code.claude.com/docs/en/monitoring-usage), the
 `/usage` report); no internal state files.
 
@@ -325,8 +328,59 @@ Sessions started before this (or without the wrapper) show how to restart
 them. Team and Enterprise accounts also need an admin to enable channels for
 the organization.
 
-Anyone holding a token can answer your sessions' prompts and, with the
-channel, prompt them, so treat it like an SSH key: keep the port on your LAN
+### Starting sessions from the phone
+
+**Start a session** on Now (and **Start** on a project page, with the
+project filled in) opens a sheet: a connected host, a workspace and one of
+its projects (as Projects lists them, or the workspace's own directory),
+the model, the permission mode (the host's default, plan, accept edits)
+and the prompt, with templates, history and `[[note]]` links. The hub
+resolves the directory from the workspace and project; the panel never
+sends a path, and the hub refuses unknown hosts, projects, models, modes
+and fields. The sheet waits until the session reports and opens its page.
+Its questions, approvals and plans reach the phone like any other's; when
+it finishes a turn, a "Finished" notification follows (`notify.turns`).
+
+The collector runs, in the project's directory:
+
+```sh
+<launch.command> --bg [--resume <id>] [--model <m>] \
+  [--permission-mode <pm>] --channels plugin:ccdash@inline \
+  --settings '{"env":{"CCDASH_LAUNCH":"<launch id>"}}' -- <prompt>
+```
+
+`claude --bg` prints the session's id, and the session's hooks carry the
+launch id (a settings `env`: background sessions run in Claude Code's
+background daemon, so the collector's own environment never reaches
+them), so the hub finds the session either way. `--settings` replaces an
+earlier one, so `launch.command` must not carry its own. Nothing else is
+passed: no `--dangerously-skip-permissions`, ever. The Home Manager module
+sets `launch.command` to the Claude Code binary with the ccdash plugin
+(`--plugin-dir`), so the channel and the knowledge tools load as in a
+terminal; `launch.command = []` turns starting sessions off on that
+machine.
+
+An ended session's page offers **Continue** (`claude --bg --resume`; Claude
+Code may continue a stopped background session as a copy under a new id,
+and the page follows it). **Stop**, on the session page and the cards'
+menu, asks first, then runs `launch.stop` (`claude stop <id>`) for a
+background session or sends SIGTERM to an interactive session's Claude
+process (never SIGKILL, and only to a process that is still Claude Code).
+**Open on** (the host's name) focuses the session's window or attaches a background
+session there (`attach.command`, as `ccdash open` does). **Forget**, when
+the session's host is offline, marks it ended on the hub; it comes back if
+its host reports it running again.
+
+```toml
+# collector config (the Home Manager module fills these in)
+[launch]
+command = ["claude"]                # + the arguments above; [] is off
+stop = ["claude", "stop", "{id}"]
+```
+
+Anyone holding a token can answer your sessions' prompts, start sessions
+in your projects and, with the channel, prompt them, so treat it like an
+SSH key: keep the port on your LAN
 or VPN, and revoke the device in Settings if it goes missing (rotate
 `tokenFile` if it was on the bootstrap token).
 
@@ -341,7 +395,8 @@ commands) and its memory as PSS, so shared pages are not counted twice.
 Turn it off with `procs.enable = false`.
 
 The HTTP API needs a bearer token for everything (it can read sessions,
-rename them, answer their prompts and, with the channel, prompt them): the
+rename them, answer their prompts, start and stop sessions and, with the
+channel, prompt them): the
 bootstrap one from `tokenFile`, compared in constant time, or a device's
 own, looked up by its SHA-256. Only the notification buttons' one-time
 links and `/collect`, which takes a collector's token, differ. Keep the hub

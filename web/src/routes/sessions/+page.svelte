@@ -67,7 +67,7 @@
 					<span class="text-sm font-normal text-muted-foreground">{sessions.length}</span>
 				</summary>
 				{#if note}<p class="mt-1 text-xs text-muted-foreground">{note}</p>{/if}
-				<div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+				<div class="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
 					{#each sessions as s (s.id)}
 						<SessionCard session={s} lane={lanes.get(s.id)} />
 					{/each}

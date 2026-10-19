@@ -19,11 +19,12 @@ use tracing::warn;
 
 use crate::{
     claims, knowledge, messages,
-    model::{Kind, Stamped, Turn},
+    model::{Activity, Kind, Session, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
     tokens,
     util::{now_ms, truncate},
+    workspace::Workspaces,
 };
 
 pub(crate) const SCHEMA: &str = "
@@ -82,7 +83,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     kind TEXT NOT NULL,
     started_at INTEGER NOT NULL,
-    ended_at INTEGER
+    ended_at INTEGER,
+    branch TEXT,
+    launched INTEGER
 );
 ";
 
@@ -104,17 +107,21 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("samples", "lines_removed", "INTEGER"),
     ("claims", "issue", "TEXT"),
     ("push_subscriptions", "token_id", "INTEGER"),
+    ("sessions", "branch", "TEXT"),
+    ("sessions", "launched", "INTEGER"),
 ];
 
 const UPSERT_SESSION: &str = "
-INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at, branch, launched)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT (id) DO UPDATE SET
     cwd = excluded.cwd,
     name = COALESCE(excluded.name, name),
     title = COALESCE(excluded.title, title),
     kind = excluded.kind,
-    ended_at = excluded.ended_at
+    ended_at = excluded.ended_at,
+    branch = COALESCE(excluded.branch, branch),
+    launched = MAX(COALESCE(launched, 0), excluded.launched)
 ";
 
 const PRUNE_EVERY_MS: i64 = 3_600_000;
@@ -317,6 +324,8 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                 kind,
                 started_at,
                 ended_at,
+                branch,
+                launched,
             } => {
                 tx.execute(
                     UPSERT_SESSION,
@@ -328,7 +337,9 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                         title,
                         kind_name(*kind),
                         started_at,
-                        ended_at
+                        ended_at,
+                        branch,
+                        launched
                     ],
                 )?;
             }
@@ -415,14 +426,21 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             })
         }))
     };
-    let (title, started_at) = conn
+    let (title, started_at, branch, launched) = conn
         .query_row(
-            "SELECT title, started_at FROM sessions WHERE id = ?1",
+            "SELECT title, started_at, branch, COALESCE(launched, 0) FROM sessions WHERE id = ?1",
             [session],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            },
         )
         .optional()?
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None, false));
     let hooked = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND kind != 'activity')",
         [session],
@@ -450,9 +468,95 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         tasks,
         inbox: messages::previews(&messages::pending(&conn, session)?, PREVIEW_LEN),
         claim: claims::load(&conn, session, now)?,
+        branch,
+        launched,
     };
     conn.finish()?;
     Ok(restored)
+}
+
+/// A session the live state no longer holds, rebuilt from its row (by id
+/// or unique id prefix): ended, with its last prompt, reply and turn.
+pub fn ended_session(
+    conn: &Connection,
+    key: &str,
+    workspaces: &Workspaces,
+) -> Result<Option<Session>> {
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    );
+    const SELECT: &str = "SELECT id, host, cwd, name, title, kind, started_at FROM sessions";
+    let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ))
+    };
+    let exact = conn
+        .prepare_cached(&format!("{SELECT} WHERE id = ?1"))?
+        .query_row([key], row)
+        .optional()?;
+    let found = match exact {
+        Some(found) => found,
+        None => {
+            let rows: Vec<Row> = conn
+                .prepare_cached(&format!(
+                    "{SELECT} WHERE substr(id, 1, length(?1)) = ?1 LIMIT 2"
+                ))?
+                .query_map([key], row)?
+                .collect::<rusqlite::Result<_>>()?;
+            match <[Row; 1]>::try_from(rows) {
+                Ok([one]) => one,
+                Err(_) => return Ok(None),
+            }
+        }
+    };
+    let (id, host, cwd, name, title, kind, started_at) = found;
+    let (ended_at, last_event_at): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT (SELECT ended_at FROM sessions WHERE id = ?1),
+                (SELECT max(ts) FROM events WHERE session = ?1)",
+        [&id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let saved = restored(conn, &id)?;
+    let last = last_event_at.unwrap_or(started_at).max(started_at);
+    let (workspace, project) = match workspaces.locate(&cwd) {
+        Some((ws, project)) => (Some(ws), project),
+        None => (None, None),
+    };
+    let mut session = Session::stub(&host, &id, &cwd);
+    session.kind = if kind == "background" {
+        Kind::Background
+    } else {
+        Kind::Interactive
+    };
+    session.workspace = workspace;
+    session.project = project;
+    session.name = name;
+    session.title = title.or(saved.title);
+    session.activity = Activity::Gone;
+    session.activity_since = ended_at.unwrap_or(last);
+    session.hooked = saved.hooked;
+    session.prompt = saved.prompt;
+    session.reply = saved.reply;
+    session.turn = saved.turn;
+    session.tasks = saved.tasks;
+    session.branch = saved.branch;
+    session.launched = saved.launched;
+    session.started_at = started_at;
+    session.last_event_at = last;
+    Ok(Some(session))
 }
 
 /// Rebuilds the progress of a session's last turn from its events.
@@ -522,6 +626,22 @@ mod tests {
                 kind: Kind::Interactive,
                 started_at: t,
                 ended_at: None,
+                branch: Some("main".into()),
+                launched: true,
+            },
+        );
+        store.send(
+            "testhost",
+            StoreMsg::Session {
+                id: "s1".into(),
+                cwd: "/w/p".into(),
+                name: None,
+                title: None,
+                kind: Kind::Background,
+                started_at: t,
+                ended_at: Some(t + 9),
+                branch: None,
+                launched: false,
             },
         );
         for (dt, kind, data) in [
@@ -616,6 +736,21 @@ mod tests {
         );
         assert_eq!(turn.files, ["a.rs"]);
         assert_eq!(saved.tasks[0].subject, "Ship");
+        assert_eq!(saved.branch.as_deref(), Some("main"));
+        assert!(saved.launched);
+
+        let workspaces = Workspaces::new(&["/w".into()], "/home");
+        let ended = ended_session(&reader, "s", &workspaces).unwrap().unwrap();
+        assert_eq!(ended.activity, Activity::Gone);
+        assert_eq!(
+            (ended.kind, ended.activity_since),
+            (Kind::Background, t + 9)
+        );
+        assert_eq!(ended.title.as_deref(), Some("Fix it"));
+        assert_eq!(ended.project.as_deref(), Some("p"));
+        assert_eq!(ended.prompt.unwrap().text, "second");
+        assert!(ended.launched);
+        assert!(ended_session(&reader, "x", &workspaces).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

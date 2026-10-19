@@ -11,6 +11,7 @@ mod command;
 mod config;
 mod conversation;
 mod emit;
+mod git;
 mod history;
 mod hub;
 mod knowledge;

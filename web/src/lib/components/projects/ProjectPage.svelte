@@ -5,6 +5,7 @@
 	import { page } from '$app/state';
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import Grid3x3Icon from '@lucide/svelte/icons/grid-3x3';
+	import PlayIcon from '@lucide/svelte/icons/play';
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import type { Card, Doc, Issue } from '#lib/api/types.js';
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
@@ -15,6 +16,7 @@
 	import { newNoteHref, PRIORITY_RANK, projectHref } from '#lib/notes.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { projects } from '#lib/projects.svelte.js';
+	import { starter } from '#lib/starter.svelte.js';
 	import BoardTab from './BoardTab.svelte';
 	import DocsTab from './DocsTab.svelte';
 	import GraphTab from './GraphTab.svelte';
@@ -104,10 +106,21 @@
 				{/if}
 			</nav>
 			<span class="text-xs text-muted-foreground">{facts.join(' · ')}</span>
+			<Button
+				size="sm"
+				class="ml-auto"
+				disabled={!live.hosts.some((h) => h.connected)}
+				title={live.hosts.some((h) => h.connected)
+					? 'Start a Claude Code session here'
+					: 'No host is connected'}
+				onclick={() => starter.show({ ws, project })}
+			>
+				<PlayIcon /> Start
+			</Button>
 			<DropdownMenu.Root>
 				<DropdownMenu.Trigger>
 					{#snippet child({ props })}
-						<Button variant="outline" size="sm" class="ml-auto" {...props}>
+						<Button variant="outline" size="sm" {...props}>
 							<PlusIcon /> New <ChevronDownIcon class="size-3 opacity-60" />
 						</Button>
 					{/snippet}
@@ -145,8 +158,10 @@
 			<p class="text-sm text-critical" role="alert">{projects.error}</p>
 		{/if}
 		<Tabs.Root value={tab} onValueChange={setTab} class="gap-3">
-			<div class="-mx-3 overflow-x-auto px-3 sm:mx-0 sm:px-0">
-				<Tabs.List class="w-fit">
+			<div>
+				<Tabs.List
+					class="w-fit flex-wrap justify-start group-data-[orientation=horizontal]/tabs:h-auto"
+				>
 					<Tabs.Trigger value="board">Board</Tabs.Trigger>
 					<Tabs.Trigger value="now">Now</Tabs.Trigger>
 					<Tabs.Trigger value="progress">Progress</Tabs.Trigger>

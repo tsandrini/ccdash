@@ -8,6 +8,8 @@ import type {
 	Graph,
 	History,
 	Hit,
+	Launch,
+	LaunchBody,
 	Message,
 	Note,
 	NoteOp,
@@ -55,6 +57,25 @@ export const answerAsk = (id: string, ask: string, answer: Answer) =>
 		`sessions/${encodeURIComponent(id)}/asks/${encodeURIComponent(ask)}`,
 		answer
 	);
+
+/** Starts a background session (or continues an ended one); the launch
+ * moves on through `launch` updates on the stream. */
+export const startLaunch = (body: LaunchBody) => postJson<{ launch: Launch }>('launches', body);
+
+export const fetchLaunch = (id: string) =>
+	getJson<{ launch: Launch }>(`launches/${encodeURIComponent(id)}`);
+
+/** `claude stop` (background) or SIGTERM (interactive) on the session's host. */
+export const stopSession = (id: string) =>
+	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/stop`, {});
+
+/** Marks the session ended on the hub (a ghost, an offline host). */
+export const forgetSession = (id: string) =>
+	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/forget`, {});
+
+/** Focuses its window or attaches it in a terminal on its host. */
+export const openSession = (id: string) =>
+	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/open`, {});
 
 export const fetchPrompts = (params: { session?: string; workspace?: string; limit?: number }) =>
 	getJson<{ prompts: Prompt[] }>(`prompts${query(params)}`);

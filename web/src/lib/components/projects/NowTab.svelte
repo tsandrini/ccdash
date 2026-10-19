@@ -7,7 +7,8 @@
 	import { fetchSession } from '#lib/api/index.js';
 	import Clock from '#lib/components/app/Clock.svelte';
 	import StateBadge from '#lib/components/app/StateBadge.svelte';
-	import { fmtStamp, place, plain, toolLabel } from '#lib/format.js';
+	import Where from '#lib/components/app/Where.svelte';
+	import { fmtStamp, plain, toolLabel } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
 	import { notePanel } from '#lib/notepanel.svelte.js';
 	import { claimPaths, label, shown } from '#lib/session.js';
@@ -75,7 +76,7 @@
 		{#if !sessions.length}
 			<p class="text-sm text-muted-foreground">No session is running here.</p>
 		{/if}
-		<div class="grid gap-2 sm:grid-cols-2">
+		<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
 			{#each sessions as s (s.id)}
 				<article class="flex flex-col gap-1 rounded-lg border bg-card p-3 text-sm">
 					<span class="flex items-center gap-2">
@@ -83,11 +84,7 @@
 						<Clock since={s.activity_since} class="ml-auto text-xs" />
 					</span>
 					<a class="truncate font-medium hover:underline" href="/sessions/{s.id}">{label(s)}</a>
-					<span class="truncate text-xs text-muted-foreground"
-						>{[live.multiHost ? s.host : null, place(s.cwd), s.model]
-							.filter(Boolean)
-							.join(' · ')}</span
-					>
+					<Where session={s} />
 					{#if s.activity === 'working' && s.tool}
 						<span class="truncate font-mono text-xs">{toolLabel(s.tool)}</span>
 					{/if}

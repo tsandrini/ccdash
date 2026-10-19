@@ -303,6 +303,39 @@ waits: Array<Wait>, };
 
 export type LateWait = { session: string, label: string, host: string, cwd: string, start: number, ms: number, };
 
+/**
+ * A session the panel asked a host to start (or continue).
+ */
+export type Launch = { id: string, host: string, workspace: string, project: string | null, 
+/**
+ * The session continued, for a resume (Claude Code may continue it
+ * as a copy under a new id: `state` names the one that runs).
+ */
+resume: string | null, at: number, } & ({ "state": "pending" } | { "state": "started", session: string, } | { "state": "failed", error: string, });
+
+export type LaunchBody = { 
+/**
+ * A connected host.
+ */
+host: string, workspace: string, 
+/**
+ * A project of the workspace (as `/projects` lists them); none starts
+ * in the workspace's own directory.
+ */
+project?: string, prompt: string, 
+/**
+ * A model alias or name; the host's default when absent.
+ */
+model?: string, 
+/**
+ * `plan` or `acceptEdits`; the host's default when absent or `default`.
+ */
+permission_mode?: string, 
+/**
+ * An ended session to continue (on its host, in its directory).
+ */
+resume?: string, };
+
 export type Limit = { used_pct: number, 
 /**
  * Unix seconds.
@@ -619,6 +652,15 @@ workspace: string | null,
  */
 project: string | null, 
 /**
+ * The git branch of `cwd` (a detached `HEAD` as a short hash), read
+ * by the collector.
+ */
+branch: string | null, 
+/**
+ * Started (or continued) from the panel: a finished turn notifies.
+ */
+launched: boolean, 
+/**
  * Name from `claude agents`.
  */
 name: string | null, 
@@ -795,7 +837,7 @@ files: Array<string>, };
 
 export type Unsubscribe = { endpoint: string, };
 
-export type Update = { "type": "session", session: Session, } | { "type": "removed", host: string, id: string, } | { "type": "rate_limits", rate_limits: RateLimits, } | { "type": "hosts", hosts: Array<HostStatus>, } | { "type": "notes", workspace: string, };
+export type Update = { "type": "session", session: Session, } | { "type": "removed", host: string, id: string, } | { "type": "rate_limits", rate_limits: RateLimits, } | { "type": "hosts", hosts: Array<HostStatus>, } | { "type": "notes", workspace: string, } | { "type": "launch", launch: Launch, };
 
 /**
  * A full write of one note, as the importer and the tools produce it;

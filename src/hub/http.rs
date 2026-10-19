@@ -1,5 +1,6 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
-//! replying to them and answering their prompts, and the knowledge layer
+//! replying to them and answering their prompts, starting, stopping,
+//! forgetting and opening them (`/launches`), and the knowledge layer
 //! (`/notes`, `/projects`: list, search, read, write, verify), and the
 //! devices' tokens (`/tokens`). Every `/api` route needs
 //! `Authorization: Bearer <token>`: the bootstrap token from the
@@ -38,10 +39,11 @@ use ts_rs::TS;
 
 use super::{
     collect::{self, Tokens},
-    core::Hub,
+    core::{Cmd, Hub, LaunchReq},
     web,
 };
 use crate::{
+    actions::{self, MAX_PROMPT, PERMISSION_MODES},
     analytics::{self, Analytics},
     ask::Answer,
     config::HubConfig,
@@ -52,10 +54,10 @@ use crate::{
         projects::{self, Graph, Projects},
     },
     messages,
-    model::{Activity, Snapshot},
+    model::{Activity, Session, Snapshot},
     paths,
     push::{self, Push},
-    store::Store,
+    store::{self, Store},
     tokens,
     util::{self, now_ms},
     workspace::{Scope, Workspaces},
@@ -65,6 +67,8 @@ const DAY_MS: i64 = 86_400_000;
 const HOUR_MS: i64 = 3_600_000;
 /// Messages shown with a session's conversation.
 const SESSION_MESSAGES: usize = 50;
+/// How long a stop waits for the session's host.
+const STOP_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct App {
@@ -125,6 +129,11 @@ pub async fn serve(
         .route("/sessions/{id}/reply", post(reply))
         .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
+        .route("/sessions/{id}/stop", post(stop))
+        .route("/sessions/{id}/forget", post(forget))
+        .route("/sessions/{id}/open", post(open))
+        .route("/launches", post(launch))
+        .route("/launches/{id}", get(launch_of))
         .route("/prompts", get(prompts))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
@@ -285,11 +294,12 @@ async fn session(
     Path(id): Path<String>,
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let session = app
-        .hub
-        .resolve(&id)
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let session = match app.hub.resolve(&id).await? {
+        Some(session) => session,
+        None => ended(&app, &id)
+            .await?
+            .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?,
+    };
     let store = app.store.clone();
     let (session_id, started_at) = (session.id.clone(), session.started_at);
     let live = session.activity != Activity::Gone;
@@ -394,6 +404,201 @@ async fn answer(
     let session = app
         .hub
         .answer(&id, &ask, answer)
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// A session the live state no longer holds, from its row in the store.
+async fn ended(app: &App, key: &str) -> Result<Option<Session>, ApiError> {
+    let (store, workspaces, key) = (app.store.clone(), app.workspaces.clone(), key.to_owned());
+    Ok(tokio::task::spawn_blocking(move || -> Result<_> {
+        store::ended_session(&store.reader()?, &key, &workspaces)
+    })
+    .await
+    .map_err(anyhow::Error::from)??)
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchBody {
+    /// A connected host.
+    host: String,
+    workspace: String,
+    /// A project of the workspace (as `/projects` lists them); none starts
+    /// in the workspace's own directory.
+    #[serde(default)]
+    #[ts(optional)]
+    project: Option<String>,
+    prompt: String,
+    /// A model alias or name; the host's default when absent.
+    #[serde(default)]
+    #[ts(optional)]
+    model: Option<String>,
+    /// `plan` or `acceptEdits`; the host's default when absent or `default`.
+    #[serde(default)]
+    #[ts(optional)]
+    permission_mode: Option<String>,
+    /// An ended session to continue (on its host, in its directory).
+    #[serde(default)]
+    #[ts(optional)]
+    resume: Option<String>,
+}
+
+/// Starts a background session in a known project, or continues an ended
+/// one; `202 { launch }`, followed by `launch` updates on the stream. The
+/// directory comes from the workspace and project, never from the client.
+async fn launch(
+    State(app): State<App>,
+    Json(body): Json<LaunchBody>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let refuse = |message: String| ApiError(StatusCode::UNPROCESSABLE_ENTITY, message);
+    let prompt = body.prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return Err(refuse("the prompt is empty".into()));
+    }
+    if prompt.chars().count() > MAX_PROMPT {
+        return Err(refuse(format!(
+            "prompts are at most {MAX_PROMPT} characters"
+        )));
+    }
+    let model = body.model.filter(|m| !m.trim().is_empty());
+    if let Some(m) = &model
+        && !actions::valid_model(m)
+    {
+        return Err(refuse(format!("unknown model {m:?}")));
+    }
+    let permission_mode = body
+        .permission_mode
+        .filter(|m| !m.is_empty() && m != "default");
+    if let Some(m) = &permission_mode
+        && !PERMISSION_MODES.contains(&m.as_str())
+    {
+        return Err(refuse(format!("permission mode {m:?} is not offered")));
+    }
+    let ws_dir = app
+        .workspaces
+        .dir(&body.workspace)
+        .ok_or_else(|| refuse(format!("unknown workspace {:?}", body.workspace)))?
+        .to_owned();
+    let (cwd, resume) = match &body.resume {
+        Some(key) => {
+            let live = app.hub.resolve(key).await?;
+            if live.as_ref().is_some_and(|s| s.activity != Activity::Gone) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "the session is still running".into(),
+                ));
+            }
+            let s = match live {
+                Some(s) => s,
+                None => ended(&app, key)
+                    .await?
+                    .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?,
+            };
+            if s.host != body.host {
+                return Err(refuse(format!("the session ran on {}", s.host)));
+            }
+            if app.workspaces.locate(&s.cwd) != Some((body.workspace.clone(), body.project.clone()))
+            {
+                return Err(refuse("the session ran in another project".into()));
+            }
+            (s.cwd, Some(s.id))
+        }
+        None => match &body.project {
+            None => (ws_dir, None),
+            Some(project) => {
+                let (store, ws, name) =
+                    (app.store.clone(), body.workspace.clone(), project.clone());
+                let known = tokio::task::spawn_blocking(move || -> Result<bool> {
+                    let view = projects::build(&store.reader()?, &ws, &[], now_ms())?;
+                    Ok(view
+                        .projects
+                        .iter()
+                        .any(|p| p.project.as_ref() == Some(&name)))
+                })
+                .await
+                .map_err(anyhow::Error::from)??;
+                let plain = !project.is_empty()
+                    && !project.contains('/')
+                    && project != "."
+                    && project != "..";
+                if !known || !plain {
+                    return Err(refuse(format!(
+                        "{project:?} is not a known project of {}",
+                        body.workspace
+                    )));
+                }
+                (format!("{ws_dir}/{project}"), None)
+            }
+        },
+    };
+    let launch = app
+        .hub
+        .launch(LaunchReq {
+            host: body.host,
+            workspace: body.workspace,
+            project: body.project,
+            cwd,
+            prompt,
+            model,
+            permission_mode,
+            resume,
+        })
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "launch": launch }))))
+}
+
+/// A launch while the hub keeps it (15 minutes).
+async fn launch_of(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let launch = app
+        .hub
+        .launch_of(&id)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "no such launch".into()))?;
+    Ok(Json(json!({ "launch": launch })))
+}
+
+/// Stops a running session: `claude stop` for a background one, SIGTERM
+/// for an interactive one; answers once its host has.
+async fn stop(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let result = tokio::time::timeout(
+        STOP_WAIT,
+        app.hub.session_cmd(|reply| Cmd::Stop { key: id, reply }),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::GATEWAY_TIMEOUT,
+            "the host did not answer".into(),
+        )
+    })??;
+    let session = result.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// Marks a session gone on the hub (a ghost, or one on an offline host); a
+/// later report from its host brings it back.
+async fn forget(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .session_cmd(|reply| Cmd::Forget { key: id, reply })
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// Focuses the session's window on its host, or attaches a background
+/// session there in a new terminal.
+async fn open(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .session_cmd(|reply| Cmd::Open { key: id, reply })
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))

@@ -30,6 +30,14 @@ pub struct Envelope {
     /// A queued title this hook handed to Claude Code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_title: Option<String>,
+    /// The launch that started the session (`CCDASH_LAUNCH`), when the
+    /// panel did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    /// The git branch of the session's directory, read by the collector
+    /// for statusline readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub payload: Value,
 }
 
@@ -124,6 +132,8 @@ mod tests {
             pid: None,
             remote_id: None,
             applied_title: None,
+            launch: None,
+            branch: None,
             payload,
         }
     }

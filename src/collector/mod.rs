@@ -2,8 +2,8 @@
 //! and the desktop report (hooks, statusline, `claude agents`, niri,
 //! `/proc`, `/usage`, OpenTelemetry), forwards it to the hub, and carries
 //! out what the hub sends back: channel replies, ask decisions, queued
-//! titles. The local API keeps serving a mirror of this host's sessions for
-//! the DMS plugin and the CLI.
+//! titles, sessions to start, stop or open. The local API keeps serving a
+//! mirror of this host's sessions for the DMS plugin and the CLI.
 
 mod api;
 mod link;
@@ -28,9 +28,11 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    actions::{self, LaunchSpec},
     agents,
     channel::ToChannel,
-    config::CollectorConfig,
+    config::{CollectorConfig, Launch},
+    git,
     knowledge::{self, Note, Query},
     model::{HostStatus, RateLimits, ScopedLimit, Session, Snapshot, Update},
     niri, otlp, paths, procs,
@@ -38,7 +40,7 @@ use crate::{
     state::{AgentEntry, NiriEvent, ProcPoll, StoreMsg, Window},
     usage,
     util::{self, now_ms, pid_alive},
-    wire::{self, Envelope},
+    wire::{self, Envelope, Source},
     workspace::Workspaces,
 };
 
@@ -207,7 +209,8 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
             hub_tx,
             local.updates.clone(),
             paths::notes_cache(),
-        ),
+        )
+        .with_commands(cfg.launch.clone(), cfg.attach.command.clone()),
         rx,
     ));
     tokio::spawn(link::run(
@@ -354,6 +357,10 @@ struct Actor {
     offline: HashMap<String, i64>,
     /// When the link went down, until it comes back.
     down_at: Option<i64>,
+    /// How sessions start and stop here (`[launch]`).
+    launch: Launch,
+    /// `[attach] command`, for the hub's `Open`.
+    attach: Vec<String>,
 }
 
 impl Actor {
@@ -394,7 +401,86 @@ impl Actor {
             cache_path,
             offline: HashMap::new(),
             down_at: None,
+            launch: Launch {
+                command: Vec::new(),
+                stop: Vec::new(),
+            },
+            attach: Vec::new(),
         }
+    }
+
+    fn with_commands(mut self, launch: Launch, attach: Vec<String>) -> Self {
+        self.launch = launch;
+        self.attach = attach;
+        self
+    }
+
+    /// The git branch of a session's directory: the one the hub knows,
+    /// else the one reported with it.
+    fn branch_of(&self, session: Option<&str>, cwd: Option<&str>) -> Option<String> {
+        let dir = session
+            .and_then(|id| self.sessions.get(id))
+            .map(|s| s.cwd.as_str())
+            .filter(|c| !c.is_empty())
+            .or(cwd)?;
+        git::branch(Path::new(dir))
+    }
+
+    /// Starts `spec` in the background and tells the hub what came of it.
+    fn launch(&self, launch: String, spec: LaunchSpec) {
+        let (hub, command) = (self.hub.clone(), self.launch.command.clone());
+        let inside = self.workspaces.locate(&spec.cwd).is_some();
+        tokio::spawn(async move {
+            let result = if inside {
+                actions::launch(&command, &spec).await
+            } else {
+                Err(format!("{} is outside every ccdash workspace", spec.cwd))
+            };
+            match &result {
+                Ok(id) => info!("launch {launch}: started {id} in {}", spec.cwd),
+                Err(e) => warn!("launch {launch} in {}: {e}", spec.cwd),
+            }
+            let _ = hub.send(ToHub::Launched {
+                launch,
+                session: result.as_ref().ok().cloned(),
+                error: result.err(),
+            });
+        });
+    }
+
+    fn stop(&self, id: String) {
+        let hub = self.hub.clone();
+        let Some(session) = self.sessions.get(&id).cloned() else {
+            let _ = hub.send(ToHub::Stopped {
+                session: id,
+                error: Some("this host does not know the session".into()),
+            });
+            return;
+        };
+        let command = self.launch.stop.clone();
+        tokio::spawn(async move {
+            let result = actions::stop(&command, &session).await;
+            if let Err(e) = &result {
+                warn!("stopping {id}: {e}");
+            }
+            let _ = hub.send(ToHub::Stopped {
+                session: id,
+                error: result.err(),
+            });
+        });
+    }
+
+    fn open(&self, id: &str) {
+        let Some(session) = self.sessions.get(id).cloned() else {
+            warn!("open: no session {id} on this host");
+            return;
+        };
+        let attach = self.attach.clone();
+        tokio::spawn(async move {
+            if let Err(e) = actions::open_session(&session, &attach).await {
+                warn!("open {}: {e:#}", session.id);
+            }
+        });
     }
 
     fn to_hub(&self, msg: ToHub) {
@@ -588,7 +674,9 @@ impl Actor {
                     Update::RateLimits { rate_limits } => {
                         self.rate_limits = Some(rate_limits.clone());
                     }
-                    Update::Hosts { .. } | Update::Notes { .. } => return,
+                    Update::Hosts { .. } | Update::Notes { .. } | Update::Launch { .. } => {
+                        return;
+                    }
                 }
                 self.publish(serde_json::to_value(&update).unwrap_or(Value::Null));
             }
@@ -621,6 +709,26 @@ impl Actor {
                     let _ = reply.send(result);
                 }
             }
+            ToCollector::Launch {
+                launch,
+                cwd,
+                prompt,
+                model,
+                permission_mode,
+                resume,
+            } => {
+                let spec = LaunchSpec {
+                    cwd,
+                    prompt,
+                    model,
+                    permission_mode,
+                    resume,
+                    nonce: launch.clone(),
+                };
+                self.launch(launch, spec);
+            }
+            ToCollector::Stop { session, .. } => self.stop(session),
+            ToCollector::Open { session } => self.open(&session),
         }
     }
 
@@ -661,8 +769,17 @@ impl Actor {
 async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            LocalCmd::Envelope(envelope) => a.to_hub(ToHub::Envelope { envelope }),
-            LocalCmd::Agents(list, at) => {
+            LocalCmd::Envelope(mut envelope) => {
+                if envelope.source == Source::Statusline {
+                    let p = &envelope.payload;
+                    envelope.branch = a.branch_of(p["session_id"].as_str(), p["cwd"].as_str());
+                }
+                a.to_hub(ToHub::Envelope { envelope });
+            }
+            LocalCmd::Agents(mut list, at) => {
+                for e in &mut list {
+                    e.branch = a.branch_of(Some(&e.session_id), e.cwd.as_deref());
+                }
                 let dead: Vec<u32> = a
                     .sessions
                     .values()

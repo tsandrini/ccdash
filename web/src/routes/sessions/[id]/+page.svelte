@@ -1,7 +1,8 @@
 <script lang="ts">
-	// The session page: header (title with inline rename, state, where,
-	// context, cost, Open in Claude), Chat / Shell / Details, the open asks
-	// pinned above the composer.
+	// The session page: header (title with inline rename, state, where and
+	// branch, context, cost, Open in Claude, Stop / Open / Forget), Chat /
+	// Shell / Details, the open asks pinned above the composer; an ended
+	// session (also one only history still knows) offers Continue.
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import ArrowDownIcon from '@lucide/svelte/icons/arrow-down';
@@ -15,23 +16,28 @@
 	import AskCard from '#lib/components/app/AskCard.svelte';
 	import Clock from '#lib/components/app/Clock.svelte';
 	import Meter from '#lib/components/app/Meter.svelte';
+	import SessionActions from '#lib/components/app/SessionActions.svelte';
 	import StateBadge from '#lib/components/app/StateBadge.svelte';
+	import Where from '#lib/components/app/Where.svelte';
 	import ChatTab from '#lib/components/session/ChatTab.svelte';
 	import Composer from '#lib/components/session/Composer.svelte';
 	import DetailsTab from '#lib/components/session/DetailsTab.svelte';
 	import ShellTab from '#lib/components/session/ShellTab.svelte';
 	import { Convo } from '#lib/components/session/convo.svelte.js';
-	import { fmtUsd, known, place } from '#lib/format.js';
+	import { fmtStamp, fmtUsd, known } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
 	import { claimPaths, isAgent, label, signature, shown } from '#lib/session.js';
+	import { starter } from '#lib/starter.svelte.js';
 
 	const id = $derived(page.params.id!);
+	let convo = $state<Convo>(new Convo(''));
 	const session = $derived(
-		live.sessions.get(id) ?? [...live.sessions.values()].find((s) => s.id.startsWith(id))
+		live.sessions.get(id) ??
+			[...live.sessions.values()].find((s) => s.id.startsWith(id)) ??
+			(convo.session?.id.startsWith(id) ? convo.session : undefined)
 	);
 	const tab = $derived(page.url.searchParams.get('tab') ?? 'chat');
 
-	let convo = $state<Convo>(new Convo(''));
 	let scroller = $state<HTMLDivElement | null>(null);
 	let atEnd = $state(true);
 	let editing = $state(false);
@@ -99,13 +105,6 @@
 		}
 	}
 
-	const whereText = $derived(
-		session
-			? [live.multiHost ? session.host : null, session.workspace, place(session.cwd), session.model]
-					.filter(Boolean)
-					.join(' · ')
-			: ''
-	);
 	const parent = $derived(session?.parent ? live.sessions.get(session.parent) : undefined);
 </script>
 
@@ -126,7 +125,7 @@
 	{@const s = session}
 	<div class="flex h-full flex-col">
 		<header class="flex flex-col gap-1.5 border-b px-3 py-2 sm:px-4">
-			<div class="flex items-center gap-2">
+			<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
 				<StateBadge activity={shown(s)} />
 				<Clock since={s.activity_since} class="text-xs" />
 				{#if s.renaming}<span class="text-xs text-muted-foreground"
@@ -180,23 +179,28 @@
 				</form>
 				{#if renameError}<p class="text-xs text-critical" role="alert">{renameError}</p>{/if}
 			{:else}
-				<h2 class="flex items-center gap-1 text-base font-semibold">
-					<span class="truncate">{label(s)}</span>
-					{#if s.activity !== 'gone'}
-						<Button
-							variant="ghost"
-							size="icon-xs"
-							aria-label="Rename session"
-							title="Rename"
-							onclick={() => {
-								title = label(s);
-								editing = true;
-							}}><PencilIcon /></Button
-						>
-					{/if}
-				</h2>
+				<div class="flex min-w-0 items-center gap-2">
+					<h2 class="flex min-w-0 items-center gap-1 text-base font-semibold">
+						<span class="truncate">{label(s)}</span>
+						{#if s.activity !== 'gone'}
+							<Button
+								variant="ghost"
+								size="icon-xs"
+								aria-label="Rename session"
+								title="Rename"
+								onclick={() => {
+									title = label(s);
+									editing = true;
+								}}><PencilIcon /></Button
+							>
+						{/if}
+					</h2>
+					<div class="ml-auto flex shrink-0 flex-col items-end gap-1">
+						<SessionActions session={s} resume={false} />
+					</div>
+				</div>
 			{/if}
-			<p class="truncate text-xs text-muted-foreground" title={s.cwd}>{whereText}</p>
+			<Where session={s} workspace />
 			{#if isAgent(s)}
 				<p class="text-xs text-muted-foreground">
 					{#if parent}Started by <a class="underline" href="/sessions/{parent.id}"
@@ -241,7 +245,22 @@
 				</div>
 			{/if}
 		</Tabs.Root>
-		{#if s.activity !== 'gone' && (s.asks.length || (s.hooked && !isAgent(s)) || s.channel)}
+		{#if s.activity === 'gone'}
+			<footer class="border-t bg-background px-3 py-2 sm:px-4">
+				<div class="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2">
+					<p class="text-xs text-muted-foreground">
+						Ended {fmtStamp(s.activity_since)}.{s.workspace
+							? ` Continue it in the background on ${s.host}.`
+							: ' It ran outside every workspace, so it cannot be continued from here.'}
+					</p>
+					{#if s.workspace}
+						<Button size="sm" class="ml-auto" onclick={() => starter.show({ resume: s })}
+							>Continue…</Button
+						>
+					{/if}
+				</div>
+			</footer>
+		{:else if s.asks.length || (s.hooked && !isAgent(s)) || s.channel}
 			<footer class="flex flex-col gap-2 border-t bg-background px-3 py-2 sm:px-4">
 				<div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
 					{#if s.asks.length}

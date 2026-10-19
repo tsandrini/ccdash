@@ -468,7 +468,7 @@ mod tests {
 
     fn session(conn: &Connection, id: &str, started_at: i64, ended_at: Option<i64>) {
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, 'h', '/w', NULL, ?2, 'interactive', ?3, ?4)",
+            "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES (?1, 'h', '/w', NULL, ?2, 'interactive', ?3, ?4)",
             params![id, format!("title {id}"), started_at, ended_at],
         )
         .unwrap();
@@ -515,7 +515,7 @@ mod tests {
     fn background_sessions_never_wait_on_you() {
         let conn = db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('bg', 'h', '/w', NULL, 't', 'background', 0, 500)",
+            "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES ('bg', 'h', '/w', NULL, 't', 'background', 0, 500)",
             [],
         )
         .unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let conn = db();
         session(&conn, "a", 0, None);
         conn.execute(
-            "INSERT INTO sessions VALUES ('b', 'other', '/w', NULL, 'b', 'interactive', 0, NULL)",
+            "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES ('b', 'other', '/w', NULL, 'b', 'interactive', 0, NULL)",
             [],
         )
         .unwrap();

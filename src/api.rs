@@ -39,6 +39,7 @@ mod tests {
         crate::hub::http::PutNote::export_all(&cfg).unwrap();
         crate::hub::http::Unsubscribe::export_all(&cfg).unwrap();
         crate::hub::http::Label::export_all(&cfg).unwrap();
+        crate::hub::http::LaunchBody::export_all(&cfg).unwrap();
     }
 
     #[test]

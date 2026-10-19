@@ -82,6 +82,10 @@ pub struct AgentEntry {
     pub waiting_for: Option<String>,
     #[serde(default)]
     pub started_at: Option<i64>,
+    /// The git branch of `cwd`, added by the collector (not part of
+    /// `claude agents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +123,8 @@ pub enum StoreMsg {
         kind: Kind,
         started_at: i64,
         ended_at: Option<i64>,
+        branch: Option<String>,
+        launched: bool,
     },
     /// A scoped limit read from `/usage`.
     Limit { ts: i64, limit: ScopedLimit },
@@ -159,6 +165,8 @@ pub struct Restored {
     pub tasks: Vec<Task>,
     pub inbox: Vec<Message>,
     pub claim: Option<Claim>,
+    pub branch: Option<String>,
+    pub launched: bool,
 }
 
 #[derive(Debug, Default)]
@@ -303,7 +311,28 @@ impl State {
                 s.inbox = saved.inbox;
             }
             s.claim = s.claim.take().or(saved.claim);
+            s.branch = s.branch.take().or(saved.branch);
+            s.launched |= saved.launched;
         }
+    }
+
+    /// Flags the session as started from the panel; true when it is known.
+    pub fn set_launched(&mut self, id: &str, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if !s.launched {
+            s.launched = true;
+            fx.store.push(session_row(s, None));
+            fx.touched.insert(id.to_owned());
+        }
+        true
+    }
+
+    /// Ends the session on the owner's word (a ghost, or one on a host
+    /// whose collector is offline); a later report brings it back.
+    pub fn forget(&mut self, id: &str, now: i64, fx: &mut Effects) {
+        self.mark_gone(id, now, "forgotten", fx);
     }
 
     /// Shows the messages waiting for the session's next prompt; true
@@ -769,6 +798,10 @@ impl State {
         if let Some(remote) = &env.remote_id {
             s.remote_url = Some(remote_url(remote));
         }
+        if s.branch != env.branch {
+            s.branch = env.branch.clone();
+            fx.store.push(session_row(s, None));
+        }
         let mut title = str_of(p, "session_name")
             .filter(|t| !t.is_empty())
             .map(str::to_owned);
@@ -1063,6 +1096,10 @@ impl State {
             if e.name.is_some() {
                 s.name = e.name.clone();
             }
+            if s.branch != e.branch {
+                s.branch = e.branch.clone();
+                fx.store.push(session_row(s, None));
+            }
             // NOTE: an open ask means a live hook holds the prompt, whatever the poll says
             if quiet
                 && s.asks.is_empty()
@@ -1250,6 +1287,8 @@ impl State {
             project: cwd
                 .and_then(|cwd| self.workspaces.locate(cwd))
                 .and_then(|(_, p)| p),
+            branch: None,
+            launched: false,
             name: None,
             title: None,
             activity: Activity::Idle,
@@ -1689,6 +1728,8 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
         kind: s.kind,
         started_at: s.started_at,
         ended_at,
+        branch: s.branch.clone(),
+        launched: s.launched,
     }
 }
 
@@ -1824,6 +1865,8 @@ mod tests {
             pid: Some(std::process::id()),
             remote_id: Some("session_remote".into()),
             applied_title: None,
+            launch: None,
+            branch: None,
             payload,
         }
     }

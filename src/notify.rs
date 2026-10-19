@@ -115,7 +115,7 @@ impl Composer {
             // NOTE: hooked only: unhooked turns come from the agents poll, which flaps
             if self.cfg.turns
                 && s.hooked
-                && s.kind == Kind::Interactive
+                && (s.kind == Kind::Interactive || s.launched)
                 && s.activity == Activity::YourTurn
                 && s.asks.is_empty()
                 && s.activity_since >= self.started_at
@@ -242,8 +242,14 @@ impl Composer {
             (_, Some(reply)) if !reply.text.trim().is_empty() => reply.text.clone(),
             _ => "Claude finished.".into(),
         };
+        // NOTE: a session started from the panel runs in the background: it finished
+        let title = if s.launched {
+            format!("Finished: {}", label(s))
+        } else {
+            format!("{}: your turn", label(s))
+        };
         Content {
-            title: format!("{}: your turn", label(s)),
+            title,
             body: truncate(&body, BODY_LEN),
             session: s.id.clone(),
             url: self.click(s),
@@ -514,6 +520,8 @@ mod tests {
                 pid: None,
                 remote_id: None,
                 applied_title: None,
+                launch: None,
+                branch: None,
                 payload,
             };
             st.apply(&env, &mut fx);
@@ -661,6 +669,8 @@ mod tests {
             pid: None,
             remote_id: None,
             applied_title: None,
+            launch: None,
+            branch: None,
             payload: json!({"session_id": SID, "hook_event_name": "Stop",
                 "last_assistant_message": "All done."}),
         };
@@ -683,6 +693,43 @@ mod tests {
             0,
         );
         assert!(elsewhere.notes(&st, &HashMap::new(), 5_000).is_empty());
+    }
+
+    #[test]
+    fn launched_background_sessions_notify_when_finished() {
+        let mut st = state_with_prompt(2_000);
+        let mut fx = Effects::default();
+        let poll = |st: &mut State, fx: &mut Effects| {
+            st.agents(
+                &[crate::state::AgentEntry {
+                    session_id: SID.into(),
+                    kind: Some("background".into()),
+                    ..Default::default()
+                }],
+                3_000,
+                fx,
+            );
+        };
+        poll(&mut st, &mut fx);
+        let stop = Envelope {
+            v: 1,
+            source: Source::Hook,
+            ts: 4_000,
+            pid: None,
+            remote_id: None,
+            applied_title: None,
+            launch: None,
+            branch: None,
+            payload: json!({"session_id": SID, "hook_event_name": "Stop",
+                "last_assistant_message": "Done."}),
+        };
+        st.apply(&stop, &mut fx);
+        assert!(composer().notes(&st, &HashMap::new(), 5_000).is_empty());
+        assert!(st.set_launched(SID, &mut fx));
+        let notes = composer().notes(&st, &HashMap::new(), 5_000);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].content.title.starts_with("Finished: "));
+        assert_eq!(notes[0].content.body, "Done.");
     }
 
     /// Serves one canned response and returns the raw request.

@@ -59,19 +59,28 @@
 	});
 
 	let tabs = $state<HTMLElement | null>(null);
+	/** Tabs hidden past the right edge: the row fades there. */
+	let more = $state(false);
+	const measure = () => {
+		if (tabs) more = tabs.scrollLeft + tabs.clientWidth < tabs.scrollWidth - 2;
+	};
 	$effect(() => {
 		void section;
 		tabs
 			?.querySelector('[aria-current="page"]')
 			?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+		requestAnimationFrame(measure);
 	});
 </script>
 
+<svelte:window onresize={measure} />
+
 <div class="mx-auto flex max-w-6xl flex-col gap-3 p-3 sm:p-4">
 	<nav
-		class="-mx-3 overflow-x-auto px-3 sm:mx-0 sm:px-0"
+		class="-mx-3 overflow-x-auto px-3 sm:mx-0 sm:px-0 {more ? 'mask-r-from-85%' : ''}"
 		aria-label="Analytics section"
 		bind:this={tabs}
+		onscroll={measure}
 	>
 		<div class="inline-flex w-fit gap-0.5 rounded-lg bg-muted p-[3px] text-sm whitespace-nowrap">
 			{#each SECTIONS as [id, label] (id)}

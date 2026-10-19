@@ -11,14 +11,16 @@ use crate::state::Window;
 use crate::{
     ask::Answer,
     knowledge::{Hit, Note, NoteOp, NoteView, Query, Upsert, Written},
-    model::{Claim, RateLimits, ScopedLimit, Session, Update},
+    model::{Claim, Kind, RateLimits, ScopedLimit, Session, Update},
     state::{AgentEntry, NiriEvent, ProcPoll},
     wire::Envelope,
 };
 
-/// 3: session messages (`Tell` stores, `Injected` acknowledges), claims
-/// (`Claim`, `Release`, `Reply::Claimed`), `inbox` and `claim` on sessions.
-pub const VERSION: u32 = 3;
+/// 4: sessions started, stopped and opened from the panel (`Launch`,
+/// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
+/// on sessions, `branch` on agents entries and envelopes, `launch` on
+/// envelopes.
+pub const VERSION: u32 = 4;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,21 @@ pub enum ToHub {
     /// sent, so the messages delivered in it were read.
     Injected {
         session: String,
+    },
+    /// What `claude --bg` made of launch `launch`: the id it printed, or
+    /// why it failed.
+    Launched {
+        launch: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// Stopping `session` went through (`claude stop` or SIGTERM), or not.
+    Stopped {
+        session: String,
+        #[serde(default)]
+        error: Option<String>,
     },
 }
 
@@ -282,6 +299,32 @@ pub enum ToCollector {
     NoteChanged {
         note: Box<Note>,
     },
+    /// Starts a background session in `cwd` with `prompt` (`claude --bg`),
+    /// or continues session `resume`; answered by `Launched`. The hooks of
+    /// the new session carry `launch` in their envelopes.
+    Launch {
+        launch: String,
+        cwd: String,
+        prompt: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        permission_mode: Option<String>,
+        #[serde(default)]
+        resume: Option<String>,
+    },
+    /// Stops a running session: `claude stop` for a background one,
+    /// SIGTERM to `pid` for an interactive one; answered by `Stopped`.
+    Stop {
+        session: String,
+        pid: Option<u32>,
+        kind: Kind,
+    },
+    /// Focuses the session's window, or attaches to a background session
+    /// (what `ccdash open` does on that host).
+    Open {
+        session: String,
+    },
 }
 
 #[cfg(test)]
@@ -396,6 +439,34 @@ mod tests {
         assert!(
             matches!(back, ToHub::Queued { call: Call::Claim { ref paths, .. }, .. } if paths == &["src"])
         );
+        let launched: ToHub =
+            serde_json::from_str(r#"{"type":"launched","launch":"l","session":"9c4719e5"}"#)
+                .unwrap();
+        assert!(
+            matches!(launched, ToHub::Launched { ref session, error: None, .. } if session.as_deref() == Some("9c4719e5"))
+        );
+        assert!(!launched.durable());
+        let launch = ToCollector::Launch {
+            launch: "l".into(),
+            cwd: "/w/p".into(),
+            prompt: "hi".into(),
+            model: None,
+            permission_mode: Some("plan".into()),
+            resume: None,
+        };
+        let text = serde_json::to_string(&launch).unwrap();
+        assert!(text.starts_with(r#"{"type":"launch""#), "{text}");
+        let stop: ToCollector =
+            serde_json::from_str(r#"{"type":"stop","session":"s","pid":7,"kind":"background"}"#)
+                .unwrap();
+        assert!(matches!(
+            stop,
+            ToCollector::Stop {
+                pid: Some(7),
+                kind: Kind::Background,
+                ..
+            }
+        ));
         let injected: ToHub = serde_json::from_str(r#"{"type":"injected","session":"s"}"#).unwrap();
         assert!(matches!(injected, ToHub::Injected { ref session } if session == "s"));
         assert!(!injected.durable());

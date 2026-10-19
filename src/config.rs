@@ -37,6 +37,7 @@ pub struct CollectorConfig {
     pub niri: Niri,
     pub procs: Procs,
     pub attach: Attach,
+    pub launch: Launch,
     pub telemetry: Telemetry,
     pub usage: Usage,
     pub queue: Queue,
@@ -170,6 +171,19 @@ pub struct Attach {
     pub command: Vec<String>,
 }
 
+/// Sessions the panel starts, continues and stops on this machine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Launch {
+    /// The Claude Code executable and any leading arguments (never
+    /// `--settings`: ccdash passes its own); ccdash adds `--bg`, the model,
+    /// the permission mode, `--resume`, `--channels plugin:ccdash@inline`
+    /// and the prompt. Empty turns starting sessions from the panel off.
+    pub command: Vec<String>,
+    /// Stops a background session; `{id}` is replaced with its short id.
+    pub stop: Vec<String>,
+}
+
 /// Polls Claude Code's `/usage` report for the per-model weekly limits the
 /// statusline doesn't carry, such as Fable's.
 #[derive(Debug, Clone, Deserialize)]
@@ -202,7 +216,8 @@ pub struct Notify {
     pub permissions: bool,
     pub questions: bool,
     pub plans: bool,
-    /// Finished turns of interactive sessions.
+    /// Finished turns of interactive sessions and of sessions started
+    /// from the panel ("Finished").
     pub turns: bool,
     /// Workspace names to notify for; empty notifies for every session.
     pub workspaces: Vec<String>,
@@ -337,6 +352,15 @@ impl Default for Attach {
     }
 }
 
+impl Default for Launch {
+    fn default() -> Self {
+        Self {
+            command: vec!["claude".into()],
+            stop: ["claude", "stop", "{id}"].map(String::from).to_vec(),
+        }
+    }
+}
+
 impl Default for Store {
     fn default() -> Self {
         Self {
@@ -428,6 +452,10 @@ mod tests {
         assert_eq!(collector.hub.url, "wss://h/collect");
         assert_eq!(collector.agents.interval_secs, 9);
         assert!(collector.niri.enable);
+        assert_eq!(collector.launch.command, ["claude"]);
+        let off: CollectorConfig = toml::from_str("[launch]\ncommand = []\n").unwrap();
+        assert!(off.launch.command.is_empty());
+        assert_eq!(off.launch.stop, ["claude", "stop", "{id}"]);
     }
 
     #[test]

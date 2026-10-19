@@ -1,5 +1,6 @@
 // Preferences that stay on the device: theme and colour scheme, the
-// sidebar, the board grid, composer drafts, quick replies and templates.
+// sidebar, the board grid, composer drafts, quick replies and templates,
+// the last host, model and permission mode a session was started with.
 
 import { browser } from '$app/env';
 
@@ -12,6 +13,7 @@ const GRID_KEY = 'ccdash.grid';
 const QUICK_KEY = 'ccdash.quick';
 const TEMPLATES_KEY = 'ccdash.templates';
 const DRAFT_KEY = 'ccdash.draft.';
+const START_KEY = 'ccdash.start';
 
 export const DEFAULT_QUICK = [
 	'Continue',
@@ -22,6 +24,9 @@ export const DEFAULT_QUICK = [
 ];
 
 export type Template = { name: string; text: string };
+
+/** What the start sheet picked last; empty strings are the host's defaults. */
+export type StartChoice = { host: string; model: string; mode: string };
 
 /** Colour schemes: shadcn's neutral one, and ccdash's own (a draft to iterate on). */
 export type Scheme = 'neutral' | 'ccdash';
@@ -51,6 +56,7 @@ class Prefs {
 	grid = $state<boolean>(browser && localStorage.getItem(GRID_KEY) === 'on');
 	quick = $state<string[]>(load(QUICK_KEY, DEFAULT_QUICK));
 	templates = $state<Template[]>(load(TEMPLATES_KEY, []));
+	start = $state<StartChoice>(load(START_KEY, { host: '', model: '', mode: '' }));
 
 	setTheme(theme: Theme) {
 		this.theme = theme;
@@ -97,6 +103,11 @@ class Prefs {
 	setTemplates(list: Template[]) {
 		this.templates = list.filter((t) => t.name.trim() && t.text.trim());
 		localStorage.setItem(TEMPLATES_KEY, JSON.stringify(this.templates));
+	}
+
+	setStart(choice: StartChoice) {
+		this.start = choice;
+		localStorage.setItem(START_KEY, JSON.stringify(choice));
 	}
 
 	draft(session: string): string {

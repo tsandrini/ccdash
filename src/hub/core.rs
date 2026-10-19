@@ -17,7 +17,8 @@ use crate::{
     knowledge::{self, Query},
     messages,
     model::{
-        Activity, Ask, HostStatus, Message, RateLimits, ScopedLimit, Session, Snapshot, Update,
+        Activity, Ask, HostStatus, Launch, LaunchState, Message, RateLimits, ScopedLimit, Session,
+        Snapshot, Update,
     },
     notify::{Composer, Note},
     paths,
@@ -33,6 +34,10 @@ const MAX_TITLE: usize = 100;
 const MAX_REPLY: usize = 20_000;
 const GONE: &str = "that prompt is no longer open";
 const MINUTE_MS: i64 = 60_000;
+/// A launch the session has not reported for within this fails.
+const LAUNCH_WAIT_MS: i64 = 2 * MINUTE_MS;
+/// Launches are kept this long for `GET /launches/{id}`.
+const LAUNCH_KEEP_MS: i64 = 15 * MINUTE_MS;
 
 /// What a collector reports about its host.
 pub enum Input {
@@ -142,6 +147,62 @@ pub enum Cmd {
     },
     /// The daily lifecycle pass.
     Reflect,
+    /// Starts (or continues) a session; replies with the launch.
+    Launch {
+        req: LaunchReq,
+        reply: oneshot::Sender<Result<Launch, String>>,
+    },
+    /// The launch with this id, while the hub keeps it.
+    LaunchOf(String, oneshot::Sender<Option<Launch>>),
+    /// What `claude --bg` on `host` made of a launch.
+    Launched {
+        host: String,
+        launch: String,
+        session: Option<String>,
+        error: Option<String>,
+    },
+    /// Stops the session `key` names; replies once its host has.
+    Stop {
+        key: String,
+        reply: oneshot::Sender<Result<Session, String>>,
+    },
+    Stopped {
+        host: String,
+        session: String,
+        error: Option<String>,
+    },
+    /// Marks the session `key` names gone (a ghost, an offline host).
+    Forget {
+        key: String,
+        reply: oneshot::Sender<Result<Session, String>>,
+    },
+    /// Focuses or attaches the session `key` names on its host.
+    Open {
+        key: String,
+        reply: oneshot::Sender<Result<Session, String>>,
+    },
+}
+
+/// A session to start, with the directory already resolved from a known
+/// workspace and project.
+#[derive(Debug, Clone)]
+pub struct LaunchReq {
+    pub host: String,
+    pub workspace: String,
+    pub project: Option<String>,
+    pub cwd: String,
+    pub prompt: String,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub resume: Option<String>,
+}
+
+/// A launch and what the hub needs to finish it.
+struct Slot {
+    launch: Launch,
+    cwd: String,
+    /// The id `claude --bg` printed, until the session shows up.
+    short: Option<String>,
 }
 
 /// What answering an open ask needs and the session doesn't show.
@@ -205,6 +266,8 @@ impl Hub {
             knowledge,
             tool_output_bytes,
             cmds: tx.clone(),
+            launches: HashMap::new(),
+            stops: HashMap::new(),
         };
         tokio::spawn(run(core, rx));
         Self { tx, updates }
@@ -292,6 +355,28 @@ impl Hub {
         self.send(Cmd::Resolve(key.to_owned(), tx)).await?;
         rx.await.context("hub stopped")
     }
+
+    pub async fn launch(&self, req: LaunchReq) -> Result<Result<Launch, String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Launch { req, reply }).await?;
+        rx.await.context("hub stopped")
+    }
+
+    pub async fn launch_of(&self, id: &str) -> Result<Option<Launch>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::LaunchOf(id.to_owned(), tx)).await?;
+        rx.await.context("hub stopped")
+    }
+
+    /// Sends a session command (`Stop`, `Forget`, `Open`) and waits for it.
+    pub async fn session_cmd(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<Session, String>>) -> Cmd,
+    ) -> Result<Result<Session, String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(make(reply)).await?;
+        rx.await.context("hub stopped")
+    }
 }
 
 struct Core {
@@ -320,6 +405,10 @@ struct Core {
     tool_output_bytes: usize,
     /// For tasks that finish a knowledge call and report back.
     cmds: mpsc::Sender<Cmd>,
+    /// Sessions the panel asked to start, by launch id.
+    launches: HashMap<String, Slot>,
+    /// Who waits for a session's host to report its stop.
+    stops: HashMap<String, Vec<oneshot::Sender<Result<Session, String>>>>,
 }
 
 /// The session behind a knowledge call, placed in its workspace.
@@ -367,8 +456,16 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                 let Some(state) = core.states.get_mut(&host) else {
                     continue;
                 };
+                let mut nonce = None;
                 match input {
-                    Input::Envelope(env) => state.apply(&env, &mut fx),
+                    Input::Envelope(env) => {
+                        state.apply(&env, &mut fx);
+                        if let (Some(launch), Some(id)) =
+                            (&env.launch, env.payload["session_id"].as_str())
+                        {
+                            nonce = Some((launch.clone(), id.to_owned()));
+                        }
+                    }
                     Input::Agents(list, now, dead) => {
                         state.report_dead(&dead);
                         state.agents(&list, now, &mut fx);
@@ -388,8 +485,13 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                     }
                 }
                 core.flush(&host, fx);
+                if let Some((launch, session)) = nonce {
+                    core.link(&host, &launch, &session);
+                }
+                core.link_printed(&host);
             }
             Cmd::Tick(now) => {
+                core.expire_launches(now);
                 let hosts: Vec<String> = core.states.keys().cloned().collect();
                 for host in hosts {
                     let mut fx = Effects::default();
@@ -476,6 +578,35 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             Cmd::NotesChanged { notes } => core.notes_changed(notes),
             Cmd::NotesResync { workspace } => core.notes_resync(workspace),
             Cmd::Reflect => core.reflect(),
+            Cmd::Launch { req, reply } => {
+                let _ = reply.send(core.launch(req));
+            }
+            Cmd::LaunchOf(id, reply) => {
+                let _ = reply.send(core.launches.get(&id).map(|s| s.launch.clone()));
+            }
+            Cmd::Launched {
+                host,
+                launch,
+                session,
+                error,
+            } => core.launched(&host, &launch, session, error),
+            Cmd::Stop { key, reply } => match core.stop(&key) {
+                Ok(id) => core.stops.entry(id).or_default().push(reply),
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+            Cmd::Stopped {
+                host,
+                session,
+                error,
+            } => core.stopped(&host, &session, error),
+            Cmd::Forget { key, reply } => {
+                let _ = reply.send(core.forget(&key));
+            }
+            Cmd::Open { key, reply } => {
+                let _ = reply.send(core.open(&key));
+            }
         }
     }
 }
@@ -1251,12 +1382,260 @@ impl Core {
         Ok(Reply::Claimed(claim))
     }
 
+    /// Asks `req.host` to start the session and keeps the launch until
+    /// the session reports (its hooks carry the launch id) or it fails.
+    fn launch(&mut self, req: LaunchReq) -> Result<Launch, String> {
+        if !self.links.contains_key(&req.host) {
+            return Err(format!("{} is not connected", req.host));
+        }
+        let id = util::random_hex(16).map_err(|e| format!("{e:#}"))?;
+        let launch = Launch {
+            id: id.clone(),
+            host: req.host.clone(),
+            workspace: req.workspace,
+            project: req.project,
+            resume: req.resume.clone(),
+            at: now_ms(),
+            state: LaunchState::Pending,
+        };
+        info!(
+            "launch {id} on {}: {}{}",
+            req.host,
+            req.cwd,
+            req.resume
+                .as_deref()
+                .map(|r| format!(", continuing {r}"))
+                .unwrap_or_default()
+        );
+        self.tell(
+            &req.host,
+            ToCollector::Launch {
+                launch: id.clone(),
+                cwd: req.cwd.clone(),
+                prompt: req.prompt,
+                model: req.model,
+                permission_mode: req.permission_mode,
+                resume: req.resume,
+            },
+        );
+        self.launches.insert(
+            id,
+            Slot {
+                launch: launch.clone(),
+                cwd: req.cwd,
+                short: None,
+            },
+        );
+        let _ = self.updates.send(Update::Launch {
+            launch: launch.clone(),
+        });
+        Ok(launch)
+    }
+
+    fn launched(
+        &mut self,
+        host: &str,
+        launch: &str,
+        session: Option<String>,
+        error: Option<String>,
+    ) {
+        let Some(slot) = self
+            .launches
+            .get_mut(launch)
+            .filter(|s| s.launch.host == host && s.launch.state == LaunchState::Pending)
+        else {
+            return;
+        };
+        match (session, error) {
+            (_, Some(error)) => self.settle(launch, LaunchState::Failed { error }),
+            (Some(short), None) => {
+                slot.short = Some(short);
+                self.link_printed(host);
+            }
+            (None, None) => self.settle(
+                launch,
+                LaunchState::Failed {
+                    error: "claude --bg reported nothing".into(),
+                },
+            ),
+        }
+    }
+
+    /// The session behind a pending launch reported: flag it and settle.
+    fn link(&mut self, host: &str, launch: &str, session: &str) {
+        let pending = self
+            .launches
+            .get(launch)
+            .is_some_and(|s| s.launch.host == host && s.launch.state == LaunchState::Pending);
+        if !pending {
+            return;
+        }
+        let mut fx = Effects::default();
+        let known = self
+            .states
+            .get_mut(host)
+            .is_some_and(|st| st.set_launched(session, &mut fx));
+        self.flush(host, fx);
+        if known {
+            self.settle(
+                launch,
+                LaunchState::Started {
+                    session: session.to_owned(),
+                },
+            );
+        }
+    }
+
+    /// Links pending launches on `host` whose printed id names a live
+    /// session (for a session whose hooks did not carry the launch).
+    fn link_printed(&mut self, host: &str) {
+        let Some(state) = self.states.get(host) else {
+            return;
+        };
+        let found: Vec<(String, String)> = self
+            .launches
+            .iter()
+            .filter(|(_, s)| s.launch.host == host && s.launch.state == LaunchState::Pending)
+            .filter_map(|(id, slot)| {
+                let short = slot.short.as_deref()?;
+                // NOTE: a continued session may come back as a copy under a new id
+                let session = state.sessions().find(|s| {
+                    s.activity != Activity::Gone
+                        && (s.short_id.as_deref() == Some(short) || s.id.starts_with(short))
+                })?;
+                Some((id.clone(), session.id.clone()))
+            })
+            .collect();
+        for (launch, session) in found {
+            self.link(host, &launch, &session);
+        }
+    }
+
+    fn settle(&mut self, launch: &str, state: LaunchState) {
+        let Some(slot) = self.launches.get_mut(launch) else {
+            return;
+        };
+        if let LaunchState::Failed { error } = &state {
+            warn!("launch {launch} in {}: {error}", slot.cwd);
+        }
+        slot.launch.state = state;
+        let _ = self.updates.send(Update::Launch {
+            launch: slot.launch.clone(),
+        });
+    }
+
+    /// Fails launches the session never reported for; forgets old ones.
+    fn expire_launches(&mut self, now: i64) {
+        let late: Vec<(String, Option<String>)> = self
+            .launches
+            .iter()
+            .filter(|(_, s)| {
+                s.launch.state == LaunchState::Pending && now - s.launch.at > LAUNCH_WAIT_MS
+            })
+            .map(|(id, s)| (id.clone(), s.short.clone()))
+            .collect();
+        for (id, short) in late {
+            let error = match short {
+                Some(short) => format!("started as {short}, but the session never reported"),
+                None => "the host did not answer".into(),
+            };
+            self.settle(&id, LaunchState::Failed { error });
+        }
+        self.launches
+            .retain(|_, s| now - s.launch.at <= LAUNCH_KEEP_MS);
+    }
+
+    /// The live session `key` names on a connected host, with its host.
+    fn running(&self, key: &str) -> Result<(String, Session), String> {
+        let (host, s) = self
+            .resolve(key)
+            .ok_or_else(|| format!("no session matches {key:?}"))?;
+        if s.activity == Activity::Gone {
+            return Err("the session has ended".into());
+        }
+        if !self.links.contains_key(host) {
+            return Err(format!("{host} is not connected"));
+        }
+        Ok((host.to_owned(), s.clone()))
+    }
+
+    /// Asks the session's host to stop it; the session id to answer under.
+    fn stop(&mut self, key: &str) -> Result<String, String> {
+        let (host, s) = self.running(key)?;
+        info!("stopping {} on {host}", s.id);
+        self.tell(
+            &host,
+            ToCollector::Stop {
+                session: s.id.clone(),
+                pid: s.pid,
+                kind: s.kind,
+            },
+        );
+        Ok(s.id)
+    }
+
+    fn stopped(&mut self, host: &str, session: &str, error: Option<String>) {
+        let current = self
+            .states
+            .get(host)
+            .and_then(|st| st.session(session))
+            .cloned();
+        for reply in self.stops.remove(session).unwrap_or_default() {
+            let result = match (&error, &current) {
+                (Some(e), _) => Err(e.clone()),
+                (None, Some(s)) => Ok(s.clone()),
+                (None, None) => Err("the session vanished".into()),
+            };
+            let _ = reply.send(result);
+        }
+    }
+
+    fn forget(&mut self, key: &str) -> Result<Session, String> {
+        let (host, id) = self
+            .resolve(key)
+            .map(|(host, s)| (host.to_owned(), s.id.clone()))
+            .ok_or_else(|| format!("no session matches {key:?}"))?;
+        info!("forgetting {id} on {host}");
+        let mut fx = Effects::default();
+        let state = self.states.get_mut(&host).ok_or("session vanished")?;
+        state.forget(&id, now_ms(), &mut fx);
+        let session = state.session(&id).cloned().ok_or("session vanished")?;
+        self.flush(&host, fx);
+        Ok(session)
+    }
+
+    fn open(&mut self, key: &str) -> Result<Session, String> {
+        let (host, s) = self.running(key)?;
+        self.tell(
+            &host,
+            ToCollector::Open {
+                session: s.id.clone(),
+            },
+        );
+        Ok(s)
+    }
+
     fn collector_closed(&mut self, host: &str, conn: u64) {
         if self.links.get(host).is_none_or(|l| l.conn != conn) {
             return;
         }
         info!("collector {host} disconnected");
         self.links.remove(host);
+        let waiting: Vec<String> = self
+            .stops
+            .keys()
+            .filter(|id| {
+                self.states
+                    .get(host)
+                    .is_some_and(|st| st.session(id).is_some())
+            })
+            .cloned()
+            .collect();
+        for id in waiting {
+            for reply in self.stops.remove(&id).unwrap_or_default() {
+                let _ = reply.send(Err(format!("{host} disconnected")));
+            }
+        }
         if let Some(status) = self.hosts.get_mut(host) {
             status.connected = false;
             status.since = now_ms();
@@ -1726,4 +2105,235 @@ fn inject(
         }
     };
     Ok((text, delivered))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        model::Kind,
+        wire::{Envelope, Source},
+    };
+
+    fn envelope(source: Source, launch: Option<&str>, payload: Value) -> Envelope {
+        Envelope {
+            v: 1,
+            source,
+            ts: now_ms(),
+            pid: Some(std::process::id()),
+            remote_id: None,
+            applied_title: None,
+            launch: launch.map(str::to_owned),
+            branch: Some("main".into()),
+            payload,
+        }
+    }
+
+    /// The next message of a kind the test waits for, skipping the rest.
+    async fn next(
+        rx: &mut mpsc::Receiver<ToCollector>,
+        want: impl Fn(&ToCollector) -> bool,
+    ) -> ToCollector {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a message for the collector")
+                .expect("link open");
+            if want(&msg) {
+                return msg;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launches_link_their_session_and_stops_answer() {
+        let dir = std::env::temp_dir().join(format!("ccdash-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("t.db"), 30).unwrap();
+        let hub = Hub::spawn(
+            "hub".into(),
+            "http://hub".into(),
+            Workspaces::new(&["/w".into()], "/home"),
+            store,
+            None,
+            KnowledgeCfg::default(),
+            0,
+        );
+        let req = |resume: Option<&str>| LaunchReq {
+            host: "navi".into(),
+            workspace: "w".into(),
+            project: Some("p".into()),
+            cwd: "/w/p".into(),
+            prompt: "go".into(),
+            model: None,
+            permission_mode: Some("plan".into()),
+            resume: resume.map(str::to_owned),
+        };
+        assert!(
+            hub.launch(req(None)).await.unwrap().is_err(),
+            "offline host"
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        hub.send(Cmd::CollectorOpen {
+            host: "navi".into(),
+            conn: 1,
+            terminals: Vec::new(),
+            tx,
+        })
+        .await
+        .unwrap();
+        let first = hub.launch(req(None)).await.unwrap().unwrap();
+        assert_eq!(first.state, LaunchState::Pending);
+        let sent = next(&mut rx, |m| matches!(m, ToCollector::Launch { .. })).await;
+        assert!(
+            matches!(sent, ToCollector::Launch { ref launch, ref cwd, .. }
+            if launch == &first.id && cwd == "/w/p")
+        );
+
+        // the session's hooks carry the launch id
+        let sid = "9c4719e5-9508-461b-b1f4-e7b5a4c26f9d";
+        let start = envelope(
+            Source::Hook,
+            Some(&first.id),
+            json!({"session_id": sid, "cwd": "/w/p", "hook_event_name": "SessionStart"}),
+        );
+        hub.send(Cmd::Input("navi".into(), Input::Envelope(start)))
+            .await
+            .unwrap();
+        let started = hub.launch_of(&first.id).await.unwrap().unwrap();
+        assert_eq!(
+            started.state,
+            LaunchState::Started {
+                session: sid.into()
+            }
+        );
+        let session = hub.resolve(sid).await.unwrap().unwrap();
+        assert!(session.launched);
+
+        // a session whose hooks lack the id: linked through the printed one
+        let second = hub.launch(req(None)).await.unwrap().unwrap();
+        hub.send(Cmd::Launched {
+            host: "navi".into(),
+            launch: second.id.clone(),
+            session: Some("aaaabbbb".into()),
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            hub.launch_of(&second.id).await.unwrap().unwrap().state,
+            LaunchState::Pending
+        );
+        let poll_again = || AgentEntry {
+            session_id: "aaaabbbb-0000-4000-8000-000000000000".into(),
+            id: Some("aaaabbbb".into()),
+            cwd: Some("/w/p".into()),
+            kind: Some("background".into()),
+            pid: Some(std::process::id()),
+            branch: Some("feat".into()),
+            ..AgentEntry::default()
+        };
+        let poll = poll_again();
+        hub.send(Cmd::Input(
+            "navi".into(),
+            Input::Agents(vec![poll], now_ms(), Vec::new()),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            hub.launch_of(&second.id).await.unwrap().unwrap().state,
+            LaunchState::Started { ref session } if session.starts_with("aaaabbbb")
+        ));
+        let bg = hub.resolve("aaaabbbb").await.unwrap().unwrap();
+        assert_eq!(
+            (bg.kind, bg.branch.as_deref()),
+            (Kind::Background, Some("feat"))
+        );
+
+        let third = hub.launch(req(None)).await.unwrap().unwrap();
+        hub.send(Cmd::Launched {
+            host: "navi".into(),
+            launch: third.id.clone(),
+            session: None,
+            error: Some("not trusted".into()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            hub.launch_of(&third.id).await.unwrap().unwrap().state,
+            LaunchState::Failed {
+                error: "not trusted".into()
+            }
+        );
+
+        // continued as a copy under a new id: the printed id names it
+        let copy = hub.launch(req(Some(sid))).await.unwrap().unwrap();
+        hub.send(Cmd::Launched {
+            host: "navi".into(),
+            launch: copy.id.clone(),
+            session: Some("cccc0000".into()),
+            error: None,
+        })
+        .await
+        .unwrap();
+        let polled = AgentEntry {
+            session_id: "cccc0000-0000-4000-8000-000000000000".into(),
+            id: Some("cccc0000".into()),
+            kind: Some("background".into()),
+            pid: Some(std::process::id()),
+            ..AgentEntry::default()
+        };
+        hub.send(Cmd::Input(
+            "navi".into(),
+            Input::Agents(vec![poll_again(), polled], now_ms(), Vec::new()),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            hub.launch_of(&copy.id).await.unwrap().unwrap().state,
+            LaunchState::Started { ref session } if session.starts_with("cccc0000")
+        ));
+
+        // stop: the host is asked, the request answers with its report
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                hub.session_cmd(|reply| Cmd::Stop {
+                    key: "aaaabbbb".into(),
+                    reply,
+                })
+                .await
+                .unwrap()
+            })
+        };
+        let stop = next(&mut rx, |m| matches!(m, ToCollector::Stop { .. })).await;
+        assert!(
+            matches!(stop, ToCollector::Stop { kind: Kind::Background, ref session, .. }
+            if session.starts_with("aaaabbbb"))
+        );
+        hub.send(Cmd::Stopped {
+            host: "navi".into(),
+            session: bg.id.clone(),
+            error: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(waiting.await.unwrap().unwrap().id, bg.id);
+
+        let forgotten = hub
+            .session_cmd(|reply| Cmd::Forget {
+                key: sid.into(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgotten.activity, Activity::Gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

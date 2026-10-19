@@ -3,7 +3,13 @@
 // session changes.
 
 import { Unauthorized } from '#lib/api/client.js';
-import { fetchSession, type Exchange, type Message, type Stats } from '#lib/api/index.js';
+import {
+	fetchSession,
+	type Exchange,
+	type Message,
+	type Session,
+	type Stats
+} from '#lib/api/index.js';
 import { live } from '#lib/live/store.svelte.js';
 
 export const PAGE = 10;
@@ -19,6 +25,8 @@ export class Convo {
 	loading = $state(false);
 	/** True when the session is unknown to the hub. */
 	missing = $state(false);
+	/** The session as the page fetched it: an ended one comes from history. */
+	session = $state<Session | null>(null);
 	/** Bumped when a load changed the exchanges, for scroll handling. */
 	changed = $state<{ mode: Mode; n: number }>({ mode: 'initial', n: 0 });
 	#timer: ReturnType<typeof setTimeout> | null = null;
@@ -52,7 +60,12 @@ export class Convo {
 		} finally {
 			this.loading = false;
 		}
-		if (page.session) live.put(page.session);
+		if (page.session) {
+			this.session = page.session;
+			// NOTE: an ended session from history stays out of the live lists
+			if (page.session.activity !== 'gone' || live.sessions.has(page.session.id))
+				live.put(page.session);
+		}
 		const conv = page.conversation;
 		if (mode === 'older') {
 			this.exchanges = [...conv.exchanges, ...this.exchanges];

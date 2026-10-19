@@ -245,6 +245,13 @@ pub struct Session {
     /// The project inside the workspace: the repo directory `cwd` is in.
     #[serde(default)]
     pub project: Option<String>,
+    /// The git branch of `cwd` (a detached `HEAD` as a short hash), read
+    /// by the collector.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Started (or continued) from the panel: a finished turn notifies.
+    #[serde(default)]
+    pub launched: bool,
     /// Name from `claude agents`.
     pub name: Option<String>,
     /// Conversation title from the statusline (also the window title).
@@ -294,8 +301,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// An idle interactive session with nothing reported yet, for tests.
-    #[cfg(test)]
+    /// An idle interactive session with nothing reported yet.
     pub fn stub(host: &str, id: &str, cwd: &str) -> Self {
         Self {
             host: host.into(),
@@ -307,6 +313,8 @@ impl Session {
             cwd: cwd.into(),
             workspace: None,
             project: None,
+            branch: None,
+            launched: false,
             name: None,
             title: None,
             activity: Activity::Idle,
@@ -426,5 +434,40 @@ pub enum Update {
     /// Notes of `workspace` changed; the panel reloads what it shows.
     Notes {
         workspace: String,
+    },
+    /// A session started from the panel moved on.
+    Launch {
+        launch: Launch,
+    },
+}
+
+/// A session the panel asked a host to start (or continue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct Launch {
+    pub id: String,
+    pub host: String,
+    pub workspace: String,
+    pub project: Option<String>,
+    /// The session continued, for a resume (Claude Code may continue it
+    /// as a copy under a new id: `state` names the one that runs).
+    pub resume: Option<String>,
+    pub at: i64,
+    #[serde(flatten)]
+    pub state: LaunchState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchState {
+    /// Sent to the host; the session has not reported yet.
+    Pending,
+    /// The session is running; its page opens under this id.
+    Started {
+        session: String,
+    },
+    Failed {
+        error: String,
     },
 }

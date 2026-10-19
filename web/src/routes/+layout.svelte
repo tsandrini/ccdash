@@ -22,6 +22,7 @@
 	import NotePanel from '#lib/components/notes/NotePanel.svelte';
 	import RangePicker from '#lib/components/app/RangePicker.svelte';
 	import ScopeChips from '#lib/components/app/ScopeChips.svelte';
+	import StartSheet from '#lib/components/app/StartSheet.svelte';
 	import ThemeToggle from '#lib/components/app/ThemeToggle.svelte';
 	import { setToken } from '#lib/api/client.js';
 	import { live } from '#lib/live/store.svelte.js';
@@ -164,3 +165,4 @@
 <LoginDialog />
 <CommandPalette />
 <NotePanel />
+<StartSheet />

@@ -299,7 +299,7 @@ mod tests {
         .unwrap();
         assert!(load(&conn, "s", 1_000).unwrap().is_some());
         conn.execute(
-            "INSERT INTO sessions VALUES ('s', 'h', '/a', NULL, NULL, 'interactive', 0, 5)",
+            "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES ('s', 'h', '/a', NULL, NULL, 'interactive', 0, 5)",
             [],
         )
         .unwrap();

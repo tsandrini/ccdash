@@ -117,6 +117,8 @@ mod tests {
                 pid: None,
                 remote_id: None,
                 applied_title: None,
+                launch: None,
+                branch: None,
                 payload: json!({ "n": n }),
             },
         }

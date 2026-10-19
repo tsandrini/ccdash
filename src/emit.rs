@@ -133,6 +133,10 @@ pub fn envelope(source: Source, payload: Value, applied_title: Option<String>) -
             .ok()
             .filter(|id| !id.is_empty()),
         applied_title,
+        launch: std::env::var("CCDASH_LAUNCH")
+            .ok()
+            .filter(|id| paths::plain_session_id(id)),
+        branch: None,
         payload,
     }
 }

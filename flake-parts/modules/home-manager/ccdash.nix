@@ -20,6 +20,7 @@ let
     mkMerge
     mkOption
     optionalAttrs
+    optionals
     optionalString
     types
     ;
@@ -70,6 +71,7 @@ let
   };
 
   channel = cfg.claudeCode.channel;
+  pluginDir = "${cfg.package}/share/ccdash/claude-plugin";
   # NOTE: `claude <subcommand>` parsers reject the channel flags (`rc` included)
   claudeWrapper = pkgs.writeShellScriptBin "claude" ''
     real=${getExe claudeCode.package}
@@ -87,7 +89,7 @@ let
     done
     exec "$real" ${
       if channel.devFlag then "--dangerously-load-development-channels" else "--channels"
-    } plugin:ccdash@inline --plugin-dir ${cfg.package}/share/ccdash/claude-plugin "$@"
+    } plugin:ccdash@inline --plugin-dir ${pluginDir} "$@"
   '';
 in
 {
@@ -178,7 +180,8 @@ in
           replying to sessions from ccdash, through a Claude Code channel.
           Puts a `claude` wrapper first in `PATH` that starts interactive
           sessions with `--channels plugin:ccdash@inline --plugin-dir …`; subcommands,
-          `-p` and `--bg` run unchanged. Claude Code only loads the channel
+          `-p` and `--bg` run unchanged (sessions started from the panel get
+          the plugin through `[launch] command`). Claude Code only loads the channel
           when it is allowlisted (the NixOS module's
           {option}`programs.ccdash.channel.allow`) or with
           {option}`devFlag`
@@ -260,13 +263,30 @@ in
       };
     }
     (mkIf (claudeCode.enable && claudeCode.package != null) {
-      services.ccdash.settings.agents.command = mkDefault [
-        (getExe claudeCode.package)
-        "agents"
-        "--json"
-      ];
-      # NOTE: the real binary, not the channel wrapper; ccdash adds `-p /usage`
-      services.ccdash.settings.usage.command = mkDefault [ (getExe claudeCode.package) ];
+      services.ccdash.settings = {
+        agents.command = mkDefault [
+          (getExe claudeCode.package)
+          "agents"
+          "--json"
+        ];
+        # NOTE: the real binary, not the channel wrapper; ccdash adds `-p /usage`
+        usage.command = mkDefault [ (getExe claudeCode.package) ];
+        # NOTE: the wrapper passes `--bg` through without the plugin; ccdash adds `--channels`
+        launch = {
+          command = mkDefault (
+            [ (getExe claudeCode.package) ]
+            ++ optionals channel.enable [
+              "--plugin-dir"
+              pluginDir
+            ]
+          );
+          stop = mkDefault [
+            (getExe claudeCode.package)
+            "stop"
+            "{id}"
+          ];
+        };
+      };
     })
     (mkIf cfg.claudeCode.hooks.enable {
       programs.claude-code.settings.hooks = genAttrs hookEvents (event: [

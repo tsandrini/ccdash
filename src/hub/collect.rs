@@ -179,6 +179,21 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
         ToHub::Call { id, call } => Cmd::Call { host, id, call },
         ToHub::Queued { call, at } => Cmd::Queued { host, call, at },
         ToHub::Injected { session } => Cmd::Injected { host, session },
+        ToHub::Launched {
+            launch,
+            session,
+            error,
+        } => Cmd::Launched {
+            host,
+            launch,
+            session,
+            error,
+        },
+        ToHub::Stopped { session, error } => Cmd::Stopped {
+            host,
+            session,
+            error,
+        },
     })
 }
 

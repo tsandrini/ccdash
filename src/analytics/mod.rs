@@ -719,7 +719,7 @@ mod tests {
         let t0 = 20 * DAY_MS;
         for (id, cwd) in [("a", "/ws/one/repo"), ("b", "/ws/two")] {
             conn.execute(
-                "INSERT INTO sessions VALUES (?1, 'h', ?2, NULL, NULL, 'interactive', ?3, NULL)",
+                "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES (?1, 'h', ?2, NULL, NULL, 'interactive', ?3, NULL)",
                 params![id, cwd, t0],
             )
             .unwrap();
@@ -762,7 +762,7 @@ mod tests {
         let conn = db();
         let t0 = 10 * DAY_MS;
         conn.execute(
-            "INSERT INTO sessions VALUES ('a', 'h', '/w', NULL, NULL, 'interactive', ?1, NULL)",
+            "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES ('a', 'h', '/w', NULL, NULL, 'interactive', ?1, NULL)",
             [t0],
         )
         .unwrap();

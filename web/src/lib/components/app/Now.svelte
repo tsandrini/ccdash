@@ -1,12 +1,16 @@
 <script lang="ts">
 	// What needs the owner, with the answer inline; then what is working,
-	// the hosts and the limits, and the last progress entries.
+	// the hosts and the limits, and the last progress entries. "Start a
+	// session" opens the start sheet in the scope's workspace.
+	import PlayIcon from '@lucide/svelte/icons/play';
 	import { Unauthorized } from '#lib/api/client.js';
 	import { fetchNotes, type Hit } from '#lib/api/index.js';
 	import { fmtDuration, fmtStamp, place, plain, plural } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
 	import { busy, group, label, shown } from '#lib/session.js';
+	import { starter } from '#lib/starter.svelte.js';
+	import { Button } from '#lib/components/ui/button/index.js';
 	import AskCard from './AskCard.svelte';
 	import Clock from './Clock.svelte';
 	import LimitTile from './LimitTile.svelte';
@@ -62,14 +66,25 @@
 
 <div class="mx-auto flex max-w-5xl flex-col gap-6 p-3 sm:p-4">
 	<section class="flex flex-col gap-3">
-		<h2 class="flex items-baseline gap-2 text-base font-semibold">
-			Needs you
-			<span class="text-sm font-normal text-muted-foreground">
-				{#if groups.needs.length}{plural(groups.needs.length, 'session')} · longest wait {fmtDuration(
-						longest
-					)}{:else if live.ready}nothing is waiting on you{/if}
-			</span>
-		</h2>
+		<div class="flex flex-wrap items-center gap-2">
+			<h2 class="flex items-baseline gap-2 text-base font-semibold">
+				Needs you
+				<span class="text-sm font-normal text-muted-foreground">
+					{#if groups.needs.length}{plural(groups.needs.length, 'session')} · longest wait {fmtDuration(
+							longest
+						)}{:else if live.ready}nothing is waiting on you{/if}
+				</span>
+			</h2>
+			<Button
+				size="sm"
+				class="ml-auto"
+				disabled={!live.hosts.some((h) => h.connected)}
+				title={live.hosts.some((h) => h.connected) ? undefined : 'No host is connected'}
+				onclick={() => starter.show({ ws: scope.current.ws[0] ?? null })}
+			>
+				<PlayIcon /> Start a session
+			</Button>
+		</div>
 		{#each groups.needs as s (s.id)}
 			<div class="flex flex-col gap-2 rounded-lg border bg-card p-3" data-activity={shown(s)}>
 				<a href="/sessions/{s.id}" class="flex items-center gap-2 text-sm">
@@ -133,7 +148,7 @@
 			Working <span class="text-sm font-normal text-muted-foreground">{groups.working.length}</span>
 		</h2>
 		{#if groups.working.length}
-			<div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+			<div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
 				{#each groups.working as s (s.id)}
 					<SessionCard session={s} compact />
 				{/each}
@@ -145,7 +160,7 @@
 
 	<section class="flex flex-col gap-2">
 		<h2 class="text-base font-semibold">Hosts and limits</h2>
-		<div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+		<div class="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
 			{#each live.hosts as h (h.name)}
 				<div class="flex flex-col gap-1 rounded-lg border bg-card p-3">
 					<span class="flex items-center gap-2 text-sm font-medium">

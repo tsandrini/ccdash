@@ -356,7 +356,7 @@ mod tests {
             ("c", "/elsewhere", 1.0),
         ] {
             conn.execute(
-                "INSERT INTO sessions VALUES (?1, 'h', ?2, NULL, NULL, 'interactive', ?3, NULL)",
+                "INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at) VALUES (?1, 'h', ?2, NULL, NULL, 'interactive', ?3, NULL)",
                 params![id, cwd, now - HOUR_MS],
             )
             .unwrap();

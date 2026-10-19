@@ -5,7 +5,7 @@
 import { browser } from '$app/env';
 import { SvelteMap } from 'svelte/reactivity';
 import { Unauthorized, api, getJson, token } from '../api/client';
-import type { HostStatus, RateLimits, Session, Snapshot, Update } from '../api/types';
+import type { HostStatus, Launch, RateLimits, Session, Snapshot, Update } from '../api/types';
 
 const STALE_STREAM_MS = 45_000;
 
@@ -16,6 +16,8 @@ class Live {
 	/** Hub clock minus ours. */
 	skew = $state(0);
 	sessions = new SvelteMap<string, Session>();
+	/** Launches this panel saw on the stream, by id. */
+	launches = new SvelteMap<string, Launch>();
 	rateLimits = $state<RateLimits | null>(null);
 	workspaces = $state<string[]>([]);
 	hosts = $state<HostStatus[]>([]);
@@ -40,6 +42,10 @@ class Live {
 
 	get multiHost(): boolean {
 		return this.hosts.length > 1;
+	}
+
+	connected(host: string): boolean {
+		return this.hosts.some((h) => h.name === host && h.connected);
 	}
 
 	hostLabel(host: string): string {
@@ -172,6 +178,9 @@ class Live {
 				break;
 			case 'notes':
 				this.notes = { workspace: update.workspace, n: this.notes.n + 1 };
+				break;
+			case 'launch':
+				this.launches.set(update.launch.id, update.launch);
 				break;
 		}
 	}
