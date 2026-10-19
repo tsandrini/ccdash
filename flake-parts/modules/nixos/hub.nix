@@ -44,10 +44,7 @@ in
       type = types.package;
       default = localFlake.packages.${pkgs.stdenv.hostPlatform.system}.ccdash-web;
       defaultText = literalExpression "ccdash.packages.\${system}.ccdash-web";
-      description = ''
-        The built panel the hub serves at `/` (`http.web_dir`), with the
-        previous panel under `/v1`.
-      '';
+      description = "The built panel the hub serves at `/` (`http.web_dir`).";
     };
 
     port = mkOption {

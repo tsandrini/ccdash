@@ -42,6 +42,6 @@ export const scope = {
 		put('ws', next.ws.join(','));
 		put('host', next.host);
 		put('range', next.range);
-		goto(`${url.pathname}${url.search}`, { replaceState: true });
+		goto(`${url.pathname}${url.search}`, { replace: true });
 	}
 };

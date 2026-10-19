@@ -206,7 +206,7 @@
 				</p>
 			{/if}
 		</header>
-		<Tabs.Root value={tab} onValueChange={setTab} class="flex min-h-0 flex-1 flex-col gap-0">
+		<Tabs.Root value={tab} onValueChange={setTab} class="min-h-0 flex-1 gap-0">
 			<Tabs.List class="mx-3 mt-2 w-fit sm:mx-4">
 				<Tabs.Trigger value="chat">Chat</Tabs.Trigger>
 				<Tabs.Trigger value="shell">Shell</Tabs.Trigger>

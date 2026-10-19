@@ -1,6 +1,6 @@
 // The panel's service worker: keeps the app shell available offline (the
 // build's files cache-first, the page network-first with the cache as the
-// fallback; the API, the stream, `/act` and the previous panel are never
+// fallback; the API, the stream, `/act` and the collector link are never
 // touched) and shows Web Push notifications with buttons that answer
 // prompts through `/act/<key>/<action>`. Tapping the body opens the
 // session's page; a `close` message takes an answered prompt down.
@@ -42,14 +42,13 @@ self.addEventListener('activate', (event) => {
 	);
 });
 
-/** Same origin, GET, not the API, a button, the collector link or the previous panel. */
+/** Same origin, GET, not the API, a button or the collector link. */
 function ours(request: Request): URL | null {
 	if (request.method !== 'GET') return null;
 	const url = new URL(request.url);
 	if (url.origin !== self.location.origin) return null;
 	const p = url.pathname;
-	if (p.startsWith('/api/') || p.startsWith('/act/') || p === '/collect' || p.startsWith('/v1'))
-		return null;
+	if (p.startsWith('/api/') || p.startsWith('/act/') || p === '/collect') return null;
 	return url;
 }
 

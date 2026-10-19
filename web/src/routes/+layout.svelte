@@ -1,6 +1,7 @@
 <script lang="ts">
 	// The shell: sidebar (a drawer on the phone), topbar with the scope,
-	// the connection state, the palette and the theme; the live store and
+	// the range where it applies, the connection state, the palette and the
+	// theme; the live store and
 	// the worker start here. `#token=`, `#session=` and `#pair` links from
 	// pairing and old notifications are honoured.
 	import './layout.css';
@@ -17,6 +18,7 @@
 	import LoginDialog from '#lib/components/app/LoginDialog.svelte';
 	import Nav from '#lib/components/app/Nav.svelte';
 	import NotePanel from '#lib/components/notes/NotePanel.svelte';
+	import RangePicker from '#lib/components/app/RangePicker.svelte';
 	import ScopeChips from '#lib/components/app/ScopeChips.svelte';
 	import ThemeToggle from '#lib/components/app/ThemeToggle.svelte';
 	import { setToken } from '#lib/api/client.js';
@@ -101,6 +103,7 @@
 				<h1 class="truncate text-sm font-semibold md:hidden">{title}</h1>
 				<div class="hidden items-center gap-1.5 sm:flex">
 					<ScopeChips />
+					<RangePicker />
 				</div>
 				<div class="ml-auto flex items-center gap-1">
 					<ConnState />
@@ -116,8 +119,9 @@
 					<ThemeToggle />
 				</div>
 			</header>
-			<div class="flex items-center gap-1.5 border-b px-2 py-1.5 sm:hidden">
+			<div class="flex flex-wrap items-center gap-1.5 border-b px-2 py-1.5 sm:hidden">
 				<ScopeChips />
+				<RangePicker />
 			</div>
 			<main class="min-h-0 flex-1">
 				{@render children()}

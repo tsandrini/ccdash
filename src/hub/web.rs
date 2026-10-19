@@ -1,8 +1,7 @@
 //! The panel's files, served from a directory (`http.web_dir`): the built
 //! app at `/`, with `index.html` for every path that names no file (the
-//! app routes on the client; only the hashed assets under `_app/` 404),
-//! and the previous panel under `/v1/` until it is retired. Inline
-//! scripts of a page are hashed into its CSP.
+//! app routes on the client; only the hashed assets under `_app/` 404).
+//! Inline scripts of a page are hashed into its CSP.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -29,11 +28,7 @@ pub async fn serve(State(app): State<App>, uri: Uri) -> Response {
 }
 
 fn file(root: &Path, path: &str) -> Response {
-    let (root, rest) = match path.strip_prefix("/v1") {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => (root.join("v1"), rest),
-        _ => (root.to_path_buf(), path),
-    };
-    let Some(rel) = relative(rest) else {
+    let Some(rel) = relative(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut file = root.join(&rel);
@@ -184,15 +179,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_the_app_and_the_old_panel() {
+    async fn serves_the_app() {
         // NOTE: a dotted directory name, like a store path's
         let dir = std::env::temp_dir().join(format!("ccdash-web-0.1.0-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("_app/immutable")).unwrap();
-        std::fs::create_dir_all(dir.join("v1")).unwrap();
         std::fs::write(dir.join("index.html"), "<p>new</p>").unwrap();
         std::fs::write(dir.join("_app/immutable/x.js"), "1").unwrap();
-        std::fs::write(dir.join("v1/index.html"), "<p>old</p>").unwrap();
-        std::fs::write(dir.join("v1/app.js"), "2").unwrap();
         let body = async |path: &str| {
             let r = file(&dir, path);
             let status = r.status();
@@ -212,11 +204,8 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
         assert_eq!(body("/missing.js").await.2, "<p>new</p>");
-        assert_eq!(body("/v1/missing.js").await.2, "<p>old</p>");
-        assert_eq!(body("/v1").await.2, "<p>old</p>");
-        assert_eq!(body("/v1/").await.2, "<p>old</p>");
-        assert_eq!(body("/v1/app.js").await.2, "2");
-        assert_eq!(body("/v1x").await.2, "<p>new</p>");
+        // the retired panel's address is a client route like any other
+        assert_eq!(body("/v1/").await.2, "<p>new</p>");
         assert_eq!(body("/../etc/passwd").await.0, StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(dir).unwrap();
     }

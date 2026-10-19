@@ -30,7 +30,7 @@
 		const url = new URL(page.url.href);
 		if (value === 'board') url.searchParams.delete('tab');
 		else url.searchParams.set('tab', value);
-		goto(`${url.pathname}${url.search}`, { replaceState: true });
+		goto(`${url.pathname}${url.search}`, { replace: true });
 	}
 
 	$effect(() => {
@@ -131,7 +131,7 @@
 	{#if projects.error}
 		<p class="text-sm text-critical" role="alert">{projects.error}</p>
 	{/if}
-	<Tabs.Root value={tab} onValueChange={setTab} class="flex flex-col gap-3">
+	<Tabs.Root value={tab} onValueChange={setTab} class="gap-3">
 		<div class="-mx-3 overflow-x-auto px-3 sm:mx-0 sm:px-0">
 			<Tabs.List class="w-fit">
 				<Tabs.Trigger value="board">Board</Tabs.Trigger>

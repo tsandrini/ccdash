@@ -51,6 +51,17 @@
 	--kind-issue: #eb6834;
 	--kind-doc: #1baf7a;
 	--kind-progress: #8a8984;
+	/* chart series beyond the states (slots 4-6 of the validated palette:
+	tools and input, cache writes, output) and the one-hue ramp of the heatmap */
+	--series-4: #eda100;
+	--series-5: #e87ba4;
+	--series-6: #008300;
+	--seq-1: #cde2fb;
+	--seq-2: #9ec5f4;
+	--seq-3: #6da7ec;
+	--seq-4: #3987e5;
+	--seq-5: #256abf;
+	--seq-6: #184f95;
 }
 
 .dark {
@@ -93,6 +104,15 @@
 	--kind-issue: #d95926;
 	--kind-doc: #199e70;
 	--kind-progress: #8f8e88;
+	--series-4: #c98500;
+	--series-5: #d55181;
+	--series-6: #008300;
+	--seq-1: #104281;
+	--seq-2: #1c5cab;
+	--seq-3: #2a78d6;
+	--seq-4: #5598e7;
+	--seq-5: #86b6ef;
+	--seq-6: #b7d3f6;
 }
 
 @theme inline {
@@ -214,6 +234,27 @@
 }
 .prose-chat hr {
 	@apply my-3 border-border;
+}
+
+/* LayerChart's tokens, mapped onto the theme (portaled tooltips sit outside the chart root). */
+.lc-root-container,
+.lc-tooltip-root {
+	--color-primary: var(--primary);
+	--color-surface-100: var(--card);
+	--color-surface-200: var(--muted);
+	--color-surface-300: var(--border);
+	--color-surface-content: var(--foreground);
+	--color-danger: var(--critical);
+}
+.lc-tooltip-root .lc-tooltip-container {
+	border-radius: 0.5rem;
+	box-shadow: 0 6px 20px rgb(0 0 0 / 0.18);
+}
+.lc-brush-range {
+	background: color-mix(in oklab, var(--working) 15%, transparent) !important;
+	box-shadow:
+		inset 1px 0 0 var(--working),
+		inset -1px 0 0 var(--working);
 }
 
 /* Folded text with a fade, unfolded by a button. */

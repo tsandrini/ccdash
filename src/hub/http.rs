@@ -113,17 +113,13 @@ pub async fn serve(
         )
         .route("/push/test", post(push_test))
         .layer(middleware::from_fn_with_state(token.clone(), auth));
-    // NOTE: the previous panel under /v1/ resolves its relative API and
-    // button links there
     let app = Router::new()
         .route("/act/{key}/{action}", post(button))
-        .route("/v1/act/{key}/{action}", post(button))
         .route(
             "/collect",
             get(collect::collect).with_state((hub.clone(), tokens)),
         )
-        .nest("/api/v1", api.clone())
-        .nest("/v1/api/v1", api)
+        .nest("/api/v1", api)
         .fallback(get(web::serve))
         .with_state(App {
             hub,

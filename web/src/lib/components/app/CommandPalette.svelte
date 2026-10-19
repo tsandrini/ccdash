@@ -46,10 +46,9 @@
 		else goto(noteHref(hit.workspace, hit.slug));
 	}
 
-	function go(href: string, legacy = false) {
+	function go(href: string) {
 		palette.close();
-		if (legacy) location.assign(href);
-		else goto(href);
+		goto(href);
 	}
 
 	function onkeydown(event: KeyboardEvent) {
@@ -106,7 +105,7 @@
 		{#if !palette.notesOnly}
 			<Command.Group heading="Pages">
 				{#each areas as area (area.href)}
-					<Command.Item value="page {area.label}" onSelect={() => go(area.href, area.legacy)}>
+					<Command.Item value="page {area.label}" onSelect={() => go(area.href)}>
 						<area.icon class="size-4 opacity-70" />
 						{area.label}
 					</Command.Item>

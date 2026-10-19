@@ -247,9 +247,6 @@
 				</li>
 			{/each}
 		</ul>
-		<p class="text-xs text-muted-foreground">
-			Hub: {live.host}. The previous panel is at
-			<a class="underline" href="/v1/" data-sveltekit-reload>/v1</a>.
-		</p>
+		<p class="text-xs text-muted-foreground">Hub: {live.host}.</p>
 	</section>
 </div>

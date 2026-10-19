@@ -128,70 +128,63 @@ serves at `/`) is phone first: **Now** lists what needs you with the
 answer inline (permission prompts, questions, plans, sessions on your turn
 with a quick reply), then what is working, the hosts with their link state
 and the account limits, and the last progress entries; **Sessions** groups
-every session as below; a session's page has **Chat** (the exchanges with
-Claude's text, grouped tool calls, subagents and the messages between
-sessions), **Shell** (its Bash calls as a terminal transcript with their
-output) and **Details** (the turn, files, tasks, processes, the claim,
-totals), the open prompts pinned above a composer that sends a turn
-through the channel or leaves a note for the next prompt, walks the prompt
-history, inserts `[[note]]` links and keeps drafts; **Settings** holds the
-pairing code, push, the theme, quick replies and templates. Projects,
-History and Analytics are still served by the previous panel at `/v1`
-until they are ported. The workspace and host filters live in the URL.
+every session (the ones that need you first, then working, parked and
+idle, then background agents, which show the session that started them
+and "Finished" instead of "Your turn"; a session left on your turn for an
+hour is _parked_: most likely done, it no longer counts as needing you); a
+session's page has **Chat** (the exchanges with Claude's text, grouped
+tool calls, subagents and the messages between sessions), **Shell** (its
+Bash calls as a terminal transcript with their output) and **Details**
+(the turn, files, tasks, processes, the claim, totals), the open prompts
+pinned above a composer that sends a turn through the channel or leaves a
+note for the next prompt, walks the prompt history, inserts `[[note]]`
+links and keeps drafts; **Projects** shows each workspace's board, live
+sessions, progress, documents, memories and the note graph, with a reader
+and editor for every note; **Settings** holds the pairing code, push, the
+theme, quick replies and templates.
 
-The previous panel's views, as they are at `/v1`:
+**History** draws the sessions of a time range as lanes coloured by state
+(working, needs permission, your turn, parked, idle), with the totals,
+time per project, the most used tools and the 5-hour limit over time.
+**Analytics** comes in sections:
 
-- **Sessions:** the ones that need you first, then working, parked and idle,
-  then background agents (sessions Claude started, or `claude --bg`), which show
-  the session that started them and "Finished" instead of "Your turn". Each
-  card shows the pending permission or the running tool and what Claude is
-  saying, task progress, the current turn (time, tool calls, edited files,
-  subagents), context, cost, CPU and memory, and the last hour of activity.
-  A session left on your turn for an hour is _parked_: most likely done, it
-  no longer counts as needing you.
-- **Conversation:** your prompts, what Claude writes between tool calls as
-  it streams, the tool calls themselves, subagent results, compactions and
-  replies. Details has the task list, running subagents, the session's
-  processes with CPU and memory, and totals.
-- **History:** activity timeline, time per project, most used tools and
-  5-hour limit usage.
-- **Analytics**, in sections:
-  - _Overview:_ daily activity, when you prompt (weekday × hour), how long
-    Claude works per prompt and how long sessions wait for you, cost per day
-    and per model, lines changed, memory and CPU per project.
-  - _Waits:_ how long sessions waited on you and how fast you replied, apart
-    from parked time. A wait runs from Claude handing the turn back to what
-    came next: a reply within an hour counts as waiting on you; a later
-    reply, closing the session or leaving it open counts as parked; Claude
-    carrying on by itself (a background task, a wakeup) counts as neither.
-    Permission prompts always count. Lists the sessions you came back to
-    late.
-  - _Parallel:_ how many sessions worked or waited on you at once, and how
-    long everything waited on you with nothing working.
-  - _Limits:_ the 5-hour and 7-day limits, and per-model weekly limits
-    such as Fable's, with their pace and where they end up at the reset,
-    the peak of each 5-hour window, and each workspace's share of the
-    week.
-  - _Projects:_ a sortable table of time, prompts, cost, lines, tool calls,
-    compactions and CPU per directory.
-  - _Turns:_ what fills a turn (Claude, tools, permission prompts), tools and
-    shell commands by total time, the slowest calls and the commands that
-    fail most.
-  - _Context:_ compactions and how full sessions got.
-  - _Tokens:_ tokens by type, cache hit rate, API latency per model,
-    commits, pull requests, edits by language, and your active time against
-    Claude's (needs telemetry, below).
-  - _Permissions:_ what asks you most, grouped by the allow rule that would
-    cover it, how you answered and how fast, and what auto mode blocked.
+- _Overview:_ daily activity, when you prompt (weekday × hour), how long
+  Claude works per prompt and how long sessions wait for you, cost per day
+  and per model, lines changed, memory and CPU per project.
+- _Waits:_ how long sessions waited on you and how fast you replied, apart
+  from parked time. A wait runs from Claude handing the turn back to what
+  came next: a reply within an hour counts as waiting on you; a later
+  reply, closing the session or leaving it open counts as parked; Claude
+  carrying on by itself (a background task, a wakeup) counts as neither.
+  Permission prompts always count. Lists the sessions you came back to
+  late.
+- _Parallel:_ how many sessions worked or waited on you at once, and how
+  long everything waited on you with nothing working.
+- _Limits:_ the 5-hour and 7-day limits, and per-model weekly limits
+  such as Fable's, with their pace and where they end up at the reset,
+  the peak of each 5-hour window, and each workspace's share of the
+  week.
+- _Projects:_ a sortable table of time, prompts, cost, lines, tool calls,
+  compactions and CPU per directory.
+- _Turns:_ what fills a turn (Claude, tools, permission prompts), tools and
+  shell commands by total time, the slowest calls and the commands that
+  fail most.
+- _Context:_ compactions and how full sessions got.
+- _Tokens:_ tokens by type, cache hit rate, API latency per model,
+  commits, pull requests, edits by language, and your active time against
+  Claude's (needs telemetry, below).
+- _Permissions:_ what asks you most, grouped by the allow rule that would
+  cover it, how you answered and how fast, and what auto mode blocked.
 
-History and Analytics share a time range picker: quick ranges or an exact
-from–to, `‹ ›` to step by the range's length, `⊖` to double it, and
-drag across any time chart with a mouse to zoom in. With
-`workspaces.dirs` set, a workspace filter narrows every view to one or
-several workspaces. It reads "All" (or what you picked) until you open it,
-so the other names stay out of sight; each browser remembers its choice.
-With more than one machine reporting, a host filter sits next to it, and
-cards name their machine.
+History and Analytics share the time range in the topbar: quick ranges or
+an exact from–to, `‹ ›` to step by the range's length, `⊖` to double it,
+and drag across any time chart with a mouse to zoom in. Every chart has a
+tooltip and a table view under it. With `workspaces.dirs` set, a
+workspace filter next to it narrows every view to one or several
+workspaces; with more than one machine reporting, a host filter joins it,
+cards name their machine and History and every analytics section carry a
+By host table. The scope, the range and the analytics section live in the
+URL, so links are shareable and the back button works.
 
 To connect a phone, scan `ccdash url --hub --qr` on the hub (or open
 "Connect a phone" in the web UI on a paired browser). The address carries
@@ -477,8 +470,8 @@ npm run build                # → web/build, what the hub serves
 
 The hub serves `http.web_dir` (the Nix build bakes in the `ccdash-web`
 package; a `cargo run` hub falls back to `web/build`; `CCDASH_WEB_DIR`
-overrides both) with `index.html` for every route and the previous panel
-under `v1/`. The API's TypeScript types (`web/src/lib/api/types.ts`) are
+overrides both) with `index.html` for every route. The API's TypeScript
+types (`web/src/lib/api/types.ts`) are
 generated from the Rust models: `cargo test api` fails while the file is
 stale, `CCDASH_UPDATE_TYPES=1 cargo test api` rewrites it. After a change to
 `web/package-lock.json`, put the hash that

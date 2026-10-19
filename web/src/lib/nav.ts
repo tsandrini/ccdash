@@ -15,8 +15,6 @@ export type Area = {
 	href: string;
 	label: string;
 	icon: Component;
-	/** Served by the previous panel until it is ported. */
-	legacy?: boolean;
 	/** Whether a path belongs to the area. */
 	match: (path: string) => boolean;
 	/** A count shown next to the entry. */
@@ -48,19 +46,12 @@ export const areas: Area[] = [
 		icon: FolderKanbanIcon,
 		match: (path) => under('/projects')(path) || under('/notes')(path)
 	},
+	{ href: '/history', label: 'History', icon: HistoryIcon, match: under('/history') },
 	{
-		href: '/v1/#view=history',
-		label: 'History',
-		icon: HistoryIcon,
-		legacy: true,
-		match: () => false
-	},
-	{
-		href: '/v1/#view=analytics',
+		href: '/analytics/overview',
 		label: 'Analytics',
 		icon: BarChart3Icon,
-		legacy: true,
-		match: () => false
+		match: under('/analytics')
 	},
 	{ href: '/settings', label: 'Settings', icon: SettingsIcon, match: under('/settings') }
 ];

@@ -98,10 +98,10 @@ pub struct Http {
     /// e.g. `https://ccdash.example.org`. Defaults to this machine's LAN
     /// address and the first HTTP port.
     pub public_url: Option<String>,
-    /// Directory holding the built panel (`index.html`, `_app/`, and the
-    /// previous panel under `v1/`). Defaults to the one the Nix build
-    /// bakes in, else `web/build` under the working directory; the
-    /// `CCDASH_WEB_DIR` environment variable overrides both.
+    /// Directory holding the built panel (`index.html`, `_app/`). Defaults
+    /// to the one the Nix build bakes in, else `web/build` under the
+    /// working directory; the `CCDASH_WEB_DIR` environment variable
+    /// overrides both.
     pub web_dir: Option<PathBuf>,
 }
 

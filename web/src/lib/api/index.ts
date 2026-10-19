@@ -2,6 +2,7 @@
 
 import { deleteJson, getJson, postJson, putJson, query } from './client';
 import type {
+	Analytics,
 	Answer,
 	Conversation,
 	Graph,
@@ -66,6 +67,15 @@ export const fetchHistory = (params: {
 	workspace?: string;
 	host?: string;
 }) => getJson<History>(`history${query(params)}`);
+
+/** `tz`: the viewer's offset from UTC in minutes, for the day buckets. */
+export const fetchAnalytics = (params: {
+	since?: number;
+	until?: number;
+	tz: number;
+	workspace?: string;
+	host?: string;
+}) => getJson<Analytics>(`analytics${query(params)}`);
 
 export const fetchNotes = (params: {
 	workspace?: string;

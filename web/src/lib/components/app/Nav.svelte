@@ -17,8 +17,7 @@
 		{@const active = area.match(page.url.pathname)}
 		{@const badge = area.badge?.(inScope)}
 		<a
-			href={area.legacy ? area.href : `${area.href}${search}`}
-			data-sveltekit-reload={area.legacy ? '' : undefined}
+			href={`${area.href}${search}`}
 			aria-current={active ? 'page' : undefined}
 			class={cn(
 				'flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
@@ -28,9 +27,7 @@
 		>
 			<area.icon class="size-4 shrink-0 opacity-80" />
 			<span class="flex-1">{area.label}</span>
-			{#if area.legacy}
-				<span class="text-[10px] text-muted-foreground uppercase">v1</span>
-			{:else if badge}
+			{#if badge}
 				<span class="rounded-full bg-muted px-1.5 text-xs text-muted-foreground tabular-nums"
 					>{badge}</span
 				>
