@@ -24,6 +24,9 @@ const PENDING_WINDOW_MS: i64 = 30_000;
 const SAMPLE_EVERY_MS: i64 = 60_000;
 const SAMPLE_MIN_GAP_MS: i64 = 5_000;
 const SUMMARY_LEN: usize = 160;
+/// Bytes of a Bash command kept with its event, for the Shell view.
+const COMMAND_LEN: usize = 4096;
+const DEFAULT_TOOL_OUTPUT: usize = 8192;
 const SUBAGENT_TEXT_LEN: usize = 4096;
 const COMPACT_SUMMARY_LEN: usize = 8192;
 const MAX_SUBAGENTS: usize = 32;
@@ -205,6 +208,8 @@ pub struct State {
     host: String,
     terminals: Vec<String>,
     workspaces: Workspaces,
+    /// Bytes of a tool's output kept with its event (`store.tool_output_bytes`).
+    tool_output_bytes: usize,
     sessions: HashMap<String, Session>,
     aux: HashMap<String, Aux>,
     rate_limits: Option<RateLimits>,
@@ -224,6 +229,7 @@ impl State {
             host,
             terminals,
             workspaces,
+            tool_output_bytes: DEFAULT_TOOL_OUTPUT,
             sessions: HashMap::new(),
             aux: HashMap::new(),
             rate_limits: None,
@@ -233,6 +239,12 @@ impl State {
             channel_pids: HashSet::new(),
             dead: HashSet::new(),
         }
+    }
+
+    /// Caps the output stored with tool events; 0 keeps none.
+    pub fn with_tool_output_bytes(mut self, bytes: usize) -> Self {
+        self.tool_output_bytes = bytes;
+        self
     }
 
     /// Takes the collector's word on which known pids have exited; the
@@ -552,13 +564,17 @@ impl State {
                     if let Some(turn) = &mut s.turn {
                         turn.note_tool(tool_name, &summary, ok);
                     }
-                    record(
-                        store,
-                        ts,
-                        id,
-                        "tool",
-                        json!({ "name": tool_name, "summary": summary, "ms": ms, "ok": ok }),
-                    );
+                    let mut data =
+                        json!({ "name": tool_name, "summary": summary, "ms": ms, "ok": ok });
+                    if tool_name == "Bash"
+                        && let Some(command) = str_of(tool_input, "command")
+                    {
+                        data["command"] = truncate(command, COMMAND_LEN).into();
+                    }
+                    if let Some(output) = tool_output(ok, p, self.tool_output_bytes) {
+                        data["output"] = output.into();
+                    }
+                    record(store, ts, id, "tool", data);
                 }
                 if s.activity == Activity::Permission && aux.permission_agent.as_deref() == agent_id
                 {
@@ -1701,6 +1717,29 @@ fn parse_rate_limits(p: &Value, ts: i64) -> Option<RateLimits> {
         updated_at: ts,
         scoped: Vec::new(),
     })
+}
+
+/// What a tool call left behind, for the Shell view: a Bash call's stdout
+/// and stderr, or the error of a failed call of any tool. Empty → None.
+fn tool_output(ok: bool, payload: &Value, max: usize) -> Option<String> {
+    if max == 0 {
+        return None;
+    }
+    let text = if ok {
+        let response = &payload["tool_response"];
+        let part = |key: &str| response[key].as_str().unwrap_or_default().trim_end();
+        match (part("stdout"), part("stderr")) {
+            (out, "") => out.to_owned(),
+            ("", err) => err.to_owned(),
+            (out, err) => format!("{out}\n{err}"),
+        }
+    } else {
+        str_of(payload, "error")
+            .unwrap_or_default()
+            .trim_end()
+            .to_owned()
+    };
+    (!text.trim().is_empty()).then(|| truncate(&text, max))
 }
 
 fn tool_summary(name: &str, input: &Value, cwd: &str) -> String {

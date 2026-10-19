@@ -6,13 +6,15 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+use ts_rs::TS;
 
 use super::{SessionEvents, percentile};
 use crate::{command, history::Transition, model::Activity};
 
 const TOP_RULES: usize = 20;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Permissions {
     pub asks: u32,
     pub allowed: u32,
@@ -28,7 +30,8 @@ pub struct Permissions {
     pub rules: Vec<RuleStat>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct RuleStat {
     /// An allow rule in settings.json syntax.
     pub rule: String,

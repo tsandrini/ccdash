@@ -50,7 +50,7 @@ pub struct Content {
     pub body: String,
     /// The session the notification is about.
     pub session: String,
-    /// Deep link into the panel (`#session=`).
+    /// Deep link into the panel: the session's page.
     pub url: String,
     /// The ask's button key, when the prompt answers from a button.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,7 +149,7 @@ impl Composer {
     }
 
     fn click(&self, s: &Session) -> String {
-        format!("{}/#session={}", self.web_url, s.id)
+        format!("{}/sessions/{}", self.web_url, s.id)
     }
 
     fn ask_content(&self, s: &Session, ask: &Ask, key: Option<&str>) -> Content {
@@ -558,7 +558,7 @@ mod tests {
         let c = &note.content;
         assert_eq!(c.title, "repo: allow Bash?");
         assert_eq!(c.body, "List files\nls");
-        assert_eq!(c.url, format!("http://10.0.0.2:7837/#session={SID}"));
+        assert_eq!(c.url, format!("http://10.0.0.2:7837/sessions/{SID}"));
         assert_eq!((c.session.as_str(), c.key.as_deref()), (SID, Some("k3y")));
         assert!(c.urgent && !c.more);
         let actions: Vec<&str> = c.buttons.iter().map(|b| b.action.as_str()).collect();
@@ -743,7 +743,7 @@ mod tests {
                 title: "x".into(),
                 body: "b".into(),
                 session: SID.into(),
-                url: "http://x/#session=1".into(),
+                url: "http://x/sessions/1".into(),
                 key: None,
                 buttons: Vec::new(),
                 more: false,
@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(
             body,
             json!({"title": "x", "message": "b", "priority": 3, "tags": ["speech_balloon"],
-                "click": "http://x/#session=1", "topic": "t", "sequence_id": "ask-1"})
+                "click": "http://x/sessions/1", "topic": "t", "sequence_id": "ask-1"})
         );
 
         let (url, server) = capture();

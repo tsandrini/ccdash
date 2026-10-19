@@ -7,11 +7,13 @@ use anyhow::Result;
 use rusqlite::{Connection, named_params};
 use serde::Serialize;
 use serde_json::Value;
+use ts_rs::TS;
 
 use super::{Bucket, Clock, Uses, percentile};
 use crate::workspace::{IN_SCOPE, Scope};
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Telemetry {
     /// Newest record of any range, to tell an idle range from a dead export.
     pub last_at: i64,
@@ -36,7 +38,8 @@ pub struct Telemetry {
     pub decisions: Vec<DecisionUse>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ModelUse {
     pub model: String,
     pub requests: u32,
@@ -51,21 +54,24 @@ pub struct ModelUse {
     pub ttft_p50_ms: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct SourceUse {
     pub source: String,
     pub requests: u32,
     pub tokens: u64,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct EditUse {
     pub language: String,
     pub accepted: u32,
     pub rejected: u32,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct DecisionUse {
     pub source: String,
     pub decision: String,

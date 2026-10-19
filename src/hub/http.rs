@@ -10,6 +10,7 @@ use std::{
     fs::OpenOptions,
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -31,6 +32,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 use tracing::warn;
+use ts_rs::TS;
 
 use super::{
     collect::{self, Tokens},
@@ -59,7 +61,7 @@ const HOUR_MS: i64 = 3_600_000;
 const SESSION_MESSAGES: usize = 50;
 
 #[derive(Clone)]
-struct App {
+pub struct App {
     hub: Hub,
     store: Store,
     workspaces: Arc<Workspaces>,
@@ -68,6 +70,8 @@ struct App {
     public_url: Arc<String>,
     /// Web Push, when it is on.
     push: Option<Arc<Push>>,
+    /// The panel's files (see `web`).
+    pub web_dir: Arc<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,6 +84,7 @@ pub async fn serve(
     tokens: Tokens,
     public_url: String,
     push: Option<Arc<Push>>,
+    web_dir: PathBuf,
 ) {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -88,6 +93,7 @@ pub async fn serve(
         .route("/sessions/{id}/reply", post(reply))
         .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
+        .route("/prompts", get(prompts))
         .route("/pair", get(pair))
         .route("/history", get(history))
         .route("/analytics", get(analytics))
@@ -103,15 +109,18 @@ pub async fn serve(
         )
         .route("/push/test", post(push_test))
         .layer(middleware::from_fn_with_state(token.clone(), auth));
+    // NOTE: the previous panel under /v1/ resolves its relative API and
+    // button links there
     let app = Router::new()
-        .route("/", get(web::index))
-        .route("/{asset}", get(web::asset))
         .route("/act/{key}/{action}", post(button))
+        .route("/v1/act/{key}/{action}", post(button))
         .route(
             "/collect",
             get(collect::collect).with_state((hub.clone(), tokens)),
         )
-        .nest("/api/v1", api)
+        .nest("/api/v1", api.clone())
+        .nest("/v1/api/v1", api)
+        .fallback(get(web::serve))
         .with_state(App {
             hub,
             store,
@@ -119,6 +128,7 @@ pub async fn serve(
             token,
             public_url: Arc::new(public_url),
             push,
+            web_dir: Arc::new(web_dir),
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -234,8 +244,9 @@ async fn session(
     })))
 }
 
-#[derive(Deserialize)]
-struct Rename {
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct Rename {
     title: String,
 }
 
@@ -253,8 +264,9 @@ async fn rename(
     Ok(Json(json!({ "session": session })))
 }
 
-#[derive(Deserialize)]
-struct Reply {
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct Reply {
     text: String,
 }
 
@@ -299,6 +311,52 @@ async fn answer(
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Deserialize)]
+struct PromptsQuery {
+    /// One session (id, short id or prefix); else every session in scope.
+    session: Option<String>,
+    /// Comma-separated workspace names; every workspace when empty.
+    workspace: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Recent prompts, newest first and de-duplicated, for the composer's
+/// history: `session=` narrows to one session, `workspace=` to workspaces.
+async fn prompts(
+    State(app): State<App>,
+    Query(query): Query<PromptsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let dirs = match query.workspace.as_deref().filter(|w| !w.is_empty()) {
+        None => None,
+        Some(names) => Some(
+            serde_json::to_string(
+                &names
+                    .split(',')
+                    .map(|name| {
+                        app.workspaces.dir(name).map(str::to_owned).ok_or(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            format!("unknown workspace {name:?}"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(anyhow::Error::from)?,
+        ),
+    };
+    let session = match query.session.filter(|s| !s.is_empty()) {
+        None => None,
+        Some(key) => Some(app.hub.resolve(&key).await?.map_or(key, |s| s.id)),
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let store = app.store.clone();
+    let prompts = tokio::task::spawn_blocking(move || {
+        conversation::prompts(&store.reader()?, session.as_deref(), dirs.as_deref(), limit)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(json!({ "prompts": prompts })))
 }
 
 /// A notification button, sent by the phone's ntfy app: the key in the
@@ -612,8 +670,9 @@ async fn note(
     Ok(Json(value))
 }
 
-#[derive(Deserialize)]
-struct PutNote {
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct PutNote {
     kind: NoteKind,
     title: String,
     body: String,
@@ -624,6 +683,7 @@ struct PutNote {
     #[serde(default)]
     status: Option<Status>,
     #[serde(default)]
+    #[ts(type = "Record<string, unknown> | null")]
     extra: Option<Value>,
     /// The version the edit is based on; refused when the note moved on.
     #[serde(default)]
@@ -779,8 +839,9 @@ async fn push_subscribe(
     Ok(Json(json!({ "subscription": subscription })))
 }
 
-#[derive(Deserialize)]
-struct Unsubscribe {
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct Unsubscribe {
     endpoint: String,
 }
 

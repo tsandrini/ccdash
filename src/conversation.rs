@@ -3,33 +3,38 @@
 //! followed it.
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, named_params, params};
 use serde::Serialize;
 use serde_json::Value;
+use ts_rs::TS;
 
 use crate::{
     history::{Transition, segments},
     markdown,
     model::Activity,
     waits::{self, CLOSERS, Close, Edges},
+    workspace::IN_SCOPE,
 };
 
 const MAX_TOOLS_PER_EXCHANGE: usize = 200;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Conversation {
     pub exchanges: Vec<Exchange>,
     /// Older exchanges exist; ask again with `before` set to the first one's `at`.
     pub more: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Exchange {
     pub at: i64,
     /// None for events that came before the first prompt in the store.
     pub prompt: Option<String>,
     /// `"ccdash"` for prompts sent from the dashboard.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub via: Option<String>,
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
@@ -68,7 +73,8 @@ impl Exchange {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Item {
     Tool {
@@ -77,6 +83,14 @@ pub enum Item {
         summary: String,
         ms: Option<i64>,
         ok: bool,
+        /// A Bash call's whole command (the summary is its first line).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        command: Option<String>,
+        /// A Bash call's output, or a failed call's error, capped by the hub.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        output: Option<String>,
     },
     Permission {
         at: i64,
@@ -131,7 +145,8 @@ pub enum Item {
     },
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Stats {
     pub prompts: i64,
     pub tools: i64,
@@ -214,6 +229,8 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
             summary: text(data, "summary"),
             ms: data["ms"].as_i64(),
             ok: data["ok"].as_bool().unwrap_or(true),
+            command: data["command"].as_str().map(str::to_owned),
+            output: data["output"].as_str().map(str::to_owned),
         },
         "permission" => Item::Permission {
             at,
@@ -297,6 +314,57 @@ fn cap_tools(exchange: &mut Exchange) {
         }
         true
     });
+}
+
+/// A prompt as typed, for the composer's history.
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct Prompt {
+    pub at: i64,
+    pub session: String,
+    pub text: String,
+}
+
+/// The newest `limit` distinct prompts, newest first: of one session, or
+/// of every session under `dirs` (every session when None).
+pub fn prompts(
+    conn: &Connection,
+    session: Option<&str>,
+    dirs: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Prompt>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT e.ts, e.session, json_extract(e.data, '$.text') FROM events e
+            JOIN sessions x ON x.id = e.session
+            WHERE e.kind = 'prompt' AND (:session IS NULL OR e.session = :session)
+                AND {IN_SCOPE}
+            ORDER BY e.ts DESC LIMIT :scan"
+    ))?;
+    let scan = i64::try_from(limit.saturating_mul(4).max(limit))?;
+    let rows = stmt.query_map(
+        named_params! { ":session": session, ":dirs": dirs, ":host": Option::<String>::None, ":scan": scan },
+        |r| {
+            Ok(Prompt {
+                at: r.get(0)?,
+                session: r.get(1)?,
+                text: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            })
+        },
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let prompt = row?;
+        let key: String = prompt.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        out.push(prompt);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// The session's process samples since `since`: `[ts, cpu %, memory bytes]`.
@@ -546,6 +614,75 @@ mod tests {
         assert_eq!(c.exchanges[0].omitted, 5);
         assert_eq!(c.exchanges[0].items.len(), MAX_TOOLS_PER_EXCHANGE);
         assert!(matches!(&c.exchanges[0].items[0], Item::Tool { summary, .. } if summary == "7"));
+    }
+
+    #[test]
+    fn tool_output_and_command_ride_along() {
+        use serde_json::json;
+        let conn = db();
+        event(&conn, 1, "prompt", json!({"text": "go"}));
+        event(
+            &conn,
+            2,
+            "tool",
+            json!({"name": "Bash", "summary": "make", "ok": false, "command": "make\nmake test", "output": "Exit code 2"}),
+        );
+        let c = conversation(&conn, "s", None, 10).unwrap();
+        assert_eq!(
+            c.exchanges[0].items[0],
+            Item::Tool {
+                at: 2,
+                name: "Bash".into(),
+                summary: "make".into(),
+                ms: None,
+                ok: false,
+                command: Some("make\nmake test".into()),
+                output: Some("Exit code 2".into()),
+            }
+        );
+        let json = serde_json::to_value(&c.exchanges[0].items[0]).unwrap();
+        assert_eq!(json["output"], "Exit code 2");
+        let json = serde_json::to_value(&Item::Tool {
+            at: 1,
+            name: "Read".into(),
+            summary: "a".into(),
+            ms: None,
+            ok: true,
+            command: None,
+            output: None,
+        })
+        .unwrap();
+        assert!(json.get("output").is_none() && json.get("command").is_none());
+    }
+
+    #[test]
+    fn prompts_are_distinct_and_scoped() {
+        use serde_json::json;
+        let conn = db();
+        conn.execute(
+            "INSERT INTO sessions (id, host, cwd, kind, started_at) VALUES
+                ('s', 'h', '/work/a', 'interactive', 0), ('t', 'h', '/other', 'interactive', 0)",
+            [],
+        )
+        .unwrap();
+        event(&conn, 1, "prompt", json!({"text": "first"}));
+        event(&conn, 2, "prompt", json!({"text": "second"}));
+        event(&conn, 3, "prompt", json!({"text": "first "}));
+        conn.execute(
+            "INSERT INTO events VALUES (4, 'h', 't', 'prompt', ?1)",
+            [json!({"text": "elsewhere"}).to_string()],
+        )
+        .unwrap();
+        let all = prompts(&conn, None, None, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(),
+            ["elsewhere", "first ", "second"]
+        );
+        let mine = prompts(&conn, Some("s"), None, 10).unwrap();
+        assert_eq!(mine.len(), 2);
+        let scoped = prompts(&conn, None, Some(r#"["/work"]"#), 10).unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(prompts(&conn, None, None, 1).unwrap().len(), 1);
     }
 
     #[test]

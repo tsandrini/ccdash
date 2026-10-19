@@ -33,28 +33,35 @@ pub struct Envelope {
     pub payload: Value,
 }
 
-const DROPPED_KEYS: &[&str] = &["tool_response", "permission_suggestions"];
-/// Tools whose `tool_response` the daemon reads (TaskCreate returns the task id).
-const KEPT_RESPONSES: &[&str] = &["TaskCreate"];
+/// Tools whose `tool_response` the hub reads: TaskCreate returns the task
+/// id; Bash's output is kept (reduced to its text, see [`bash_output`]).
+const KEPT_RESPONSES: &[&str] = &["TaskCreate", "Bash"];
 const LONG_KEYS: &[(&str, usize)] = &[
     ("last_assistant_message", 32 * 1024),
     ("prompt", 8 * 1024),
     ("compact_summary", 8 * 1024),
     ("delta", 16 * 1024),
+    ("stdout", 8 * 1024),
+    ("stderr", 8 * 1024),
+    ("error", 8 * 1024),
 ];
 const DEFAULT_LIMIT: usize = 2048;
 
 /// Serializes `env`, shrinking the payload until it fits in one datagram.
 pub fn encode(mut env: Envelope) -> Option<Vec<u8>> {
     if let Value::Object(map) = &mut env.payload {
-        let keep_response = map
+        let tool = map
             .get("tool_name")
             .and_then(Value::as_str)
-            .is_some_and(|name| KEPT_RESPONSES.contains(&name));
-        for key in DROPPED_KEYS {
-            if !(keep_response && *key == "tool_response") {
-                map.remove(*key);
+            .unwrap_or_default()
+            .to_owned();
+        map.remove("permission_suggestions");
+        if tool == "Bash" {
+            if let Some(response) = map.get_mut("tool_response") {
+                *response = bash_output(response);
             }
+        } else if !KEPT_RESPONSES.contains(&tool.as_str()) {
+            map.remove("tool_response");
         }
     }
     for divisor in [1, 4, 16] {
@@ -65,6 +72,26 @@ pub fn encode(mut env: Envelope) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// What the hub stores of a Bash result: its text, and whether the command
+/// was interrupted. `bashEditDiff` and anything else is dropped.
+fn bash_output(response: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    match response {
+        Value::Object(map) => {
+            for key in ["stdout", "stderr", "interrupted"] {
+                if let Some(v) = map.get(key).filter(|v| !v.is_null()) {
+                    out.insert(key.to_owned(), v.clone());
+                }
+            }
+        }
+        Value::String(s) => {
+            out.insert("stdout".to_owned(), Value::String(s.clone()));
+        }
+        _ => {}
+    }
+    Value::Object(out)
 }
 
 fn clamp(value: &mut Value, limit: usize, divisor: usize) {
@@ -125,6 +152,31 @@ mod tests {
                 .len(),
             10_000
         );
+    }
+
+    #[test]
+    fn keeps_bash_output_text_only() {
+        let bytes = encode(envelope(json!({
+            "tool_name": "Bash",
+            "tool_response": {"stdout": "x".repeat(20_000), "stderr": "", "interrupted": false,
+                "isImage": false, "bashEditDiff": {"big": "y".repeat(50_000)}},
+        })))
+        .unwrap();
+        let back: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let response = &back.payload["tool_response"];
+        assert_eq!(response["stdout"].as_str().unwrap().len(), 8 * 1024);
+        assert_eq!(response["interrupted"], false);
+        assert!(response.get("bashEditDiff").is_none());
+        assert!(response.get("isImage").is_none());
+
+        let bytes = encode(envelope(json!({
+            "tool_name": "Bash",
+            "hook_event_name": "PostToolUseFailure",
+            "error": "e".repeat(20_000),
+        })))
+        .unwrap();
+        let back: Envelope = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.payload["error"].as_str().unwrap().len(), 8 * 1024);
     }
 
     #[test]

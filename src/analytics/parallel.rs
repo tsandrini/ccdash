@@ -2,6 +2,7 @@
 //! sessions don't wait on you (see `crate::waits`).
 
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::{history::Lane, model::Activity};
 
@@ -9,7 +10,8 @@ use crate::{history::Lane, model::Activity};
 const POINTS: i64 = 240;
 const MIN_SLOT_MS: i64 = 60_000;
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Parallel {
     pub slot_ms: i64,
     /// `[slot start, mean working, max working, mean waiting, max waiting]`.

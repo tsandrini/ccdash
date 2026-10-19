@@ -1,8 +1,10 @@
 //! Types shared by the daemon state and every API.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Activity {
     /// Started, no prompt yet.
@@ -21,20 +23,23 @@ pub enum Activity {
 /// How long an interactive session stays "your turn" before it is parked.
 pub const PARKED_AFTER_MS: i64 = 60 * 60_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Interactive,
     Background,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Stamped {
     pub at: i64,
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ToolRun {
     pub name: String,
     pub summary: String,
@@ -43,7 +48,8 @@ pub struct ToolRun {
 
 /// Progress of the current or last turn. Counts cover the main thread;
 /// `subagent_tools` counts tool calls made by subagents.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Turn {
     pub started_at: i64,
     pub ended_at: Option<i64>,
@@ -72,7 +78,8 @@ impl Turn {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -81,7 +88,8 @@ pub enum TaskStatus {
 }
 
 /// An entry of Claude's task list (TaskCreate/TaskUpdate or TodoWrite).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Task {
     pub id: String,
     pub subject: String,
@@ -90,7 +98,8 @@ pub struct Task {
     pub status: TaskStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Subagent {
     pub id: String,
     pub agent_type: String,
@@ -103,7 +112,8 @@ pub struct Subagent {
 
 /// CPU and memory of a session's process tree (Claude, its MCP servers and
 /// running commands).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Resources {
     /// Percent of one core since the previous poll.
     pub cpu_pct: f64,
@@ -115,7 +125,8 @@ pub struct Resources {
     pub top: Vec<ProcInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ProcInfo {
     pub pid: u32,
     pub name: String,
@@ -129,7 +140,8 @@ pub struct ProcInfo {
 /// A prompt Claude Code holds open, relayed by `ccdash ask` (the
 /// PermissionRequest hook). The terminal dialog stays open alongside it;
 /// whichever answer comes first wins.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Ask {
     pub id: String,
     /// The subagent that asked; None for the main thread.
@@ -139,7 +151,8 @@ pub struct Ask {
     pub kind: AskKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AskKind {
     /// A tool call waiting for approval.
@@ -158,7 +171,8 @@ pub enum AskKind {
     Plan { plan: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Question {
     pub question: String,
     pub header: String,
@@ -166,26 +180,30 @@ pub struct Question {
     pub multi_select: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Choice {
     pub label: String,
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct WindowRef {
     pub id: u64,
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Limit {
     pub used_pct: f64,
     /// Unix seconds.
     pub resets_at: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct RateLimits {
     pub five_hour: Option<Limit>,
     pub seven_day: Option<Limit>,
@@ -196,7 +214,8 @@ pub struct RateLimits {
     pub scoped: Vec<ScopedLimit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ScopedLimit {
     /// The server's label for the model or surface, e.g. `Fable`.
     pub label: String,
@@ -209,7 +228,8 @@ pub struct ScopedLimit {
     pub read_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Session {
     pub host: String,
     pub id: String,
@@ -273,7 +293,8 @@ pub struct Session {
 /// A message from one session, or from the owner in the panel, to a
 /// session: handed to the recipient as context at its next prompt, never
 /// as a turn of its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Message {
     pub id: i64,
     pub workspace: String,
@@ -294,7 +315,8 @@ pub struct Message {
 }
 
 /// What a session says it is working on, so the others keep clear.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Claim {
     pub what: String,
     /// Absolute files or directories the claim covers.
@@ -305,7 +327,8 @@ pub struct Claim {
 }
 
 /// A machine whose collector reports to the hub.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct HostStatus {
     pub name: String,
     pub connected: bool,
@@ -313,7 +336,8 @@ pub struct HostStatus {
     pub since: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Snapshot {
     /// The machine answering: the hub, or a collector showing its mirror.
     pub host: String,
@@ -327,7 +351,8 @@ pub struct Snapshot {
     pub rate_limits: Option<RateLimits>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
     Session {

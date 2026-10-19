@@ -6,6 +6,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::model::{Activity, PARKED_AFTER_MS};
 
@@ -15,7 +16,8 @@ pub type Segment = (i64, i64, Activity);
 /// Event kinds that can end a wait, for SQL `IN (…)`.
 pub const CLOSERS: &str = "'prompt', 'tool', 'permission', 'reply', 'error', 'end'";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export_to = "types.ts", rename = "WaitOutcome")]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// You prompted within `PARKED_AFTER_MS`.
@@ -54,7 +56,8 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Wait {
     /// The hand-over, possibly before the loaded range.
     pub start: i64,

@@ -17,6 +17,7 @@ use anyhow::Result;
 use rusqlite::{Connection, named_params};
 use serde::Serialize;
 use serde_json::Value;
+use ts_rs::TS;
 
 use crate::{
     history::lanes,
@@ -41,7 +42,8 @@ const BOUNDS_MS: [i64; 5] = [30_000, 120_000, 300_000, 900_000, 3_600_000];
 const PROC_SAMPLE_MS: i64 = 60_000;
 const MEMORY_POINTS: i64 = 240;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Analytics {
     pub since: i64,
     pub until: i64,
@@ -77,7 +79,8 @@ pub struct Analytics {
     pub telemetry: Option<Telemetry>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Bucket {
     /// Local midnight (or the hour), as a timestamp.
     pub start: i64,
@@ -114,13 +117,15 @@ pub struct Bucket {
     pub active_cli_secs: f64,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Histogram {
     pub counts: [u32; 6],
     pub median_ms: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ModelCost {
     pub model: String,
     pub cost_usd: f64,
@@ -128,7 +133,8 @@ pub struct ModelCost {
 }
 
 /// Totals of one project or one host.
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Tally {
     pub sessions: u32,
     pub working_ms: i64,
@@ -148,14 +154,16 @@ pub struct Tally {
     pub peak_mem_bytes: u64,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ProjectUse {
     pub cwd: String,
     #[serde(flatten)]
     pub tally: Tally,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct HostUse {
     pub host: String,
     #[serde(flatten)]

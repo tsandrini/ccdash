@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+use ts_rs::TS;
 
 use super::{Bucket, Clock, SessionEvents, percentile};
 use crate::{command, history::Transition, model::Activity};
@@ -13,7 +14,8 @@ const TOP_TOOLS: usize = 15;
 const TOP_COMMANDS: usize = 15;
 const TOP_SLOWEST: usize = 10;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Anatomy {
     pub turns: u32,
     pub claude_ms: i64,
@@ -28,7 +30,8 @@ pub struct Anatomy {
     pub slowest: Vec<SlowCall>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ToolStat {
     /// Tool name, or the command key for Bash commands.
     pub name: String,
@@ -41,7 +44,8 @@ pub struct ToolStat {
     pub last_failed_at: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct SlowCall {
     pub ts: i64,
     pub session: String,

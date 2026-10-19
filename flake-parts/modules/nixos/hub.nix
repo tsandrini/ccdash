@@ -40,6 +40,16 @@ in
       description = "The ccdash package.";
     };
 
+    webPackage = mkOption {
+      type = types.package;
+      default = localFlake.packages.${pkgs.stdenv.hostPlatform.system}.ccdash-web;
+      defaultText = literalExpression "ccdash.packages.\${system}.ccdash-web";
+      description = ''
+        The built panel the hub serves at `/` (`http.web_dir`), with the
+        previous panel under `/v1`.
+      '';
+    };
+
     port = mkOption {
       type = types.port;
       default = 7837;
@@ -142,6 +152,7 @@ in
           listen = mkDefault [ proxyEndpoint ];
           token_file = mkDefault cfg.tokenFile;
           public_url = mkIf cfg.nginx.enable (mkDefault "https://${cfg.nginx.domain}");
+          web_dir = mkDefault "${cfg.webPackage}";
         };
         collect.tokens = cfg.collectors;
         store.path = mkDefault "${stateDir}/ccdash.db";

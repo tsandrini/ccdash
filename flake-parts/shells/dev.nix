@@ -17,6 +17,8 @@
   clippy,
   rustfmt,
   rust-analyzer,
+  nodejs,
+  prefetch-npm-deps,
   pre-commit ? null,
 }:
 mkShell {
@@ -43,6 +45,8 @@ mkShell {
     clippy
     rustfmt
     rust-analyzer
+    nodejs # the panel: `npm ci` and `npm run dev` in web/
+    prefetch-npm-deps # `npmDepsHash` after a lock file change
   ];
 
   shellHook = ''

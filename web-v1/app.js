@@ -238,18 +238,33 @@ class Unauthorized extends Error {}
 
 const token = () => localStorage.getItem(TOKEN_KEY) || "";
 
-/** Reads `#token=…` and `#session=…` (opened once the session is known). */
+/** Reads `#token=…`, `#session=…` (opened once the session is known),
+ * `#view=…` and `#note=ws/slug` (links from the new panel). */
 function takeHash() {
   const token = location.hash.match(/token=([^&]+)/);
   const session = location.hash.match(/session=([^&]+)/);
-  if (!token && !session && !/(^#|&)pair(&|$)/.test(location.hash)) return;
+  const view = location.hash.match(/view=([^&]+)/);
+  const note = location.hash.match(/note=([^&/]+)\/([^&]+)/);
+  if (
+    !token &&
+    !session &&
+    !view &&
+    !note &&
+    !/(^#|&)pair(&|$)/.test(location.hash)
+  )
+    return;
   if (token) localStorage.setItem(TOKEN_KEY, decodeURIComponent(token[1]));
   if (session) state.pendingSession = decodeURIComponent(session[1]);
   if (/(^#|&)pair(&|$)/.test(location.hash)) state.pendingPair = true;
+  if (view) localStorage.setItem(VIEW_KEY, decodeURIComponent(view[1]));
   history.replaceState(null, "", location.pathname + location.search);
+  if (view && started) showView(decodeURIComponent(view[1]));
+  if (note) openNote(decodeURIComponent(note[1]), decodeURIComponent(note[2]));
   openPendingSession();
   openPendingPair();
 }
+
+let started = false;
 
 function openPendingPair() {
   if (!state.pendingPair || !token()) return;
@@ -7332,6 +7347,7 @@ function start() {
   registerWorker();
 
   showView(localStorage.getItem(VIEW_KEY) || "sessions");
+  started = true;
   if (!token()) return askToken();
   runStream();
 }

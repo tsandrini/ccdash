@@ -3,6 +3,7 @@
 //! answered, per bucket, and the sessions you came back to late.
 
 use serde::Serialize;
+use ts_rs::TS;
 
 use super::{Bucket, Clock, percentile};
 use crate::{
@@ -13,7 +14,8 @@ use crate::{
 
 const TOP_LATE: usize = 10;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Waiting {
     pub parked_after_ms: i64,
     /// Waits overlapping the range by outcome; time inside the range.
@@ -30,13 +32,15 @@ pub struct Waiting {
     pub late: Vec<LateWait>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts", rename = "WaitingTally")]
 pub struct Tally {
     pub waits: u32,
     pub ms: i64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct LateWait {
     pub session: String,
     pub label: String,

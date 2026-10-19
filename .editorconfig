@@ -17,3 +17,8 @@ indent_size = unset
 
 [{.envrc,*.sh}]
 indent_style = tab
+
+# the panel: prettier's tabs
+[web/**]
+indent_style = tab
+indent_size = unset

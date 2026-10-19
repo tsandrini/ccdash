@@ -123,7 +123,23 @@ ccdash import db old.db --config /etc/ccdash/hub.toml # history of a pre-hub dae
 ccdash backup --config /etc/ccdash/hub.toml copy.db   # what the nightly timer runs
 ```
 
-The web UI lives on the hub:
+The web UI lives on the hub. The panel (`web/`, a SvelteKit app the hub
+serves at `/`) is phone first: **Now** lists what needs you with the
+answer inline (permission prompts, questions, plans, sessions on your turn
+with a quick reply), then what is working, the hosts with their link state
+and the account limits, and the last progress entries; **Sessions** groups
+every session as below; a session's page has **Chat** (the exchanges with
+Claude's text, grouped tool calls, subagents and the messages between
+sessions), **Shell** (its Bash calls as a terminal transcript with their
+output) and **Details** (the turn, files, tasks, processes, the claim,
+totals), the open prompts pinned above a composer that sends a turn
+through the channel or leaves a note for the next prompt, walks the prompt
+history, inserts `[[note]]` links and keeps drafts; **Settings** holds the
+pairing code, push, the theme, quick replies and templates. Projects,
+History and Analytics are still served by the previous panel at `/v1`
+until they are ported. The workspace and host filters live in the URL.
+
+The previous panel's views, as they are at `/v1`:
 
 - **Sessions:** the ones that need you first, then working, parked and idle,
   then background agents (sessions Claude started, or `claude --bg`), which show
@@ -254,12 +270,12 @@ its disk.
 
 ### Web Push
 
-Served over HTTPS, the web UI installs as an app (the pairing dialog has
-the install button, else the browser's "Add to Home screen"), works
-offline for what it cached, and can take the same notifications as Web
-Push: "Connect a phone" → "Turn on push notifications" asks the browser
-for permission and hands the subscription to the hub; "Send a test" checks
-the way back. The notification shows the prompt with as many buttons as
+Served over HTTPS, the web UI installs as an app (Settings has the install
+button, else the browser's "Add to Home screen"), works offline for what it
+cached, and can take the same notifications as Web Push: Settings → "Turn
+on push notifications" asks the browser for permission and hands the
+subscription to the hub; "Send a test" checks the way back. The
+notification shows the prompt with as many buttons as
 the platform allows (two on Android: Allow / Deny, or the first option and
 "Answer", which opens the panel); tapping it opens the session. It closes
 once the prompt is answered. Push is on by default; the hub generates its
@@ -449,8 +465,27 @@ nix build
 `CCDASH_RUNTIME_DIR` moves a collector's sockets, so a second collector
 (or the hooks of a test session) can run next to the real one.
 
-`CCDASH_WEB_DIR=web` serves the UI from disk instead of the embedded copy,
-so edits show up on reload.
+The panel is `web/` (SvelteKit, Svelte 5, Tailwind, shadcn-svelte,
+LayerChart; Node and npm are in the devshell):
+
+```sh
+cd web && npm ci
+npm run dev    # Vite on :5173; /api and /act go to CCDASH_HUB (127.0.0.1:7837)
+npm run check && npm run lint
+npm run build                # → web/build, what the hub serves
+```
+
+The hub serves `http.web_dir` (the Nix build bakes in the `ccdash-web`
+package; a `cargo run` hub falls back to `web/build`; `CCDASH_WEB_DIR`
+overrides both) with `index.html` for every route and the previous panel
+under `v1/`. The API's TypeScript types (`web/src/lib/api/types.ts`) are
+generated from the Rust models: `cargo test api` fails while the file is
+stale, `CCDASH_UPDATE_TYPES=1 cargo test api` rewrites it. After a change to
+`web/package-lock.json`, put the hash that
+`prefetch-npm-deps web/package-lock.json` prints into
+`flake-parts/pkgs/ccdash-web.nix`. The service worker only
+registers in the built app, so push and the offline shell are checked
+against `web/build` served by a hub.
 
 ## License
 

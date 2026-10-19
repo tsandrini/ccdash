@@ -17,7 +17,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::{mpsc, watch},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     config::HubConfig,
@@ -89,7 +89,17 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
         store.clone(),
         notes,
         cfg.knowledge.clone(),
+        cfg.store.tool_output_bytes,
     );
+    let web_dir = cfg.web_dir();
+    if web_dir.join("index.html").is_file() {
+        info!("serving the panel from {}", web_dir.display());
+    } else {
+        warn!(
+            "{} has no index.html: the panel will not load (build web/ or set http.web_dir)",
+            web_dir.display()
+        );
+    }
     let tokens = collect::Tokens::new(cfg.collect.tokens.clone());
     if cfg.collect.tokens.is_empty() {
         info!("no collector tokens configured: nothing will report");
@@ -108,6 +118,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             tokens.clone(),
             public_url.clone(),
             push.clone(),
+            web_dir.clone(),
         ));
     }
     tokio::spawn(ticker(hub.sender()));

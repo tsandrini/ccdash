@@ -1,8 +1,11 @@
 # --- flake-parts/pkgs/ccdash.nix
+# The hub, collector and hooks. The hub serves the panel from
+# `ccdash-web` unless `http.web_dir` or `CCDASH_WEB_DIR` says otherwise.
 {
   lib,
   flake-root,
   rustPlatform,
+  ccdash-web,
 }:
 let
   cargoToml = lib.importTOML (flake-root + "/Cargo.toml");
@@ -17,13 +20,17 @@ rustPlatform.buildRustPackage {
       (flake-root + "/Cargo.toml")
       (flake-root + "/Cargo.lock")
       (flake-root + "/src")
-      (flake-root + "/web")
+      # NOTE: `cargo test api` checks the exported types against this file
+      (flake-root + "/web/src/lib/api/types.ts")
       (flake-root + "/dms-plugin")
       (flake-root + "/claude-plugin")
     ];
   };
 
   cargoLock.lockFile = flake-root + "/Cargo.lock";
+
+  # NOTE: read by `option_env!` in src/config.rs
+  env.CCDASH_WEB_DIR_DEFAULT = "${ccdash-web}";
 
   postInstall = ''
     mkdir -p $out/share/ccdash

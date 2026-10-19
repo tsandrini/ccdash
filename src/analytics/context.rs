@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use rusqlite::{Connection, named_params};
 use serde::Serialize;
+use ts_rs::TS;
 
 use super::{Bucket, Clock, SessionEvents};
 use crate::workspace::{IN_SCOPE, Scope};
@@ -14,7 +15,8 @@ use crate::workspace::{IN_SCOPE, Scope};
 pub const PEAK_BOUNDS: [f64; 4] = [25.0, 50.0, 75.0, 90.0];
 const TOP_SESSIONS: usize = 8;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ContextHealth {
     pub compactions: u32,
     pub compactions_auto: u32,
@@ -28,7 +30,8 @@ pub struct ContextHealth {
     pub sessions: Vec<ContextSession>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ContextSession {
     pub id: String,
     pub label: String,

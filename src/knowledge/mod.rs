@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use ts_rs::TS;
 
 use crate::util::truncate;
 
@@ -93,7 +94,8 @@ const DAY_MS: i64 = 86_400_000;
 /// Claude Code caps `additionalContext` at 10,000 characters.
 const MAX_CONTEXT: usize = 9_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum NoteKind {
     Memory,
@@ -125,7 +127,8 @@ impl fmt::Display for NoteKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Active,
@@ -156,7 +159,8 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum LinkKind {
     Mentions,
@@ -186,7 +190,8 @@ impl LinkKind {
 }
 
 /// A note as stored, body included.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Note {
     pub workspace: String,
     pub slug: String,
@@ -208,6 +213,7 @@ pub struct Note {
     pub recalled_at: Option<i64>,
     /// Kind-specific fields: issues carry `priority`, `closed_at`,
     /// `closed_by`; progress carries `issue`; imports carry `source`.
+    #[ts(type = "Record<string, unknown>")]
     pub extra: Value,
     pub body: String,
 }
@@ -238,7 +244,8 @@ impl Note {
 }
 
 /// A note in a list: everything but the body, plus its first lines.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Card {
     pub workspace: String,
     pub slug: String,
@@ -266,7 +273,8 @@ impl Card {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
@@ -301,7 +309,8 @@ fn priority_of(extra: &Value) -> Priority {
 }
 
 /// A link as the panel shows it: the other end, resolved when it exists.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct LinkRef {
     pub slug: String,
     pub kind: LinkKind,
@@ -312,7 +321,8 @@ pub struct LinkRef {
 }
 
 /// A note with its neighbourhood.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct NoteView {
     #[serde(flatten)]
     pub note: Note,
@@ -321,7 +331,8 @@ pub struct NoteView {
 }
 
 /// A search hit.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Hit {
     #[serde(flatten)]
     pub card: Card,
@@ -330,7 +341,8 @@ pub struct Hit {
 }
 
 /// What a write did.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Written {
     pub slug: String,
     pub kind: NoteKind,
@@ -344,7 +356,8 @@ pub struct Written {
 
 /// A full write of one note, as the importer and the tools produce it;
 /// `upsert` keeps or replaces what is stored under the slug.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Upsert {
     pub slug: String,
     pub kind: NoteKind,
@@ -356,6 +369,7 @@ pub struct Upsert {
     #[serde(default = "default_status")]
     pub status: Status,
     #[serde(default = "empty_object")]
+    #[ts(type = "Record<string, unknown>")]
     pub extra: Value,
     pub body: String,
     /// Explicit links besides the `[[slug]]`s in the body.
@@ -381,7 +395,8 @@ fn empty_object() -> Value {
 
 /// What a session asks of the knowledge layer; the write half is durable
 /// (queued while the hub is unreachable).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum NoteOp {
     Remember {
@@ -446,7 +461,8 @@ pub enum NoteOp {
 }
 
 /// A read: by slug, or a search.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Query {
     #[serde(default)]
     pub slug: Option<String>,
@@ -1393,7 +1409,8 @@ pub fn changed_since<'a>(cards: &'a [Card], project: Option<&str>, since: i64) -
 }
 
 /// Someone else's recent edit of a file, for the PreToolUse injection.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct RecentEdit {
     pub session: String,
     pub host: String,

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::{
     model::{Activity, Kind, Session},
@@ -12,7 +13,8 @@ use crate::{
     workspace::{IN_SCOPE, Scope},
 };
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct History {
     pub since: i64,
     pub until: i64,
@@ -28,7 +30,8 @@ pub struct History {
     pub hosts: Vec<HostTotals>,
 }
 
-#[derive(Debug, Default, PartialEq, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct HostTotals {
     pub host: String,
     pub sessions: u32,
@@ -41,14 +44,16 @@ pub struct HostTotals {
     pub cost_usd: f64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ToolCount {
     pub name: String,
     pub calls: i64,
     pub failed: i64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Lane {
     pub id: String,
     pub label: String,
@@ -64,7 +69,8 @@ pub struct Lane {
     pub waits: Vec<Wait>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct UsagePoint {
     pub ts: i64,
     pub five_hour: Option<f64>,

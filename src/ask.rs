@@ -16,6 +16,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use ts_rs::TS;
 
 use crate::{
     emit,
@@ -181,7 +182,8 @@ fn always(suggestions: &Value) -> (Option<String>, Vec<Value>) {
 }
 
 /// An answer from the web UI, the CLI or a notification button.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Answer {
     /// Allows the tool call or approves the plan.
@@ -190,6 +192,7 @@ pub enum Answer {
     /// with one it carries on with that feedback.
     Deny {
         #[serde(default)]
+        #[ts(optional)]
         message: Option<String>,
     },
     /// Allows the call and applies the suggested permission updates.

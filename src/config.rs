@@ -98,6 +98,11 @@ pub struct Http {
     /// e.g. `https://ccdash.example.org`. Defaults to this machine's LAN
     /// address and the first HTTP port.
     pub public_url: Option<String>,
+    /// Directory holding the built panel (`index.html`, `_app/`, and the
+    /// previous panel under `v1/`). Defaults to the one the Nix build
+    /// bakes in, else `web/build` under the working directory; the
+    /// `CCDASH_WEB_DIR` environment variable overrides both.
+    pub web_dir: Option<PathBuf>,
 }
 
 /// Collector links: one token per machine, keyed by the host name the
@@ -233,6 +238,9 @@ pub struct Telemetry {
 pub struct Store {
     pub path: Option<PathBuf>,
     pub retention_days: u32,
+    /// Bytes of a Bash call's output (or a failed call's error) kept with
+    /// its event, for the session page's Shell view; 0 keeps none.
+    pub tool_output_bytes: usize,
 }
 
 impl Default for Http {
@@ -241,6 +249,7 @@ impl Default for Http {
             listen: vec![SocketAddr::from(([127, 0, 0, 1], 7837))],
             token_file: None,
             public_url: None,
+            web_dir: None,
         }
     }
 }
@@ -333,6 +342,7 @@ impl Default for Store {
         Self {
             path: None,
             retention_days: 30,
+            tool_output_bytes: 8192,
         }
     }
 }
@@ -360,6 +370,21 @@ impl HubConfig {
             .path
             .clone()
             .unwrap_or_else(|| paths::state_dir().join("ccdash.db"))
+    }
+
+    /// Where the panel's files are: `CCDASH_WEB_DIR`, else `http.web_dir`,
+    /// else the directory baked in at build time, else `web/build`.
+    pub fn web_dir(&self) -> PathBuf {
+        if let Some(dir) = std::env::var_os("CCDASH_WEB_DIR") {
+            return PathBuf::from(dir);
+        }
+        if let Some(dir) = &self.http.web_dir {
+            return PathBuf::from(crate::util::expand_env(&dir.to_string_lossy()));
+        }
+        match option_env!("CCDASH_WEB_DIR_DEFAULT") {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from("web/build"),
+        }
     }
 
     pub fn push_key_file(&self) -> PathBuf {

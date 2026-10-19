@@ -179,6 +179,7 @@ impl Hub {
         store: Store,
         notes: Option<Notes>,
         knowledge: KnowledgeCfg,
+        tool_output_bytes: usize,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         let (updates, _) = broadcast::channel(256);
@@ -202,6 +203,7 @@ impl Hub {
             updates: updates.clone(),
             notes,
             knowledge,
+            tool_output_bytes,
             cmds: tx.clone(),
         };
         tokio::spawn(run(core, rx));
@@ -314,6 +316,8 @@ struct Core {
     updates: broadcast::Sender<Update>,
     notes: Option<Notes>,
     knowledge: KnowledgeCfg,
+    /// `store.tool_output_bytes`, handed to every host's reducer.
+    tool_output_bytes: usize,
     /// For tasks that finish a knowledge call and report back.
     cmds: mpsc::Sender<Cmd>,
 }
@@ -537,9 +541,10 @@ impl Core {
     ) {
         let now = now_ms();
         info!("collector {host} connected");
-        self.states
-            .entry(host.clone())
-            .or_insert_with(|| State::new(host.clone(), terminals, self.workspaces.clone()));
+        self.states.entry(host.clone()).or_insert_with(|| {
+            State::new(host.clone(), terminals, self.workspaces.clone())
+                .with_tool_output_bytes(self.tool_output_bytes)
+        });
         self.links.insert(
             host.clone(),
             Link {

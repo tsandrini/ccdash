@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{info, warn};
+use ts_rs::TS;
 
 use crate::{
     config,
@@ -235,13 +236,15 @@ fn topic(seq: &str) -> String {
 // --- subscriptions ----------------------------------------------------------
 
 /// What the browser's `PushSubscription.toJSON()` gives.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Subscribe {
     pub endpoint: String,
     pub keys: SubscribeKeys,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct SubscribeKeys {
     pub p256dh: String,
     pub auth: String,
@@ -265,7 +268,8 @@ impl Subscribe {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Subscription {
     pub id: i64,
     pub endpoint: String,
@@ -362,7 +366,8 @@ fn settle(conn: &Connection, id: i64, outcome: &Outcome, now: i64) -> Result<()>
 
 // --- sending ----------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts", rename = "PushOutcome")]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
     Sent,

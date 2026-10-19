@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::Serialize;
+use ts_rs::TS;
 
 use crate::{
     model::{Limit, RateLimits},
@@ -23,7 +24,8 @@ const RECENT_SEVEN_DAY_MS: i64 = 24 * HOUR_MS;
 /// A drop of this many points between readings starts a new 5-hour window.
 const RESET_DROP: f64 = 3.0;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Limits {
     pub five_hour: Option<Forecast>,
     pub seven_day: Option<Forecast>,
@@ -39,7 +41,8 @@ pub struct Limits {
     pub scoped: Vec<ScopedForecast>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct ScopedForecast {
     /// The server's label, e.g. `Fable`.
     pub label: String,
@@ -50,7 +53,8 @@ pub struct ScopedForecast {
     pub week: Vec<(i64, f64)>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Forecast {
     pub used_pct: f64,
     /// When the window resets, in ms.
@@ -68,14 +72,16 @@ pub struct Forecast {
     pub full_at: Option<i64>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Window {
     pub start: i64,
     pub end: i64,
     pub peak: f64,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, TS)]
+#[ts(export_to = "types.ts")]
 pub struct Share {
     /// None for sessions outside every workspace, or for `other`.
     pub workspace: Option<String>,
