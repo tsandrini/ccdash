@@ -228,12 +228,18 @@ in
           ${exe} backup --config ${configFile} "$dir/ccdash-$(date +%F).db"
           find "$dir" -name 'ccdash-*.db' -type f -printf '%T@ %p\n' | sort -rn \
             | tail -n +$((${toString cfg.backup.keep} + 1)) | cut -d' ' -f2- | xargs -r rm --
+          # NOTE: earlier copies left WAL side files and were world-readable
+          find "$dir" -name 'ccdash-*.db.partial-*' -type f -delete
+          chmod -R go-rwx "$dir"
         '';
         serviceConfig = {
           Type = "oneshot";
           User = "ccdash";
           Group = "ccdash";
           StateDirectory = "ccdash-hub";
+          # NOTE: the hub's mode; without it each run resets the state dir to 0755
+          StateDirectoryMode = "0700";
+          UMask = "0077";
         };
       };
       systemd.timers.ccdash-hub-backup = {

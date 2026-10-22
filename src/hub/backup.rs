@@ -22,6 +22,9 @@ pub fn backup(source: &Path, dest: &Path) -> Result<()> {
             Connection::open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let copy = Backup::new(&src, &mut dst)?;
         copy.run_to_completion(256, std::time::Duration::from_millis(20), None)?;
+        drop(copy);
+        // NOTE: a WAL copy grows -wal/-shm files that the rename leaves behind
+        dst.pragma_update(None, "journal_mode", "DELETE")?;
     }
     let check = Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let verdict: String = check.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
@@ -54,6 +57,13 @@ mod tests {
             .unwrap();
         let dest = dir.join("copy.db");
         backup(&src, &dest).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("copy"))
+            .collect();
+        left.sort();
+        assert_eq!(left, ["copy.db"], "no side files of the partial copy");
         let n: i64 = Connection::open(&dest)
             .unwrap()
             .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))

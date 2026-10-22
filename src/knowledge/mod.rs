@@ -1045,7 +1045,8 @@ pub fn heading(body: &str) -> Option<String> {
 
 /// `base`, or `base-2`, `base-3`… when taken.
 fn free_slug(conn: &Connection, workspace: &str, base: &str) -> Result<String> {
-    let base = if base.is_empty() { "note" } else { base };
+    // NOTE: a project prefix or a `-N` suffix must not push it past MAX_SLUG
+    let base = cut_slug(if base.is_empty() { "note" } else { base }, MAX_SLUG - 4);
     if id_of(conn, workspace, base)?.is_none() {
         return Ok(base.to_owned());
     }
@@ -1056,6 +1057,14 @@ fn free_slug(conn: &Connection, workspace: &str, base: &str) -> Result<String> {
         }
     }
     bail!("too many notes named {base}")
+}
+
+/// `slug` cut to at most `max` characters, without a trailing `-`.
+fn cut_slug(slug: &str, max: usize) -> &str {
+    slug.char_indices()
+        .nth(max)
+        .map_or(slug, |(at, _)| &slug[..at])
+        .trim_end_matches('-')
 }
 
 /// A note with its links and backlinks resolved.
@@ -1814,6 +1823,27 @@ mod tests {
         let v = view(&conn, "ws", "font-pick-2").unwrap().unwrap();
         assert_eq!(v.links[0].kind, LinkKind::Supersedes);
         assert_eq!(active(&conn, "ws").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn long_issue_titles_still_make_valid_slugs() {
+        let conn = db();
+        let long = NoteOp::IssueAdd {
+            title: "Consume the neoadmin monorepo, drop the neoadmin-client input and \
+                    rebuild the PVE 135 client package from the merged tree"
+                .into(),
+            body: None,
+            project: Some("nixos-infra".into()),
+            priority: None,
+        };
+        let mut slugs = Vec::new();
+        for _ in 0..2 {
+            let w = apply(&conn, "ws", None, Some("s1"), &long, 1).unwrap();
+            assert!(valid_slug(&w.slug) && !w.slug.ends_with('-'), "{}", w.slug);
+            assert!(w.slug.starts_with("nixos-infra--consume-the-neoadmin"));
+            slugs.push(w.slug);
+        }
+        assert_ne!(slugs[0], slugs[1]);
     }
 
     #[test]
