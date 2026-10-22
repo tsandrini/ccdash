@@ -18,7 +18,7 @@ statusline ─────────► ccdash tee ──┼──► ccdash c
 claude agents --json ──────────────┤      │ (forwards, acts)      │ (state, SQLite,
 claude -p /usage ──────────────────┤      └──► DMS plugin         │  notifications)
 niri window events ────────────────┘                              ├──► web UI
-                                                                  └──► ntfy
+                                                                  └──► Web Push
 ```
 
 - Every session reports through Claude Code hooks to a small **collector**
@@ -36,9 +36,8 @@ niri window events ────────────────┘          
   and stops sessions in known projects. "Open in Claude"
   opens a session in the Claude app through Remote Control. Every view can
   be narrowed to one host.
-- **Notifications** reach the phone (and a watch mirroring it) with
-  buttons that answer the prompt: through [ntfy](https://ntfy.sh), or as
-  Web Push to the web UI installed as an app, or both.
+- **Notifications** reach the phone (and a watch mirroring it) as Web Push
+  to the web UI installed as an app, with buttons that answer the prompt.
 - The **DMS plugin** on each workstation shows that machine's sessions
   (mirrored from the hub): a bar indicator, a quick list, and a full
   dashboard tab. Clicking a session focuses its terminal window in niri.
@@ -243,37 +242,6 @@ only for SDK hosts, so recheck after updates).
 
 ### Notifications
 
-The hub can push prompts and finished turns to an
-[ntfy](https://docs.ntfy.sh) server; the ntfy app on the phone shows them
-with buttons (Allow / Deny / Always, up to three options of a question,
-Approve / Keep planning), which a watch mirroring the phone's notifications
-can press too. A notification waits 15 s (2 minutes while the session's
-window has focus), so a prompt answered at the desk never sends one, and it
-is deleted from the phone once the prompt is answered anywhere.
-
-```nix
-services.ccdash-hub.settings.notify = {
-  url = "https://ntfy.example.org";
-  topic = "ccdash";
-  token_file = "/run/agenix/ccdash-ntfy-token"; # may publish to the topic
-  # where buttons and taps point; default: the hub's public URL
-  # web_url = "https://ccdash.example.org";
-  # turns = false;  questions, plans, permissions: per-kind switches
-  # workspaces = [ "work" ];  only these workspaces
-};
-```
-
-A button calls `POST /act/<key>/<action>` on the hub with a random key
-that belongs to that one prompt and dies with it; the access token never
-goes into a notification. The phone needs to reach the hub (LAN or VPN)
-for the buttons to work. Notifications carry session titles, commands
-and questions, so use an ntfy server you run, with access control. Keeping
-it on the same LAN or VPN costs nothing (the buttons need it anyway), and a
-short in-memory cache (`cache-duration`, no `cache-file`) keeps the text off
-its disk.
-
-### Web Push
-
 Served over HTTPS, the web UI installs as an app (Settings has the install
 button, else the browser's "Add to Home screen"), works offline for what it
 cached, and can take the same notifications as Web Push: Settings → "Turn
@@ -281,8 +249,11 @@ on push notifications" asks the browser for permission and hands the
 subscription to the hub; "Send a test" checks the way back. The
 notification shows the prompt with as many buttons as
 the platform allows (two on Android: Allow / Deny, or the first option and
-"Answer", which opens the panel); tapping it opens the session. It closes
-once the prompt is answered. Push is on by default; the hub generates its
+"Answer", which opens the panel); tapping it opens the session, and a watch
+mirroring the phone's notifications can press the buttons too. A
+notification waits 15 s (2 minutes while the session's window has focus),
+so a prompt answered at the desk never sends one, and it closes once the
+prompt is answered anywhere. Push is on by default; the hub generates its
 VAPID key pair at `push.key_file` on first start (the NixOS module keeps
 it in `/var/lib/ccdash-hub`), messages are encrypted for the device
 (RFC 8291) and go through the browser vendor's push service, which sees
@@ -294,7 +265,17 @@ services.ccdash-hub.settings.push = {
   subject = "mailto:you@example.org"; # VAPID contact; default: public URL
   # ttl_secs = 3600;  how long the service holds an undelivered message
 };
+services.ccdash-hub.settings.notify = {
+  # turns = false;  questions, plans, permissions: per-kind switches
+  # workspaces = [ "work" ];  only these workspaces
+  # web_url = "https://ccdash.example.org";  where taps point; default: public URL
+};
 ```
+
+A button calls `POST /act/<key>/<action>` on the hub with a random key
+that belongs to that one prompt and dies with it; the access token never
+goes into a notification. The phone needs to reach the hub (LAN or VPN)
+for the buttons to work.
 
 ### Replying from the phone
 

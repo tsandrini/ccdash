@@ -3,18 +3,16 @@
 //! it ends. Prompt notifications carry buttons that answer through
 //! `/act/{key}/{action}` on the hub, so the phone (or a watch mirroring it)
 //! answers without opening anything. The [`Composer`] turns the live state
-//! into backend-neutral notes; a [`Sink`] delivers them: ntfy
-//! (docs.ntfy.sh/publish) here, Web Push in `push`.
+//! into notes; a [`Sink`] delivers them (Web Push, in `push`).
 
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::Serialize;
-use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -22,20 +20,19 @@ use crate::{
     config::Notify,
     model::{Activity, Ask, AskKind, Kind, Session},
     state::State,
-    util::{expand_env, now_ms, truncate},
+    util::{now_ms, truncate},
 };
 
 const BODY_LEN: usize = 400;
 const LABEL_LEN: usize = 40;
-/// ntfy shows at most three buttons; the service worker fits the phone's
-/// own limit from the same list.
+/// At most three buttons; the service worker fits the phone's own limit
+/// from the same list.
 const MAX_BUTTONS: usize = 3;
 
 /// A notification that is due once its wait passes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
-    /// Identifies the notification across backends (ntfy sequence id, push
-    /// tag); the delete addresses it.
+    /// Identifies the notification (the push tag); the delete addresses it.
     pub seq: String,
     pub opened_at: i64,
     /// The session's window has keyboard focus.
@@ -60,9 +57,6 @@ pub struct Content {
     pub more: bool,
     /// A prompt, as opposed to a finished turn.
     pub urgent: bool,
-    /// ntfy emoji tag.
-    #[serde(skip)]
-    pub icon: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -160,7 +154,7 @@ impl Composer {
             label: truncate(label, LABEL_LEN),
             action: action.to_owned(),
         };
-        let (title, body, icon) = match &ask.kind {
+        let (title, body) = match &ask.kind {
             AskKind::Tool {
                 tool,
                 description,
@@ -185,7 +179,7 @@ impl Composer {
                 if always.is_some() {
                     buttons.push(button("Always", "always"));
                 }
-                (format!("{label}: allow {tool}?"), body, "key")
+                (format!("{label}: allow {tool}?"), body)
             }
             AskKind::Question { questions } => {
                 let body = questions
@@ -212,12 +206,12 @@ impl Composer {
                     }
                     _ => more = true,
                 }
-                (format!("{label} asks"), body, "question")
+                (format!("{label} asks"), body)
             }
             AskKind::Plan { plan } => {
                 buttons.push(button("Approve", "allow"));
                 buttons.push(button("Keep planning", "deny"));
-                (format!("{label}: plan ready"), plan.clone(), "clipboard")
+                (format!("{label}: plan ready"), plan.clone())
             }
         };
         if key.is_none() {
@@ -232,7 +226,6 @@ impl Composer {
             buttons,
             more,
             urgent: true,
-            icon,
         }
     }
 
@@ -257,7 +250,6 @@ impl Composer {
             buttons: Vec::new(),
             more: false,
             urgent: false,
-            icon: "speech_balloon",
         }
     }
 }
@@ -359,134 +351,10 @@ fn report<S: Sink>(result: Result<()>, last_error: &mut Option<String>) {
     }
 }
 
-// --- ntfy -------------------------------------------------------------------
-
-/// JSON publishes to an ntfy topic, with `http` buttons for the answers.
-pub struct Ntfy {
-    cfg: Notify,
-    web_url: String,
-}
-
-impl Ntfy {
-    pub fn new(cfg: Notify, web_url: String) -> Self {
-        Self {
-            cfg,
-            web_url: web_url.trim_end_matches('/').to_owned(),
-        }
-    }
-
-    /// The ntfy JSON message without `topic` and `sequence_id`.
-    fn message(&self, note: &Note) -> Value {
-        let c = &note.content;
-        let mut actions: Vec<Value> = match &c.key {
-            Some(key) => c
-                .buttons
-                .iter()
-                .map(|b| {
-                    json!({
-                        "action": "http",
-                        "label": b.label,
-                        "url": format!("{}/act/{key}/{}", self.web_url, b.action),
-                        "method": "POST",
-                        "clear": true,
-                    })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        if c.more {
-            actions.push(json!({
-                "action": "view",
-                "label": "Answer",
-                "url": c.url,
-                "clear": true,
-            }));
-        }
-        let mut message = json!({
-            "title": c.title,
-            "message": c.body,
-            "priority": if c.urgent { 4 } else { 3 },
-            "tags": [c.icon],
-            "click": c.url,
-        });
-        if !actions.is_empty() {
-            message["actions"] = actions.into();
-        }
-        message
-    }
-}
-
-impl Sink for Ntfy {
-    const NAME: &'static str = "ntfy";
-
-    async fn publish(&self, note: &Note) -> Result<()> {
-        let mut body = self.message(note);
-        body["topic"] = self.cfg.topic.clone().into();
-        body["sequence_id"] = note.seq.clone().into();
-        let (url, token) = (
-            self.cfg.url.trim_end_matches('/').to_owned(),
-            token(&self.cfg)?,
-        );
-        blocking(move || {
-            let mut request = agent()
-                .post(&url)
-                .header("Content-Type", "application/json");
-            if let Some(token) = &token {
-                request = request.header("Authorization", &format!("Bearer {token}"));
-            }
-            request.send(body.to_string()).map(drop)
-        })
-        .await
-        .context("publishing")
-    }
-
-    async fn delete(&self, seq: &str) -> Result<()> {
-        let url = format!(
-            "{}/{}/{seq}",
-            self.cfg.url.trim_end_matches('/'),
-            self.cfg.topic
-        );
-        let token = token(&self.cfg)?;
-        blocking(move || {
-            let mut request = agent().delete(&url);
-            if let Some(token) = &token {
-                request = request.header("Authorization", &format!("Bearer {token}"));
-            }
-            request.call().map(drop)
-        })
-        .await
-        .context("deleting")
-    }
-}
-
-async fn blocking(call: impl FnOnce() -> Result<(), ureq::Error> + Send + 'static) -> Result<()> {
-    Ok(tokio::task::spawn_blocking(call).await??)
-}
-
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .build()
-        .into()
-}
-
-/// Read at every call, so a rotated token needs no restart.
-fn token(cfg: &Notify) -> Result<Option<String>> {
-    let Some(path) = &cfg.token_file else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(expand_env(&path.to_string_lossy()));
-    let token =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let token = token.trim();
-    if token.is_empty() {
-        bail!("{} is empty", path.display());
-    }
-    Ok(Some(token.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::{
         model::{Choice, Question},
@@ -549,10 +417,6 @@ mod tests {
         Composer::new(Notify::default(), WEB.into(), 1_000)
     }
 
-    fn ntfy() -> Ntfy {
-        Ntfy::new(Notify::default(), WEB.into())
-    }
-
     #[test]
     fn prompts_get_buttons_with_their_key() {
         let mut st = state_with_prompt(2_000);
@@ -572,37 +436,17 @@ mod tests {
         let actions: Vec<&str> = c.buttons.iter().map(|b| b.action.as_str()).collect();
         assert_eq!(actions, ["allow", "deny", "always"]);
 
-        let m = ntfy().message(note);
-        assert_eq!(m["title"], "repo: allow Bash?");
-        assert_eq!(m["priority"], 4);
-        assert_eq!(m["tags"], json!(["key"]));
-        let urls: Vec<&str> = m["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["url"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            urls,
-            [
-                "http://10.0.0.2:7837/act/k3y/allow",
-                "http://10.0.0.2:7837/act/k3y/deny",
-                "http://10.0.0.2:7837/act/k3y/always",
-            ]
-        );
-        // The push payload carries the same, for the service worker to lay out.
+        // The push payload carries them for the service worker to lay out.
         let payload = serde_json::to_value(c).unwrap();
         assert_eq!(payload["key"], "k3y");
         assert_eq!(
             payload["buttons"][1],
             json!({"label": "Deny", "action": "deny"})
         );
-        assert!(payload.get("icon").is_none());
 
         // Without a key there is nothing to press.
         let notes = composer().notes(&st, &HashMap::new(), 3_000);
         assert!(notes[0].content.buttons.is_empty() && notes[0].content.key.is_none());
-        assert!(ntfy().message(&notes[0]).get("actions").is_none());
 
         // Nothing from before the daemon started; nothing for turned-off kinds.
         let late = Composer::new(Notify::default(), "http://x".into(), 5_000);
@@ -643,19 +487,18 @@ mod tests {
             assert!(s.add_ask(SID, ask, &mut Effects::default()));
             s
         };
-        let labels = |options, multi| -> Vec<String> {
+        let labels = |options, multi| -> (Vec<String>, bool) {
             let st = session(options, multi);
             let notes = composer().notes(&st, &HashMap::from([("q", "k")]), 3_000);
-            ntfy().message(&notes[0])["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|a| a["label"].as_str().unwrap().to_owned())
-                .collect()
+            let c = &notes[0].content;
+            (c.buttons.iter().map(|b| b.label.clone()).collect(), c.more)
         };
-        assert_eq!(labels(3, false), ["opt0", "opt1", "opt2"]);
-        assert_eq!(labels(4, false), ["opt0", "opt1", "Answer"]);
-        assert_eq!(labels(2, true), ["Answer"]);
+        assert_eq!(
+            labels(3, false),
+            (vec!["opt0".into(), "opt1".into(), "opt2".into()], false)
+        );
+        assert_eq!(labels(4, false), (vec!["opt0".into(), "opt1".into()], true));
+        assert_eq!(labels(2, true), (Vec::new(), true));
     }
 
     #[test]
@@ -678,11 +521,7 @@ mod tests {
         let notes = composer().notes(&st, &HashMap::new(), 5_000);
         assert_eq!(notes[0].seq, format!("turn-{SID}-4000"));
         assert_eq!(notes[0].content.body, "All done.");
-        assert!(!notes[0].content.urgent);
-        let m = ntfy().message(&notes[0]);
-        assert_eq!(m["message"], "All done.");
-        assert_eq!(m["priority"], 3);
-        assert!(m.get("actions").is_none());
+        assert!(!notes[0].content.urgent && notes[0].content.buttons.is_empty());
 
         let elsewhere = Composer::new(
             Notify {
@@ -730,96 +569,5 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert!(notes[0].content.title.starts_with("Finished: "));
         assert_eq!(notes[0].content.body, "Done.");
-    }
-
-    /// Serves one canned response and returns the raw request.
-    fn capture() -> (String, std::thread::JoinHandle<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let mut buf = vec![0u8; 8192];
-            let mut got = Vec::new();
-            while let Ok(n) = conn.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                got.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&got);
-                if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                    let len = head
-                        .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                        })
-                        .unwrap_or(0);
-                    if body.len() >= len {
-                        break;
-                    }
-                }
-            }
-            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
-                .unwrap();
-            String::from_utf8_lossy(&got).into_owned()
-        });
-        (url, handle)
-    }
-
-    #[tokio::test]
-    async fn publishes_and_deletes_with_the_token() {
-        let dir = std::env::temp_dir().join(format!("ccdash-notify-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let token_file = dir.join("token");
-        std::fs::write(&token_file, "tk_test\n").unwrap();
-        let (url, server) = capture();
-        let cfg = Notify {
-            url: url.clone(),
-            topic: "t".into(),
-            token_file: Some(token_file),
-            ..Notify::default()
-        };
-        let note = Note {
-            seq: "ask-1".into(),
-            opened_at: 0,
-            focused: false,
-            content: Content {
-                title: "x".into(),
-                body: "b".into(),
-                session: SID.into(),
-                url: "http://x/sessions/1".into(),
-                key: None,
-                buttons: Vec::new(),
-                more: false,
-                urgent: false,
-                icon: "speech_balloon",
-            },
-        };
-        Ntfy::new(cfg.clone(), WEB.into())
-            .publish(&note)
-            .await
-            .unwrap();
-        let request = server.join().unwrap();
-        assert!(request.starts_with("POST / HTTP/1.1"), "{request}");
-        assert!(
-            request.contains("authorization: Bearer tk_test")
-                || request.contains("Authorization: Bearer tk_test")
-        );
-        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(
-            body,
-            json!({"title": "x", "message": "b", "priority": 3, "tags": ["speech_balloon"],
-                "click": "http://x/sessions/1", "topic": "t", "sequence_id": "ask-1"})
-        );
-
-        let (url, server) = capture();
-        let cfg = Notify { url, ..cfg };
-        Ntfy::new(cfg, WEB.into()).delete("ask-1").await.unwrap();
-        let request = server.join().unwrap();
-        assert!(request.starts_with("DELETE /t/ask-1 HTTP/1.1"), "{request}");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

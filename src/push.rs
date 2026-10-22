@@ -1,4 +1,4 @@
-//! Web Push (RFC 8030) from the hub, next to ntfy. The panel installed on
+//! Web Push (RFC 8030) from the hub. The panel installed on
 //! a phone hands its subscription to `/api/v1/push/subscriptions`; every
 //! notification is then encrypted for that device (RFC 8291, `aes128gcm`),
 //! signed with the hub's VAPID key (RFC 8292) and posted to the push

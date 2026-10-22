@@ -195,18 +195,12 @@ pub struct Usage {
     pub interval_secs: u64,
 }
 
-/// Phone notifications through an ntfy server; prompt notifications carry
-/// buttons that answer them. Off while `url` is empty.
+/// Which prompts and turns notify the phone (through Web Push, `[push]`),
+/// and when; prompt notifications carry buttons that answer them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Notify {
-    /// The ntfy server, e.g. `https://ntfy.example.org`.
-    pub url: String,
-    pub topic: String,
-    /// File holding an ntfy access token that may publish to `topic`;
-    /// `$VAR` and `${VAR}` expand.
-    pub token_file: Option<PathBuf>,
-    /// Where button and tap links point; defaults to `http.public_url`.
+    /// Where tap links point; defaults to `http.public_url`.
     pub web_url: Option<String>,
     /// Seconds a prompt or a finished turn waits before it notifies, so
     /// one answered at the desk never does.
@@ -223,7 +217,7 @@ pub struct Notify {
     pub workspaces: Vec<String>,
 }
 
-/// Web Push (RFC 8030) to the panel installed on phones, next to ntfy.
+/// Web Push (RFC 8030) to the panel installed on phones.
 /// Subscriptions come from the panel's pairing dialog; the hub signs
 /// (VAPID) and encrypts every message itself.
 #[derive(Debug, Clone, Deserialize)]
@@ -298,9 +292,6 @@ impl Default for Usage {
 impl Default for Notify {
     fn default() -> Self {
         Self {
-            url: String::new(),
-            topic: "ccdash".into(),
-            token_file: None,
             web_url: None,
             delay_secs: 15,
             focused_delay_secs: 120,

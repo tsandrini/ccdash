@@ -1,7 +1,6 @@
 # The ccdash hub: the one process that keeps every machine's Claude Code
-# history, serves the web UI and API, and sends notifications (ntfy and
-# Web Push; the VAPID key pair is generated into the state directory on
-# first start). Collectors (the home-manager module) connect to its
+# history, serves the web UI and API, and sends Web Push notifications (the
+# VAPID key pair is generated into the state directory on first start). Collectors (the home-manager module) connect to its
 # `/collect` endpoint, each with its own token.
 { localFlake }:
 {
@@ -91,10 +90,7 @@ in
         {
           workspaces.dirs = [ "/home/me/code/work" ];
           store.retention_days = 90;
-          notify = {
-            url = "https://ntfy.example.org";
-            token_file = "/run/agenix/ccdash-ntfy-token";
-          };
+          notify.workspaces = [ "work" ];
         }
       '';
       description = ''

@@ -57,7 +57,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
         })
         .transpose()
         .context("web push")?;
-    let notes = (!cfg.notify.url.is_empty() || push.is_some()).then(|| {
+    let notes = push.as_ref().map(|push| {
         let web_url = cfg
             .notify
             .web_url
@@ -65,18 +65,8 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             .unwrap_or_else(|| public_url.clone());
         let (tx, rx) = watch::channel(Vec::new());
         let delays = Delays::from(&cfg.notify);
-        if !cfg.notify.url.is_empty() {
-            info!("notifications to {} link to {web_url}", cfg.notify.url);
-            tokio::spawn(notify::run(
-                delays,
-                rx,
-                notify::Ntfy::new(cfg.notify.clone(), web_url.clone()),
-            ));
-        }
-        if let Some(push) = &push {
-            info!("web push on, linking to {web_url}");
-            tokio::spawn(notify::run(delays, tx.subscribe(), push.clone()));
-        }
+        info!("web push on, linking to {web_url}");
+        tokio::spawn(notify::run(delays, rx, push.clone()));
         Notes {
             composer: Composer::new(cfg.notify.clone(), web_url, now_ms()),
             tx,

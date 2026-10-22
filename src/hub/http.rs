@@ -699,8 +699,8 @@ async fn prompts(
     Ok(Json(json!({ "prompts": prompts })))
 }
 
-/// A notification button, sent by the phone's ntfy app: the key in the
-/// link is the ask's own secret, valid until the prompt closes.
+/// A notification button, sent by the panel's service worker: the key in
+/// the link is the ask's own secret, valid until the prompt closes.
 async fn button(
     State(app): State<App>,
     Path((key, action)): Path<(String, String)>,
