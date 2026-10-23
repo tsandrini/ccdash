@@ -22,6 +22,7 @@ import type {
 	Session,
 	Stats,
 	Subscription,
+	SyncView,
 	Token,
 	Written
 } from './types';
@@ -80,6 +81,15 @@ export const forgetSession = (id: string) =>
 /** Focuses its window or attaches it in a terminal on its host. */
 export const openSession = (id: string) =>
 	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/open`, {});
+
+/** Every machine's copy of Claude Code's state, and the open conflicts. */
+export const fetchSync = () => getJson<SyncView>('sync');
+
+/** The machine compares every file with the hub again. */
+export const resyncHost = (host: string) =>
+	postJson<{ ok: boolean }>(`sync/${encodeURIComponent(host)}/resync`, {});
+
+export const dismissConflict = (id: number) => del<{ ok: boolean }>(`sync/conflicts/${id}`);
 
 export const fetchPrompts = (params: { session?: string; workspace?: string; limit?: number }) =>
 	getJson<{ prompts: Prompt[] }>(`prompts${query(params)}`);

@@ -297,6 +297,10 @@ pub struct Session {
     pub tasks: Vec<Task>,
     pub subagents: Vec<Subagent>,
     pub started_at: i64,
+    /// When this host's process opened the session (started or resumed
+    /// it); who opened it first holds it when two hosts have it open.
+    #[serde(default)]
+    pub opened_at: i64,
     pub last_event_at: i64,
 }
 
@@ -345,6 +349,7 @@ impl Session {
             tasks: Vec::new(),
             subagents: Vec::new(),
             started_at: 0,
+            opened_at: 0,
             last_event_at: 0,
         }
     }

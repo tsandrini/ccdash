@@ -714,7 +714,12 @@ inbox: Array<Message>,
 /**
  * What the session says it is working on.
  */
-claim: Claim | null, resources: Resources | null, turn: Turn | null, tasks: Array<Task>, subagents: Array<Subagent>, started_at: number, last_event_at: number, };
+claim: Claim | null, resources: Resources | null, turn: Turn | null, tasks: Array<Task>, subagents: Array<Subagent>, started_at: number, 
+/**
+ * When this host's process opened the session (started or resumed
+ * it); who opened it first holds it when two hosts have it open.
+ */
+opened_at: number, last_event_at: number, };
 
 export type Share = { 
 /**
@@ -777,6 +782,59 @@ export type Subscription = { id: number, endpoint: string, user_agent: string | 
  * Null for devices on the bootstrap token.
  */
 token_id: number | null, };
+
+/**
+ * A conflict the hub recorded.
+ */
+export type SyncConflict = { id: number, path: string, host: string, size: number, copy: string, at: number, };
+
+/**
+ * One machine in the panel's Sync section.
+ */
+export type SyncHost = { host: string, connected: boolean, 
+/**
+ * Its last report; none from a collector without sync.
+ */
+status: SyncStatus | null, };
+
+/**
+ * What a collector reports about its copy (`ToHub::Sync`).
+ */
+export type SyncStatus = { 
+/**
+ * Files and bytes this machine holds of what travels.
+ */
+files: number, bytes: number, 
+/**
+ * Files waiting to go up or come down after the last pass.
+ */
+pending_up: number, pending_down: number, 
+/**
+ * Files held back because their session runs here.
+ */
+held: number, 
+/**
+ * Conflicts set aside since the collector started.
+ */
+conflicts: number, last_pass: number | null, error: string | null, 
+/**
+ * While a first run or a resync compares every file: done and total.
+ */
+backfill: [number, number] | null, 
+/**
+ * Changes are seen through inotify; otherwise the collector scans
+ * everything every `sync.interval_secs`.
+ */
+watching: boolean, };
+
+/**
+ * `GET /api/v1/sync`.
+ */
+export type SyncView = { hosts: Array<SyncHost>, 
+/**
+ * What the hub holds.
+ */
+files: number, bytes: number, conflicts: Array<SyncConflict>, };
 
 export type TargetWorkspace = { name: string, projects: Array<string>, };
 

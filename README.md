@@ -45,7 +45,10 @@ niri window events ────────────────┘          
 Only public Claude Code interfaces are used (`claude agents --json`,
 `claude --bg`, `claude stop`, `claude attach`, hooks, the statusline payload, [channels](https://code.claude.com/docs/en/channels-reference),
 [OpenTelemetry](https://code.claude.com/docs/en/monitoring-usage), the
-`/usage` report); no internal state files.
+`/usage` report). The one exception is the state sync
+([Sessions on every machine](#sessions-on-every-machine)): it copies the
+files Claude Code keeps under `~/.claude` byte for byte and reads only the
+running-session registry and the prompt history's lines.
 
 The statusline carries only the 5-hour and 7-day limits. For per-model
 weekly limits such as Fable's, the collector runs `claude -p /usage` every
@@ -381,8 +384,85 @@ rename them, answer their prompts, start and stop sessions and, with the
 channel, prompt them): the
 bootstrap one from `tokenFile`, compared in constant time, or a device's
 own, looked up by its SHA-256. Only the notification buttons' one-time
-links and `/collect`, which takes a collector's token, differ. Keep the hub
-behind your firewall or VPN.
+links and `/collect` and `/sync/`, which take a collector's token,
+differ. Keep the hub behind your firewall or VPN.
+
+### Sessions on every machine
+
+With `sync.enable` on a collector (the Home Manager module's
+`sync.enable`), the hub keeps Claude Code's state for every machine:
+sessions (transcripts with their subagents, tool results and auto
+memory), rewind checkpoints, plans, task lists and pasted content
+(`projects/`, `file-history/`, `plans/`, `tasks/`, `paste-cache/`), and
+the prompt history (`history.jsonl`). Each collector keeps its machine's
+copy in step all the time, so a session ended on one machine resumes on
+another with a plain `claude --resume` (the picker lists it), and the up
+arrow and Ctrl+R know the prompts of every machine. Claude Code files
+sessions by directory, so every machine needs the same user and paths.
+Credentials, `~/.claude.json`, settings, plugins and the state of running
+sessions stay on each machine.
+
+- The collector learns of changes from inotify (a watch per directory
+  that can hold synced files, a few hundred), waits for a burst of writes
+  to settle (a quarter second, two at most) and handles just those files.
+  It scans everything only at start-up, after an inotify overflow, for
+  Resync and Stop, and every half hour as a safety net; where inotify is
+  unavailable it scans every `interval_secs`.
+- Files travel byte for byte; a file that only grew sends its new tail,
+  and a transcript line still being written waits. The hub refuses a
+  write made against a version it no longer has, so nothing is
+  overwritten unseen.
+- A file changed on both sides between two syncs is a conflict: the
+  hub's copy wins, the machine keeps its own under
+  `~/.claude/ccdash-conflicts/<time>/…` (a transcript there still resumes
+  with `claude --resume <path>`), and Settings lists it.
+- Deletions never travel: Claude Code's own clean-up
+  (`cleanupPeriodDays`) on one machine removes nothing elsewhere, and the
+  hub keeps everything.
+- The prompt history merges line by line: lines from other machines are
+  appended, and the file is never rewritten.
+- The files of a session running on a machine are never written there;
+  they catch up when it ends.
+
+**One session, one machine.** A resumed session goes on in the same
+transcript, so two machines with it open would split it. The hub knows
+where each session is open: in a session another machine opened first and
+still has open, prompts are refused (the hook blocks them and says where,
+with a link), a resume shows a warning, and the hub refuses that
+machine's writes to the session's files. Stop the session there (its
+page's **Stop**, or **Forget** when that machine is offline), then send
+the prompt again; if the other machine added to the session after it was
+opened here, the hook says so and asks you to quit and resume it, to load
+the whole conversation. **Continue** on an ended session's page offers
+every connected machine that syncs; the collector fetches the transcript
+before it resumes.
+
+Settings › **Claude Code state** shows each machine's copy (files, what
+waits, the first run's progress) with **Resync**, which compares every
+file with the hub again, sends what the hub lacks and fetches what the
+machine lacks (deleted files included), and the conflicts, to dismiss once
+seen.
+
+```toml
+# collector config
+[sync]
+enable = true
+# root = "~/.claude"              # default: $CLAUDE_CONFIG_DIR, else ~/.claude
+# include = ["projects/*", "file-history/*", "plans/*", "tasks/*",
+#            "paste-cache/*", "history.jsonl"]
+# exclude = ["projects/-tmp-*"]   # scratch sessions stay home
+# interval_secs = 3               # full scans, only without inotify
+
+# hub config
+[sync]
+# dir = "/var/lib/ccdash-hub/claude"  # default: claude/ next to the database
+```
+
+The hub keeps the files as plain files under `sync.dir`, outside the
+database and its nightly copies: back that directory up with a file-level
+tool (restic encrypts). The `/sync/` routes take the collectors' tokens
+and pieces of up to 8 MiB (the NixOS module raises nginx's body limit
+there).
 
 ## Knowledge: memories, issues, progress, documents
 
@@ -455,6 +535,7 @@ Everything is stored on the hub:
 | Live state | hub memory, one reducer per host                             |
 | History    | `/var/lib/ccdash-hub/ccdash.db` (SQLite, WAL), `ccdash` user |
 | Backups    | `/var/lib/ccdash-hub/backups/`, nightly, checked             |
+| State sync | `/var/lib/ccdash-hub/claude/`, plain files (not in backups)  |
 | Config     | `/etc/ccdash/hub.toml`                                       |
 
 On each workstation the collector keeps only what it cannot deliver:
@@ -463,6 +544,7 @@ On each workstation the collector keeps only what it cannot deliver:
 | --------- | ----------------------------------------------------------- |
 | Mirror    | collector memory (this host's sessions for DMS and the CLI) |
 | Outbox    | `~/.local/state/ccdash/outbox.ndjson`, bounded              |
+| Sync      | `~/.local/state/ccdash/sync.db` (what is in step), if on    |
 | Config    | `~/.config/ccdash/config.toml`                              |
 | Sockets   | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)      |
 | Telemetry | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled             |
@@ -482,13 +564,17 @@ Every row carries the host it came from. The database keeps 30 days
 - `limit_samples`: per-model weekly limits from each `/usage` poll
 - `ui_tokens`, `push_subscriptions`: the devices' tokens (SHA-256, label,
   browser, last use) and their push subscriptions (not pruned)
+- `sync_files`, `sync_history`, `sync_conflicts` (with the state sync): the
+  index of the synced files, the merged prompt history and the conflicts
+  the collectors set aside (not pruned)
 - `telemetry` (with telemetry on): API requests (model, tokens, cost,
   latency), API errors, tool approval decisions, commits, pull requests,
   edit decisions and active time
 
-The HTTP API serves it to your browser with the token. Nothing else leaves
-the hub, except notifications when `notify.url` is set or a device
-subscribed to push (encrypted; the push service sees only ciphertext). Delete the
+The HTTP API serves it to your browser with the token, and `/sync/` the
+synced state to the collectors with theirs. Nothing else leaves the hub,
+except Web Push notifications to subscribed devices (encrypted; the push
+service sees only ciphertext). Delete the
 database to start over. `ccdash import db` brings the history of a
 pre-hub daemon (`~/.local/state/ccdash/ccdash.db` on the workstation)
 into the hub; it skips rows the hub already has, so it is safe to repeat.

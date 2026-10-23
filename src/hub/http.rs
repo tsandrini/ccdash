@@ -1,12 +1,14 @@
 //! HTTP API for the web UI and the phone: reads, plus renaming sessions,
 //! replying to them and answering their prompts, starting, stopping,
 //! forgetting and opening them (`/launches`), and the knowledge layer
-//! (`/notes`, `/projects`: list, search, read, write, verify), and the
-//! devices' tokens (`/tokens`). Every `/api` route needs
+//! (`/notes`, `/projects`: list, search, read, write, verify), the
+//! devices' tokens (`/tokens`) and how the machines' copies of Claude
+//! Code's state stand (`/sync`). Every `/api` route needs
 //! `Authorization: Bearer <token>`: the bootstrap token from the
 //! configuration or a device's own (see `crate::tokens`). `/act/{key}/…`
 //! takes the one-time key of a notification button instead, `/collect`
-//! a collector's token (see `super::collect`).
+//! and `/sync/` a collector's token (see `super::collect`,
+//! `crate::sync::hub`).
 
 use std::{
     convert::Infallible,
@@ -28,7 +30,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -58,6 +60,7 @@ use crate::{
     paths,
     push::{self, Push},
     store::{self, Store},
+    sync::{self, SyncView},
     tokens,
     util::{self, now_ms},
     workspace::{Scope, Workspaces},
@@ -121,6 +124,7 @@ pub async fn serve(
     public_url: String,
     push: Option<Arc<Push>>,
     web_dir: PathBuf,
+    sync: sync::hub::Mirror,
 ) {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -152,6 +156,9 @@ pub async fn serve(
         .route("/push/test", post(push_test))
         .route("/tokens", get(devices).post(mint))
         .route("/tokens/{id}", patch(relabel).delete(revoke))
+        .route("/sync", get(sync_view))
+        .route("/sync/{host}/resync", post(sync_resync))
+        .route("/sync/conflicts/{id}", delete(sync_dismiss))
         .layer(middleware::from_fn_with_state(
             Guard {
                 bootstrap: token,
@@ -163,8 +170,13 @@ pub async fn serve(
         .route("/act/{key}/{action}", post(button))
         .route(
             "/collect",
-            get(collect::collect).with_state((hub.clone(), tokens)),
+            get(collect::collect).with_state((
+                hub.clone(),
+                tokens.clone(),
+                sync.changed.subscribe(),
+            )),
         )
+        .nest("/sync", sync::hub::routes(sync, tokens))
         .nest("/api/v1", api)
         .fallback(get(web::serve))
         .with_state(App {
@@ -498,8 +510,11 @@ async fn launch(
                     .await?
                     .ok_or(ApiError(StatusCode::NOT_FOUND, "no such session".into()))?,
             };
-            if s.host != body.host {
-                return Err(refuse(format!("the session ran on {}", s.host)));
+            if s.host != body.host && !continues_elsewhere(&app, &s.id, &body.host).await? {
+                return Err(refuse(format!(
+                    "the session ran on {}, and {} does not get its transcript through the hub",
+                    s.host, body.host
+                )));
             }
             if app.workspaces.locate(&s.cwd) != Some((body.workspace.clone(), body.project.clone()))
             {
@@ -1293,6 +1308,70 @@ async fn push_test(State(app): State<App>) -> Result<Json<Value>, ApiError> {
         })
         .collect();
     Ok(Json(json!({ "results": results })))
+}
+
+/// Whether `host` can continue `session` that ran elsewhere: it syncs
+/// and the hub holds the transcript (the collector pulls it first).
+async fn continues_elsewhere(app: &App, session: &str, host: &str) -> Result<bool> {
+    let syncs = app
+        .hub
+        .sync_hosts()
+        .await?
+        .iter()
+        .any(|h| h.host == host && h.connected && h.status.is_some());
+    if !syncs {
+        return Ok(false);
+    }
+    let (store, session) = (app.store.clone(), session.to_owned());
+    tokio::task::spawn_blocking(move || sync::hub::holds_transcript(&store.reader()?, &session))
+        .await
+        .context("transcript lookup")?
+}
+
+/// The machines' copies of Claude Code's state and the open conflicts.
+async fn sync_view(State(app): State<App>) -> Result<Json<SyncView>, ApiError> {
+    let hosts = app.hub.sync_hosts().await?;
+    let store = app.store.clone();
+    let ((files, bytes), conflicts) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = store.reader()?;
+        Ok((sync::hub::totals(&conn)?, sync::hub::conflicts(&conn)?))
+    })
+    .await
+    .context("sync view")??;
+    Ok(Json(SyncView {
+        hosts,
+        files,
+        bytes,
+        conflicts,
+    }))
+}
+
+async fn sync_resync(
+    State(app): State<App>,
+    Path(host): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    app.hub
+        .sync_resync(&host)
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn sync_dismiss(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let found = app
+        .store
+        .exec(move |conn| sync::hub::dismiss(conn, id, now_ms()))
+        .await??;
+    if !found {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("no open conflict {id}"),
+        ));
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 struct ApiError(StatusCode, String);

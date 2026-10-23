@@ -23,6 +23,7 @@ pub struct HubConfig {
     pub notify: Notify,
     pub push: Push,
     pub knowledge: Knowledge,
+    pub sync: HubSync,
 }
 
 /// `ccdash collector`: the hub link plus everything read on this machine.
@@ -42,6 +43,52 @@ pub struct CollectorConfig {
     pub usage: Usage,
     pub queue: Queue,
     pub inject: Inject,
+    pub sync: Sync,
+}
+
+/// Where the hub keeps Claude Code's state for the collectors.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubSync {
+    /// Defaults to `claude/` next to the database. `$VAR` expands.
+    pub dir: Option<PathBuf>,
+}
+
+/// Keeping this machine's Claude Code state (sessions, rewind
+/// checkpoints, plans, tasks, pasted content, prompt history) in step
+/// with the hub.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Sync {
+    pub enable: bool,
+    /// The Claude config dir; defaults to `$CLAUDE_CONFIG_DIR`, else
+    /// `~/.claude`. `$VAR` expands.
+    pub root: Option<PathBuf>,
+    /// Globs relative to the root (`*` spans directories) of what travels.
+    pub include: Vec<String>,
+    /// Globs of what stays home even when included.
+    pub exclude: Vec<String>,
+    /// Seconds between full scans when inotify is unavailable; with it,
+    /// changes are seen as they happen.
+    pub interval_secs: u64,
+}
+
+impl Default for Sync {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            root: None,
+            include: crate::sync::collector::DEFAULT_INCLUDE
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            exclude: crate::sync::collector::DEFAULT_EXCLUDE
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            interval_secs: 3,
+        }
+    }
 }
 
 /// The knowledge layer's lifecycle: a daily pass that flags memories.
@@ -402,6 +449,17 @@ impl HubConfig {
         }
     }
 
+    /// Where Claude Code's state is kept: `sync.dir`, else `claude/` next
+    /// to the database.
+    pub fn sync_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.sync.dir {
+            return PathBuf::from(crate::util::expand_env(&dir.to_string_lossy()));
+        }
+        let db = self.store_path();
+        db.parent()
+            .map_or_else(|| PathBuf::from("claude"), |dir| dir.join("claude"))
+    }
+
     pub fn push_key_file(&self) -> PathBuf {
         self.push
             .key_file
@@ -426,6 +484,16 @@ impl CollectorConfig {
     pub fn host(&self) -> String {
         self.host.clone().unwrap_or_else(crate::util::hostname)
     }
+
+    /// The Claude config dir the sync keeps in step.
+    pub fn sync_root(&self) -> PathBuf {
+        self.sync
+            .root
+            .as_ref()
+            .map_or_else(crate::sync::collector::default_root, |p| {
+                PathBuf::from(crate::util::expand_env(&p.to_string_lossy()))
+            })
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +515,14 @@ mod tests {
         let off: CollectorConfig = toml::from_str("[launch]\ncommand = []\n").unwrap();
         assert!(off.launch.command.is_empty());
         assert_eq!(off.launch.stop, ["claude", "stop", "{id}"]);
+        assert!(!off.sync.enable);
+        assert!(off.sync.include.iter().any(|p| p == "history.jsonl"));
+        let sync: CollectorConfig =
+            toml::from_str("[sync]\nenable = true\nroot = \"/c\"\n").unwrap();
+        assert_eq!(sync.sync_root(), PathBuf::from("/c"));
+        assert_eq!(sync.sync.exclude, ["projects/-tmp-*"]);
+        let hub: HubConfig = toml::from_str("[store]\npath = \"/s/h.db\"\n").unwrap();
+        assert_eq!(hub.sync_dir(), PathBuf::from("/s/claude"));
     }
 
     #[test]

@@ -15,16 +15,19 @@ use crate::{
     knowledge::{Hit, Note, NoteOp, NoteView, Query, Upsert, Written},
     model::{Claim, Kind, RateLimits, ScopedLimit, Session, Update},
     state::{AgentEntry, NiriEvent, ProcPoll},
+    sync::SyncStatus,
     wire::Envelope,
 };
 
+/// 6: Claude Code's state on the hub (`Sync` up, `SyncChanged` and
+/// `SyncResync` down) and the one-machine guard (`Call::Guard`).
 /// 5: `Dirs`, the project directories under each workspace on the
 /// collector's machine (where sessions can start).
 /// 4: sessions started, stopped and opened from the panel (`Launch`,
 /// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
 /// on sessions, `branch` on agents entries and envelopes, `launch` on
 /// envelopes.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +117,10 @@ pub enum ToHub {
     /// each welcome and when it changes.
     Dirs {
         dirs: BTreeMap<String, Vec<String>>,
+    },
+    /// How this machine's copy of Claude Code's state stands.
+    Sync {
+        status: SyncStatus,
     },
 }
 
@@ -218,6 +225,10 @@ pub enum Call {
         dir: String,
         notes: Vec<Upsert>,
     },
+    /// Whether the caller's session is open on another machine.
+    Guard {
+        who: Who,
+    },
 }
 
 /// What a `Call` returns.
@@ -239,6 +250,8 @@ pub enum Reply {
         unchanged: usize,
     },
     Sent,
+    /// Why the session must not go on here; none when it may.
+    Guard(Option<String>),
 }
 
 /// A configured workspace, so collectors can scope offline reads.
@@ -335,6 +348,12 @@ pub enum ToCollector {
     Open {
         session: String,
     },
+    /// The hub's copy of Claude Code's state changed; `seq` counts writes.
+    SyncChanged {
+        seq: u64,
+    },
+    /// Forget the sync records and compare everything again.
+    SyncResync,
 }
 
 #[cfg(test)]
@@ -483,6 +502,18 @@ mod tests {
         let text = serde_json::to_string(&dirs).unwrap();
         assert_eq!(text, r#"{"type":"dirs","dirs":{"w":["ccdash"]}}"#);
         assert!(!dirs.durable());
+        let sync = ToHub::Sync {
+            status: SyncStatus::default(),
+        };
+        assert!(!sync.durable());
+        assert!(
+            serde_json::to_string(&sync)
+                .unwrap()
+                .starts_with(r#"{"type":"sync""#)
+        );
+        let changed: ToCollector =
+            serde_json::from_str(r#"{"type":"sync_changed","seq":3}"#).unwrap();
+        assert!(matches!(changed, ToCollector::SyncChanged { seq: 3 }));
         let injected: ToHub = serde_json::from_str(r#"{"type":"injected","session":"s"}"#).unwrap();
         assert!(matches!(injected, ToHub::Injected { ref session } if session == "s"));
         assert!(!injected.durable());
@@ -503,6 +534,8 @@ mod tests {
                 updated: 0,
                 unchanged: 2,
             },
+            Reply::Guard(None),
+            Reply::Guard(Some("open on navi".into())),
         ] {
             let text = serde_json::to_string(&reply).unwrap();
             let back: Reply = serde_json::from_str(&text).unwrap();

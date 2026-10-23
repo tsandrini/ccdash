@@ -140,6 +140,15 @@ in
       '';
     };
 
+    sync.enable = mkEnableOption ''
+      keeping this machine's Claude Code state (sessions, rewind
+      checkpoints, plans, tasks, pasted content, the prompt history) in step
+      with the hub, so a session ended here resumes on another machine and
+      the prompt history is one. The hub refuses prompts in a session that
+      is open on another machine. Configure what travels under
+      {option}`settings.sync` (`include`, `exclude`, `root`)
+    '';
+
     dms.enable = mkEnableOption ''
       the DankMaterialShell plugin: bar pill, popout list, dash tab and
       card, notifications, and `dms ipc call ccdash …`. Linked into
@@ -244,6 +253,7 @@ in
         url = mkDefault cfg.hub.url;
         token_file = mkDefault cfg.hub.tokenFile;
       };
+      services.ccdash.settings.sync.enable = mkDefault cfg.sync.enable;
 
       xdg.configFile."ccdash/config.toml".source = configFile;
 

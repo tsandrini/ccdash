@@ -2,8 +2,10 @@
 //!
 //! Must stay fast and silent: no async runtime, never fails the caller, and
 //! no output except what a hook may answer with: a queued title (see
-//! [`apply_pending_title`]) and, on SessionStart, UserPromptSubmit and
-//! edits, the context the collector injects (see `knowledge::tools::injection_of`).
+//! [`apply_pending_title`]); on SessionStart, UserPromptSubmit and edits,
+//! the context the collector injects (see `knowledge::tools::injection_of`);
+//! and the one-machine guard: a prompt in a session open on another
+//! machine is blocked, a resume of one warned about.
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -67,19 +69,26 @@ fn send(source: Source, input: &[u8]) {
         let _ = socket.send_to(&bytes, paths::ingest_socket());
     }
     if source == Source::Hook {
-        let context = inject(&env);
-        if let Some(output) = hook_output(
-            &env.payload,
-            env.applied_title.as_deref(),
-            context.as_deref(),
-        ) {
+        let answer = inject(&env).unwrap_or_default();
+        if let Some(output) = hook_output(&env.payload, env.applied_title.as_deref(), &answer) {
             println!("{output}");
         }
     }
 }
 
+/// What the collector answered a hook with.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Answer {
+    /// Context for Claude.
+    pub context: Option<String>,
+    /// Why the prompt must not run here (the guard); shown to the owner.
+    pub block: Option<String>,
+    /// A warning shown to the owner (the guard on a resume).
+    pub warn: Option<String>,
+}
+
 /// Asks the collector what to inject for this hook, within the hook's time.
-fn inject(env: &Envelope) -> Option<String> {
+fn inject(env: &Envelope) -> Option<Answer> {
     let what = tools::injection_of(&env.payload)?;
     let wait = match what {
         Injection::SessionStart => START_WAIT,
@@ -96,26 +105,52 @@ fn inject(env: &Envelope) -> Option<String> {
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).ok()?;
     let reply: Value = serde_json::from_str(&reply).ok()?;
-    (reply["type"] == "context")
-        .then(|| reply["text"].as_str().map(str::to_owned))
-        .flatten()
-        .filter(|t| !t.trim().is_empty())
+    let text = || {
+        reply["text"]
+            .as_str()
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_owned)
+    };
+    Some(match reply["type"].as_str() {
+        Some("block") => Answer {
+            block: text(),
+            ..Answer::default()
+        },
+        Some("context") => Answer {
+            context: text(),
+            warn: reply["warn"].as_str().map(str::to_owned),
+            ..Answer::default()
+        },
+        _ => Answer {
+            warn: reply["warn"].as_str().map(str::to_owned),
+            ..Answer::default()
+        },
+    })
 }
 
-/// The hook's JSON answer: the title it adopts and the context it reads.
-pub fn hook_output(payload: &Value, title: Option<&str>, context: Option<&str>) -> Option<Value> {
-    if title.is_none() && context.is_none() {
-        return None;
-    }
+/// The hook's JSON answer: the title it adopts, the context it reads, and
+/// the guard's block or warning.
+pub fn hook_output(payload: &Value, title: Option<&str>, answer: &Answer) -> Option<Value> {
     let event = payload.get("hook_event_name")?.as_str()?;
-    let mut out = json!({ "hookEventName": event });
-    if let Some(title) = title {
-        out["sessionTitle"] = json!(title);
+    let mut top = json!({});
+    if let Some(reason) = &answer.block {
+        top["decision"] = json!("block");
+        top["reason"] = json!(reason);
     }
-    if let Some(context) = context {
-        out["additionalContext"] = json!(context);
+    if let Some(warning) = &answer.warn {
+        top["systemMessage"] = json!(warning);
     }
-    Some(json!({ "hookSpecificOutput": out }))
+    if title.is_some() || answer.context.is_some() {
+        let mut out = json!({ "hookEventName": event });
+        if let Some(title) = title {
+            out["sessionTitle"] = json!(title);
+        }
+        if let Some(context) = &answer.context {
+            out["additionalContext"] = json!(context);
+        }
+        top["hookSpecificOutput"] = out;
+    }
+    (top.as_object().is_some_and(|o| !o.is_empty())).then_some(top)
 }
 
 /// Wraps a hook or statusline payload with what Claude Code's environment
@@ -162,17 +197,42 @@ fn apply_pending_title(payload: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn context(text: &str) -> Answer {
+        Answer {
+            context: Some(text.into()),
+            ..Answer::default()
+        }
+    }
+
     #[test]
     fn hook_output_merges_title_and_context() {
         let payload = json!({"hook_event_name": "UserPromptSubmit", "session_id": "s"});
-        assert!(hook_output(&payload, None, None).is_none());
-        let out = hook_output(&payload, Some("T"), Some("ctx")).unwrap();
+        assert!(hook_output(&payload, None, &Answer::default()).is_none());
+        let out = hook_output(&payload, Some("T"), &context("ctx")).unwrap();
         assert_eq!(
             out,
             json!({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "sessionTitle": "T", "additionalContext": "ctx"}})
         );
+        let blocked = Answer {
+            block: Some("open on navi".into()),
+            ..Answer::default()
+        };
+        assert_eq!(
+            hook_output(&payload, None, &blocked).unwrap(),
+            json!({"decision": "block", "reason": "open on navi"})
+        );
+        let start = json!({"hook_event_name": "SessionStart", "source": "resume"});
+        let warned = Answer {
+            context: Some("ctx".into()),
+            warn: Some("open on navi".into()),
+            ..Answer::default()
+        };
+        assert_eq!(
+            hook_output(&start, None, &warned).unwrap(),
+            json!({"systemMessage": "open on navi", "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "ctx"}})
+        );
         let edit = json!({"hook_event_name": "PreToolUse"});
-        let out = hook_output(&edit, None, Some("c")).unwrap();
+        let out = hook_output(&edit, None, &context("c")).unwrap();
         assert!(out["hookSpecificOutput"].get("sessionTitle").is_none());
         assert!(
             out["hookSpecificOutput"]

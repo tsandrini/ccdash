@@ -38,6 +38,7 @@ use crate::{
     niri, otlp, paths, procs,
     protocol::{Call, Injection, Reply, TelemetryRecord, ToCollector, ToHub, Who, WorkspaceDir},
     state::{AgentEntry, NiriEvent, ProcPoll, StoreMsg, Window},
+    sync::collector::{self as sync, Cmd as SyncCmd, Handle as SyncHandle},
     usage,
     util::{self, now_ms, pid_alive},
     wire::{self, Envelope, Source},
@@ -169,6 +170,10 @@ impl Local {
 }
 
 pub const NOT_CONNECTED: &str = "the hub is not connected";
+/// After a stop, how long (in 100 ms polls) the process gets to exit
+/// before its files are synced anyway.
+const STOP_EXIT_POLLS: usize = 100;
+const STOP_FLUSH_WAIT: Duration = Duration::from_secs(60);
 const DIRS_EVERY_MS: i64 = 60_000;
 pub const TIMED_OUT: &str = "the hub did not answer in time";
 
@@ -204,6 +209,7 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
     let host = cfg.host();
     let (hub_tx, hub_rx) = mpsc::unbounded_channel();
     let (local, rx) = Local::spawn();
+    let sync = start_sync(&cfg, &host, &hub_tx);
     tokio::spawn(run_actor(
         Actor::new(
             host.clone(),
@@ -211,7 +217,8 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
             local.updates.clone(),
             paths::notes_cache(),
         )
-        .with_commands(cfg.launch.clone(), cfg.attach.command.clone()),
+        .with_commands(cfg.launch.clone(), cfg.attach.command.clone())
+        .with_sync(sync.clone()),
         rx,
     ));
     tokio::spawn(link::run(
@@ -249,7 +256,7 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
         tokio::spawn(otlp::serve(listener, sink));
     }
     tokio::spawn(ingest_loop(ingest, local.sender()));
-    tokio::spawn(api::serve(api, local.clone(), cfg.clone()));
+    tokio::spawn(api::serve(api, local.clone(), cfg.clone(), sync));
     tokio::spawn(agents::run(
         cfg.agents.command.clone(),
         Duration::from_secs(cfg.agents.interval_secs.max(1)),
@@ -286,6 +293,39 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
     let _ = std::fs::remove_file(&ingest_path);
     let _ = std::fs::remove_file(&api_path);
     Ok(())
+}
+
+/// Starts keeping Claude Code's state in step with the hub (`[sync]`).
+fn start_sync(
+    cfg: &CollectorConfig,
+    host: &str,
+    hub: &mpsc::UnboundedSender<ToHub>,
+) -> Option<SyncHandle> {
+    if !cfg.sync.enable {
+        return None;
+    }
+    let Some(token_file) = &cfg.hub.token_file else {
+        warn!("sync is on but hub.token_file is not set: not syncing");
+        return None;
+    };
+    let settings = sync::Settings {
+        host: host.to_owned(),
+        root: cfg.sync_root(),
+        include: cfg.sync.include.clone(),
+        exclude: cfg.sync.exclude.clone(),
+        interval: Duration::from_secs(cfg.sync.interval_secs.max(1)),
+        base_url: sync::base_url(&cfg.hub.url),
+        token_file: PathBuf::from(util::expand_env(&token_file.to_string_lossy())),
+        index: paths::state_dir().join("sync.db"),
+    };
+    info!(
+        "syncing {} with the hub at {}",
+        settings.root.display(),
+        settings.base_url
+    );
+    sync::spawn(settings, hub.clone())
+        .inspect_err(|e| warn!("sync: {e:#}"))
+        .ok()
 }
 
 impl Local {
@@ -386,6 +426,8 @@ struct Actor {
     /// they were last read.
     dirs: BTreeMap<String, Vec<String>>,
     dirs_at: i64,
+    /// The sync thread, when `[sync]` is on.
+    sync: Option<SyncHandle>,
 }
 
 impl Actor {
@@ -433,6 +475,7 @@ impl Actor {
             attach: Vec::new(),
             dirs: BTreeMap::new(),
             dirs_at: 0,
+            sync: None,
         }
     }
 
@@ -457,6 +500,17 @@ impl Actor {
         self
     }
 
+    fn with_sync(mut self, sync: Option<SyncHandle>) -> Self {
+        self.sync = sync;
+        self
+    }
+
+    fn kick_sync(&self, cmd: SyncCmd) {
+        if let Some(sync) = &self.sync {
+            sync.send(cmd);
+        }
+    }
+
     /// The git branch of a session's directory: the one the hub knows,
     /// else the one reported with it.
     fn branch_of(&self, session: Option<&str>, cwd: Option<&str>) -> Option<String> {
@@ -468,11 +522,18 @@ impl Actor {
         git::branch(Path::new(dir))
     }
 
-    /// Starts `spec` in the background and tells the hub what came of it.
+    /// Starts `spec` in the background and tells the hub what came of it;
+    /// a session to continue is synced first (it may have run elsewhere).
     fn launch(&self, launch: String, spec: LaunchSpec) {
         let (hub, command) = (self.hub.clone(), self.launch.command.clone());
         let inside = self.workspaces.locate(&spec.cwd).is_some();
+        let sync = self.sync.clone().filter(|_| spec.resume.is_some());
         tokio::spawn(async move {
+            if let Some(sync) = sync
+                && !sync.flush(STOP_FLUSH_WAIT).await
+            {
+                warn!("launch {launch}: the sync pass did not finish in time");
+            }
             let result = if inside {
                 actions::launch(&command, &spec).await
             } else {
@@ -500,10 +561,25 @@ impl Actor {
             return;
         };
         let command = self.launch.stop.clone();
+        let sync = self.sync.clone();
         tokio::spawn(async move {
             let result = actions::stop(&command, &session).await;
             if let Err(e) = &result {
                 warn!("stopping {id}: {e}");
+            }
+            // NOTE: the hub has the final bytes when the panel says stopped
+            if result.is_ok()
+                && let Some(sync) = sync
+            {
+                for _ in 0..STOP_EXIT_POLLS {
+                    if !pid_alive(session.pid) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !sync.flush(STOP_FLUSH_WAIT).await {
+                    warn!("stopping {id}: the sync pass did not finish in time");
+                }
             }
             let _ = hub.send(ToHub::Stopped {
                 session: id,
@@ -772,6 +848,8 @@ impl Actor {
             }
             ToCollector::Stop { session, .. } => self.stop(session),
             ToCollector::Open { session } => self.open(&session),
+            ToCollector::SyncChanged { .. } => self.kick_sync(SyncCmd::Changed),
+            ToCollector::SyncResync => self.kick_sync(SyncCmd::Resync),
         }
     }
 
@@ -816,6 +894,9 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
                 if envelope.source == Source::Statusline {
                     let p = &envelope.payload;
                     envelope.branch = a.branch_of(p["session_id"].as_str(), p["cwd"].as_str());
+                }
+                if envelope.payload["hook_event_name"] == "SessionEnd" {
+                    a.kick_sync(SyncCmd::Changed);
                 }
                 a.to_hub(ToHub::Envelope { envelope });
             }
@@ -968,6 +1049,7 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
                     }
                 }
                 a.resync();
+                a.kick_sync(SyncCmd::Changed);
             }
             LocalCmd::LinkDown => a.link_down(),
             LocalCmd::FromHub(msg) => a.take(*msg),

@@ -27,6 +27,7 @@ mod protocol;
 mod push;
 mod state;
 mod store;
+mod sync;
 mod tokens;
 mod usage;
 mod util;

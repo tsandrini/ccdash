@@ -1,7 +1,9 @@
 # The ccdash hub: the one process that keeps every machine's Claude Code
-# history, serves the web UI and API, and sends Web Push notifications (the
-# VAPID key pair is generated into the state directory on first start). Collectors (the home-manager module) connect to its
-# `/collect` endpoint, each with its own token.
+# history and state (sessions, the prompt history: `sync.directory`), serves
+# the web UI and API, and sends Web Push notifications (the VAPID key pair is
+# generated into the state directory on first start). Collectors (the
+# home-manager module) connect to its `/collect` and `/sync/` endpoints, each
+# with its own token.
 { localFlake }:
 {
   config,
@@ -114,6 +116,17 @@ in
       };
     };
 
+    sync.directory = mkOption {
+      type = types.str;
+      default = "${stateDir}/claude";
+      description = ''
+        Where the hub keeps the collectors' Claude Code state (sessions,
+        rewind checkpoints, plans, tasks, pasted content), as plain files.
+        Not in the nightly database copies ({option}`backup`): put it in a
+        file-level backup of its own.
+      '';
+    };
+
     backup = {
       enable = mkEnableOption ''
         a nightly copy of the database through SQLite's backup API, checked
@@ -153,6 +166,7 @@ in
         collect.tokens = cfg.collectors;
         store.path = mkDefault "${stateDir}/ccdash.db";
         push.key_file = mkDefault "${stateDir}/vapid.p8";
+        sync.dir = mkDefault cfg.sync.directory;
       };
 
       users.users.ccdash = {
@@ -177,6 +191,9 @@ in
           Group = "ccdash";
           StateDirectory = "ccdash-hub";
           StateDirectoryMode = "0700";
+          ReadWritePaths = mkIf (!lib.hasPrefix "${stateDir}/" cfg.sync.directory) [
+            cfg.sync.directory
+          ];
           Restart = "on-failure";
           RestartSec = 2;
           # hardening
@@ -209,6 +226,16 @@ in
             proxy_buffering off;
             proxy_read_timeout 1h;
             proxy_send_timeout 1h;
+          '';
+        };
+        # NOTE: collectors move files in pieces of up to 8 MiB
+        locations."/sync/" = {
+          proxyPass = "http://${proxyEndpoint}";
+          extraConfig = ''
+            client_max_body_size 16m;
+            proxy_request_buffering off;
+            proxy_read_timeout 5m;
+            proxy_send_timeout 5m;
           '';
         };
       };

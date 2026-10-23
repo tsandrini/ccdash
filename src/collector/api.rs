@@ -48,6 +48,7 @@ use crate::{
     config::CollectorConfig,
     knowledge::{Upsert, tools},
     protocol::{Call, Injection, Reply, Who},
+    sync::collector::Handle as SyncHandle,
     wire::Envelope,
 };
 
@@ -57,6 +58,8 @@ const TOOL_WAIT: Duration = Duration::from_millis(4000);
 /// Hooks run with a 5 s timeout; `ccdash emit` waits a little longer than this.
 const START_WAIT: Duration = Duration::from_millis(2500);
 const HOOK_WAIT: Duration = Duration::from_millis(1200);
+/// The guard asks the hub alongside the injection, within the same time.
+const GUARD_WAIT: Duration = Duration::from_millis(1000);
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -101,13 +104,18 @@ enum Request {
     },
 }
 
-pub async fn serve(listener: UnixListener, local: Local, cfg: Arc<CollectorConfig>) {
+pub async fn serve(
+    listener: UnixListener,
+    local: Local,
+    cfg: Arc<CollectorConfig>,
+    sync: Option<SyncHandle>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (local, cfg) = (local.clone(), cfg.clone());
+                let (local, cfg, sync) = (local.clone(), cfg.clone(), sync.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, local, cfg).await {
+                    if let Err(e) = handle(stream, local, cfg, sync).await {
                         debug!("api client: {e:#}");
                     }
                 });
@@ -117,7 +125,12 @@ pub async fn serve(listener: UnixListener, local: Local, cfg: Arc<CollectorConfi
     }
 }
 
-async fn handle(stream: UnixStream, local: Local, cfg: Arc<CollectorConfig>) -> Result<()> {
+async fn handle(
+    stream: UnixStream,
+    local: Local,
+    cfg: Arc<CollectorConfig>,
+    sync: Option<SyncHandle>,
+) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
@@ -159,7 +172,19 @@ async fn handle(stream: UnixStream, local: Local, cfg: Arc<CollectorConfig>) -> 
             Ok(Request::Ask { envelope }) => return ask(lines, write, local, envelope).await,
             Ok(Request::Tool { name, args, who }) => tool(&local, &name, &args, who).await?,
             Ok(Request::Inject { envelope }) => {
-                let (reply, ack) = inject(&local, &cfg, &envelope).await?;
+                let (warning, injected) = tokio::join!(
+                    guard(&local, sync.as_ref(), &envelope),
+                    inject(&local, &cfg, &envelope)
+                );
+                let (mut reply, mut ack) = injected?;
+                if let Some(text) = warning? {
+                    if envelope.payload["hook_event_name"] == "UserPromptSubmit" {
+                        reply = json!({ "type": "block", "text": text });
+                        ack = None;
+                    } else {
+                        reply["warn"] = json!(text);
+                    }
+                }
                 send(&mut write, &reply).await?;
                 // NOTE: the hook has the context once the write went through
                 if let Some(session) = ack {
@@ -318,6 +343,40 @@ async fn inject(
         Some(text) => (json!({ "type": "context", "text": text }), ack),
         None => (json!({ "type": "none" }), None),
     })
+}
+
+/// Why a prompt must not run in the hook's session here, or why its resume
+/// is risky: the hub sees it open on another machine, or this machine's
+/// copy of its transcript is behind the hub's. Quiet without the hub.
+async fn guard(local: &Local, sync: Option<&SyncHandle>, env: &Envelope) -> Result<Option<String>> {
+    let p = &env.payload;
+    let guarded = match p["hook_event_name"].as_str() {
+        Some("UserPromptSubmit") => true,
+        Some("SessionStart") => p["source"] == "resume",
+        _ => false,
+    };
+    let Some(session) = p["session_id"].as_str().filter(|_| guarded) else {
+        return Ok(None);
+    };
+    if local.connected().await? {
+        let who = Who {
+            session: Some(session.to_owned()),
+            pid: env.pid,
+            cwd: p["cwd"].as_str().map(str::to_owned),
+        };
+        if let Ok(Reply::Guard(Some(reason))) =
+            local.call_within(Call::Guard { who }, GUARD_WAIT).await?
+        {
+            return Ok(Some(reason));
+        }
+    }
+    Ok(sync.filter(|s| s.behind(session)).map(|_| {
+        format!(
+            "Another machine added to this session after it was opened here, so this copy \
+            is out of date. Quit it and resume it again (`claude --resume {session}`) to go \
+            on with the whole conversation."
+        )
+    }))
 }
 
 /// The full id behind a key the mirror knows; unknown keys pass through

@@ -61,7 +61,7 @@ pub fn status(as_json: bool) -> Result<()> {
         println!(
             "{:<10} {:>6}  {:<40}  {}",
             activity_label(s.activity),
-            age(now - s.activity_since),
+            crate::util::age(now - s.activity_since),
             truncate(&label(s), 40),
             truncate(&detail(s), 70),
         );
@@ -129,13 +129,4 @@ fn detail(s: &Session) -> String {
         return format!("{}: {}", tool.name, tool.summary);
     }
     s.cwd.clone()
-}
-
-fn age(ms: i64) -> String {
-    let secs = ms.max(0) / 1000;
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
-    }
 }

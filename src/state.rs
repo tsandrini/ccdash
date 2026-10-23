@@ -392,6 +392,9 @@ impl State {
         s.hooked = true;
         s.last_event_at = ts;
         if let Some(pid) = env.pid {
+            if s.pid.is_some_and(|old| old != pid) {
+                s.opened_at = ts;
+            }
             s.pid = Some(pid);
             sync_channel(s, &self.channel_pids);
         }
@@ -425,6 +428,7 @@ impl State {
         }
         if s.activity == Activity::Gone {
             set_activity(s, Activity::Idle, ts, store);
+            s.opened_at = ts;
         }
 
         let tool_name = str_of(p, "tool_name").unwrap_or("?");
@@ -792,6 +796,9 @@ impl State {
         let aux = self.aux.entry(id.to_owned()).or_default();
         s.hooked = true;
         if let Some(pid) = env.pid {
+            if s.pid.is_some_and(|old| old != pid) {
+                s.opened_at = ts;
+            }
             s.pid = Some(pid);
             sync_channel(s, &self.channel_pids);
         }
@@ -1319,6 +1326,7 @@ impl State {
             tasks: Vec::new(),
             subagents: Vec::new(),
             started_at,
+            opened_at: started_at,
             last_event_at: now,
         };
         fx.store.push(session_row(&session, None));

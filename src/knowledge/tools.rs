@@ -334,7 +334,8 @@ pub fn text_of(reply: &Reply) -> String {
         } => format!("imported: {added} added, {updated} updated, {unchanged} unchanged"),
         Reply::Context(Some(text)) => text.clone(),
         Reply::Context(None) => "nothing to add".into(),
-        Reply::Session(_) => "ok".into(),
+        Reply::Session(_) | Reply::Guard(None) => "ok".into(),
+        Reply::Guard(Some(reason)) => reason.clone(),
     }
 }
 

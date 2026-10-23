@@ -24,6 +24,16 @@ pub fn hostname() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
+/// A duration as `42s`, `7m` or `3h05m`.
+pub fn age(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
 pub fn pid_alive(pid: Option<u32>) -> bool {
     pid.is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
 }

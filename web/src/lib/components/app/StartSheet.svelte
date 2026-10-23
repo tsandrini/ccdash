@@ -1,8 +1,9 @@
 <script lang="ts">
 	// Starts a background session (`claude --bg` on a connected host, in a
 	// project with notes and a directory on that host) or continues an
-	// ended one: host, workspace and project, the model, the permission
-	// mode, the prompt. Waits for the session to report and opens its page.
+	// ended one, on the host it ran on or another that syncs it: host,
+	// workspace and project, the model, the permission mode, the prompt.
+	// Waits for the session to report and opens its page.
 	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
@@ -93,7 +94,8 @@
 	function pick(preset: StartPreset, hosts: LaunchTarget[]) {
 		const r = preset.resume;
 		const last = prefs.start.host;
-		host = r?.host ?? (hosts.some((t) => t.host === last) ? last : hosts[0]?.host) ?? '';
+		const has = (h: string | undefined) => hosts.some((t) => t.host === h);
+		host = (r && has(r.host) ? r.host : has(last) ? last : hosts[0]?.host) ?? '';
 		const here = hosts.find((t) => t.host === host)?.workspaces ?? [];
 		const want = r?.workspace ?? preset.ws ?? scope.current.ws[0] ?? '';
 		ws = r?.workspace ?? (here.some((w) => w.name === want) ? want : (here[0]?.name ?? ''));
@@ -197,7 +199,8 @@
 			<Sheet.Title>{resume ? 'Continue the session' : 'Start a session'}</Sheet.Title>
 			<Sheet.Description>
 				{#if resume}
-					Continues “{label(resume)}” in the background on {resume.host}, in {place(resume.cwd)}.
+					Continues “{label(resume)}” in the background on {host || resume.host}, in
+					{place(resume.cwd)}.
 				{:else}
 					Runs <code class="font-mono">claude --bg</code> on the host, in the project's directory. Its
 					questions and approvals reach this device.
@@ -237,8 +240,19 @@
 						</select>
 					</label>
 				</div>
-			{:else if !connected.includes(resume.host)}
-				<p class="text-sm text-critical">{resume.host} is not connected.</p>
+			{:else}
+				<label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:w-1/3">
+					Host
+					<select class={selectClass} bind:value={host}>
+						{#each connected as h (h)}<option value={h}>{h}</option>{/each}
+					</select>
+				</label>
+				{#if host && host !== resume.host}
+					<p class="text-xs text-muted-foreground">
+						It ran on {resume.host}{connected.includes(resume.host) ? '' : ', which is offline'}; {host}
+						fetches its transcript from the hub first.
+					</p>
+				{/if}
 			{/if}
 			<div class="grid grid-cols-2 gap-2">
 				<label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">

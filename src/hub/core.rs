@@ -2,7 +2,7 @@
 //! the collector links, open asks and notifications. Everything else
 //! talks to it through `Cmd`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Workspace name → the directories under it on one host.
 pub type Dirs = BTreeMap<String, Vec<String>>;
@@ -28,6 +28,7 @@ use crate::{
     protocol::{Call, Injection, Reply, TelemetryRecord, ToCollector, Who},
     state::{AgentEntry, Effects, NiriEvent, PREVIEW_LEN, ProcPoll, State, StoreMsg},
     store::{self, Store},
+    sync::{SyncHost, SyncStatus},
     util::{self, now_ms},
     wire::Envelope,
     workspace::Workspaces,
@@ -191,6 +192,24 @@ pub enum Cmd {
     },
     /// The connected hosts with their directories.
     HostDirs(oneshot::Sender<Vec<(String, Dirs)>>),
+    /// How a collector's copy of Claude Code's state stands.
+    SyncStatus {
+        host: String,
+        status: SyncStatus,
+    },
+    /// Every host with its sync status, for the panel.
+    SyncHosts(oneshot::Sender<Vec<SyncHost>>),
+    /// The host holding session `session` when it is not `host`.
+    Holder {
+        host: String,
+        session: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Asks `host`'s collector to compare everything with the hub again.
+    SyncResync {
+        host: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// A session to start, with the directory already resolved from a known
@@ -269,6 +288,8 @@ impl Hub {
             store,
             reader,
             published: HashMap::new(),
+            shown: HashMap::new(),
+            sync: HashMap::new(),
             pending: HashMap::new(),
             acks: HashSet::new(),
             updates: updates.clone(),
@@ -387,6 +408,37 @@ impl Hub {
     }
 
     /// Sends a session command (`Stop`, `Forget`, `Open`) and waits for it.
+    /// Every host with its sync status.
+    pub async fn sync_hosts(&self) -> Result<Vec<SyncHost>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SyncHosts(reply)).await?;
+        rx.await.context("hub stopped")
+    }
+
+    /// The host holding `session` when that is not `host`: another
+    /// machine opened it first and has it open.
+    pub async fn holder(&self, host: &str, session: &str) -> Result<Option<String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Holder {
+            host: host.to_owned(),
+            session: session.to_owned(),
+            reply,
+        })
+        .await?;
+        rx.await.context("hub stopped")
+    }
+
+    /// Asks `host`'s collector to compare everything again.
+    pub async fn sync_resync(&self, host: &str) -> Result<Result<(), String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SyncResync {
+            host: host.to_owned(),
+            reply,
+        })
+        .await?;
+        rx.await.context("hub stopped")
+    }
+
     pub async fn session_cmd(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<Session, String>>) -> Cmd,
@@ -411,7 +463,12 @@ struct Core {
     channels: HashSet<(String, u32)>,
     store: Store,
     reader: Option<Connection>,
-    published: HashMap<String, Session>,
+    /// What each host's collector last got of each of its sessions.
+    published: HashMap<(String, String), Session>,
+    /// What the panel last got of each session id (see `preferred`).
+    shown: HashMap<String, Session>,
+    /// The last sync status of each host's collector.
+    sync: HashMap<String, SyncStatus>,
     /// Open asks by id.
     pending: HashMap<String, Pending>,
     /// Sessions whose prompt hook still has to acknowledge delivered messages.
@@ -574,6 +631,17 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::Call { host, id, call } => {
                 let result = match call {
+                    Call::Guard { who } => {
+                        let reason = core.guard(&host, &who, now_ms());
+                        core.tell(
+                            &host,
+                            ToCollector::Result {
+                                id,
+                                result: Ok(Reply::Guard(reason)),
+                            },
+                        );
+                        continue;
+                    }
                     Call::Rename { session, title } => core.rename(&session, &title),
                     Call::Reply { session, text } => core.reply(&session, &text),
                     Call::Answer {
@@ -630,6 +698,22 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             Cmd::Dirs { host, dirs } => {
                 core.dirs.insert(host, dirs);
             }
+            Cmd::SyncStatus { host, status } => {
+                core.sync.insert(host, status);
+            }
+            Cmd::SyncHosts(reply) => {
+                let _ = reply.send(core.sync_hosts());
+            }
+            Cmd::Holder {
+                host,
+                session,
+                reply,
+            } => {
+                let _ = reply.send(core.holder(&host, &session).map(|(h, _)| h.to_owned()));
+            }
+            Cmd::SyncResync { host, reply } => {
+                let _ = reply.send(core.sync_resync(&host));
+            }
             Cmd::HostDirs(reply) => {
                 let mut hosts: Vec<(String, Dirs)> = core
                     .links
@@ -645,10 +729,14 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
 
 impl Core {
     fn snapshot(&self, now: i64) -> Snapshot {
-        let mut sessions: Vec<Session> = self
+        let ids: BTreeSet<&str> = self
             .states
             .values()
-            .flat_map(|s| s.sessions().cloned())
+            .flat_map(|s| s.sessions().map(|s| s.id.as_str()))
+            .collect();
+        let mut sessions: Vec<Session> = ids
+            .into_iter()
+            .filter_map(|id| self.preferred(id).map(|(_, s)| s.clone()))
             .collect();
         sessions.sort_by_key(|s| s.started_at);
         Snapshot {
@@ -682,16 +770,122 @@ impl Core {
     }
 
     /// Finds a session on any host by id, background short id or unique
-    /// id prefix.
+    /// id prefix; a session handed between hosts is its `preferred` copy.
     fn resolve(&self, key: &str) -> Option<(&str, &Session)> {
-        let mut hits = self
+        let mut ids: Vec<&str> = self
             .states
-            .iter()
-            .filter_map(|(host, state)| Some((host.as_str(), state.resolve(key)?)));
-        match (hits.next(), hits.next()) {
-            (Some(hit), None) => Some(hit),
-            (Some(hit), Some(_)) if hit.1.id == key => Some(hit),
+            .values()
+            .filter_map(|state| state.resolve(key))
+            .map(|s| s.id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        match ids.as_slice() {
+            [id] => self.preferred(id),
+            many if many.contains(&key) => self.preferred(key),
             _ => None,
+        }
+    }
+
+    /// The copy of session `id` that stands for it when several hosts
+    /// know it (one ran it, then another resumed it): a live one, the
+    /// earliest opened when two are live, else the one that ended last.
+    fn preferred(&self, id: &str) -> Option<(&str, &Session)> {
+        self.states
+            .iter()
+            .filter_map(|(host, st)| Some((host.as_str(), st.session(id)?)))
+            .max_by_key(|(_, s)| {
+                if s.activity == Activity::Gone {
+                    (false, s.activity_since)
+                } else {
+                    (true, -s.opened_at)
+                }
+            })
+    }
+
+    /// Why the caller's session must not take a prompt on `host`: another
+    /// host opened it earlier and still has it open. One session runs on
+    /// one machine at a time (`h7.md`).
+    fn guard(&self, host: &str, who: &Who, now: i64) -> Option<String> {
+        let id = who.session.as_deref()?;
+        let (other, _) = self.holder(host, id)?;
+        let link = format!("{}/sessions/{id}", self.public_url.trim_end_matches('/'));
+        Some(if self.links.contains_key(other) {
+            format!(
+                "This session is open on {other}, and a session runs on one machine at a time. \
+                Stop it there or in ccdash ({link}), then send your prompt again."
+            )
+        } else {
+            let since = self.hosts.get(other).map_or(now, |h| h.since);
+            format!(
+                "This session was open on {other} when {other} went offline {} ago. If it is \
+                closed there, Forget it in ccdash ({link}), then send your prompt again.",
+                util::age(now - since)
+            )
+        })
+    }
+
+    /// The host (and its copy) that holds session `id` against `host`: it
+    /// has the session open and opened it no later than `host` did.
+    fn holder(&self, host: &str, id: &str) -> Option<(&str, &Session)> {
+        let opened = self
+            .states
+            .get(host)
+            .and_then(|st| st.session(id))
+            .filter(|s| s.activity != Activity::Gone)
+            .map(|s| s.opened_at);
+        self.states
+            .iter()
+            .filter(|(h, _)| h.as_str() != host)
+            .filter_map(|(h, st)| Some((h.as_str(), st.session(id)?)))
+            .filter(|(_, s)| s.activity != Activity::Gone)
+            .filter(|(_, s)| opened.is_none_or(|o| s.opened_at <= o))
+            .min_by_key(|(_, s)| s.opened_at)
+    }
+
+    fn sync_hosts(&self) -> Vec<SyncHost> {
+        self.hosts
+            .values()
+            .map(|h| SyncHost {
+                host: h.name.clone(),
+                connected: h.connected,
+                status: self.sync.get(&h.name).cloned(),
+            })
+            .collect()
+    }
+
+    fn sync_resync(&mut self, host: &str) -> Result<(), String> {
+        if !self.links.contains_key(host) {
+            return Err(format!("{host} is not connected"));
+        }
+        if !self.sync.contains_key(host) {
+            return Err(format!("{host} does not sync (`sync.enable` is off there)"));
+        }
+        info!("asking {host} to compare everything again");
+        self.tell(host, ToCollector::SyncResync);
+        Ok(())
+    }
+
+    /// Tells the panel about session `id` as `preferred` has it now; a
+    /// session no host holds any more is removed.
+    fn show(&mut self, id: &str, host: &str) {
+        match self.preferred(id).map(|(_, s)| s.clone()) {
+            Some(s) => {
+                if self.shown.get(id) != Some(&s) {
+                    self.shown.insert(id.to_owned(), s.clone());
+                    let _ = self.updates.send(Update::Session {
+                        session: Box::new(s),
+                    });
+                }
+            }
+            None => {
+                if self.shown.remove(id).is_some() {
+                    let _ = self.updates.send(Update::Removed {
+                        host: host.to_owned(),
+                        id: id.to_owned(),
+                    });
+                }
+            }
         }
     }
 
@@ -1078,7 +1272,7 @@ impl Core {
                     }
                 });
             }
-            Call::Rename { .. } | Call::Reply { .. } | Call::Answer { .. } => {
+            Call::Rename { .. } | Call::Reply { .. } | Call::Answer { .. } | Call::Guard { .. } => {
                 answer(Err("not a knowledge call".into()));
             }
         }
@@ -1913,31 +2107,34 @@ impl Core {
             self.store.send(host, msg);
         }
         let mut down: Vec<ToCollector> = Vec::new();
+        let mut changed = Vec::new();
         for id in fx.touched {
             let Some(session) = state.session(&id) else {
                 continue;
             };
-            if self.published.get(&id) != Some(session) {
-                self.published.insert(id, session.clone());
-                let update = Update::Session {
-                    session: Box::new(session.clone()),
-                };
+            let key = (host.to_owned(), id.clone());
+            if self.published.get(&key) != Some(session) {
+                self.published.insert(key, session.clone());
                 down.push(ToCollector::Update {
-                    update: Box::new(update.clone()),
+                    update: Box::new(Update::Session {
+                        session: Box::new(session.clone()),
+                    }),
                 });
-                let _ = self.updates.send(update);
+                changed.push(id);
             }
         }
         for id in fx.removed {
-            self.published.remove(&id);
-            let update = Update::Removed {
-                host: host.to_owned(),
-                id,
-            };
+            self.published.remove(&(host.to_owned(), id.clone()));
             down.push(ToCollector::Update {
-                update: Box::new(update.clone()),
+                update: Box::new(Update::Removed {
+                    host: host.to_owned(),
+                    id: id.clone(),
+                }),
             });
-            let _ = self.updates.send(update);
+            changed.push(id);
+        }
+        for id in &changed {
+            self.show(id, host);
         }
         let limits_changed = fx.rate_limits;
         let closed: Vec<(String, String)> = self
@@ -2179,6 +2376,147 @@ mod tests {
                 return msg;
             }
         }
+    }
+
+    /// The guard's answer for `session` on `host`.
+    async fn guard(
+        hub: &Hub,
+        rx: &mut mpsc::Receiver<ToCollector>,
+        host: &str,
+        session: &str,
+    ) -> Option<String> {
+        let who = Who {
+            session: Some(session.into()),
+            pid: None,
+            cwd: None,
+        };
+        hub.send(Cmd::Call {
+            host: host.into(),
+            id: 7,
+            call: Call::Guard { who },
+        })
+        .await
+        .unwrap();
+        match next(rx, |m| matches!(m, ToCollector::Result { id: 7, .. })).await {
+            ToCollector::Result {
+                result: Ok(Reply::Guard(reason)),
+                ..
+            } => reason,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_session_runs_on_one_machine() {
+        let dir = std::env::temp_dir().join(format!("ccdash-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("t.db"), 30).unwrap();
+        let hub = Hub::spawn(
+            "hub".into(),
+            "http://hub".into(),
+            Workspaces::new(&["/w".into()], "/home"),
+            store,
+            None,
+            KnowledgeCfg::default(),
+            0,
+        );
+        let mut rxs = HashMap::new();
+        for (conn, host) in ["navi", "flat"].into_iter().enumerate() {
+            let (tx, rx) = mpsc::channel(256);
+            hub.send(Cmd::CollectorOpen {
+                host: host.into(),
+                conn: conn as u64,
+                terminals: Vec::new(),
+                tx,
+            })
+            .await
+            .unwrap();
+            rxs.insert(host, rx);
+        }
+        let sid = "5e3f1c2a-0000-4000-8000-000000000001";
+        let hook = |event: &str, source: &str| {
+            Input::Envelope(envelope(
+                Source::Hook,
+                None,
+                json!({"session_id": sid, "cwd": "/w/p", "hook_event_name": event, "source": source}),
+            ))
+        };
+        let send = |host: &str, input: Input| hub.send(Cmd::Input(host.into(), input));
+        send("navi", hook("SessionStart", "startup")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        send("flat", hook("SessionStart", "resume")).await.unwrap();
+
+        // navi opened it first: flat is refused, navi is not
+        let reason = guard(&hub, rxs.get_mut("flat").unwrap(), "flat", sid).await;
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("open on navi")
+                    && r.contains(&format!("http://hub/sessions/{sid}"))),
+            "{reason:?}"
+        );
+        assert_eq!(
+            guard(&hub, rxs.get_mut("navi").unwrap(), "navi", sid).await,
+            None
+        );
+        assert_eq!(
+            hub.holder("flat", sid).await.unwrap().as_deref(),
+            Some("navi")
+        );
+        assert_eq!(hub.holder("navi", sid).await.unwrap(), None);
+        // one copy stands for the session: the holder's
+        let snap = hub.snapshot().await.unwrap();
+        let copies: Vec<&str> = snap
+            .sessions
+            .iter()
+            .filter(|s| s.id == sid)
+            .map(|s| s.host.as_str())
+            .collect();
+        assert_eq!(copies, ["navi"]);
+
+        // navi closes it: flat goes on and stands for it
+        send("navi", hook("SessionEnd", "")).await.unwrap();
+        assert_eq!(
+            guard(&hub, rxs.get_mut("flat").unwrap(), "flat", sid).await,
+            None
+        );
+        assert_eq!(hub.resolve(sid).await.unwrap().unwrap().host, "flat");
+
+        // flat closes, navi opens it again and goes offline with it open
+        send("flat", hook("SessionEnd", "")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        send("navi", hook("SessionStart", "resume")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        hub.send(Cmd::CollectorClosed {
+            host: "navi".into(),
+            conn: 0,
+        })
+        .await
+        .unwrap();
+        send("flat", hook("SessionStart", "resume")).await.unwrap();
+        let reason = guard(&hub, rxs.get_mut("flat").unwrap(), "flat", sid).await;
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|r| r.contains("navi went offline") && r.contains("Forget")),
+            "{reason:?}"
+        );
+        assert_eq!(
+            hub.holder("flat", sid).await.unwrap().as_deref(),
+            Some("navi")
+        );
+        // forgetting the offline copy lets flat go on
+        let forgot = hub
+            .session_cmd(|reply| Cmd::Forget {
+                key: sid.into(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(forgot.host, "navi");
+        assert_eq!(hub.holder("flat", sid).await.unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

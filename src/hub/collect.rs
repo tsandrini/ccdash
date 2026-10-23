@@ -19,12 +19,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use crate::{
     hub::core::{Cmd, Hub, Input},
-    protocol::{ToHub, VERSION},
+    protocol::{ToCollector, ToHub, VERSION},
     util::{constant_time_eq, expand_env},
 };
 
@@ -45,7 +45,7 @@ impl Tokens {
     }
 
     /// The host whose token `given` is.
-    fn host_of(&self, given: &str) -> Option<String> {
+    pub(crate) fn host_of(&self, given: &str) -> Option<String> {
         let mut hit = None;
         for (host, path) in &self.files {
             let path = PathBuf::from(expand_env(&path.to_string_lossy()));
@@ -66,7 +66,7 @@ impl Tokens {
 }
 
 pub async fn collect(
-    State((hub, tokens)): State<(Hub, Tokens)>,
+    State((hub, tokens, changed)): State<(Hub, Tokens, watch::Receiver<u64>)>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -78,13 +78,18 @@ pub async fn collect(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = link(socket, host.clone(), hub).await {
+        if let Err(e) = link(socket, host.clone(), hub, changed).await {
             debug!("collector {host}: {e:#}");
         }
     })
 }
 
-async fn link(socket: WebSocket, host: String, hub: Hub) -> Result<()> {
+async fn link(
+    socket: WebSocket,
+    host: String,
+    hub: Hub,
+    mut changed: watch::Receiver<u64>,
+) -> Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let conn = NEXT.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
@@ -121,9 +126,16 @@ async fn link(socket: WebSocket, host: String, hub: Hub) -> Result<()> {
         tx,
     })
     .await?;
+    changed.mark_unchanged();
     let result = async {
         loop {
             tokio::select! {
+                gone = changed.changed() => {
+                    gone?;
+                    let seq = *changed.borrow_and_update();
+                    let text = serde_json::to_string(&ToCollector::SyncChanged { seq })?;
+                    sink.send(Message::Text(text.into())).await?;
+                }
                 msg = tokio::time::timeout(IDLE, stream.next()) => {
                     let Some(msg) = msg.context("idle")? else { return Ok(()) };
                     if let Some(cmd) = parse(&msg?)?.and_then(|m| command(&host, m)) {
@@ -195,6 +207,7 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
             error,
         },
         ToHub::Dirs { dirs } => Cmd::Dirs { host, dirs },
+        ToHub::Sync { status } => Cmd::SyncStatus { host, status },
     })
 }
 

@@ -209,6 +209,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(tokens::SCHEMA)?;
     conn.execute_batch(messages::SCHEMA)?;
     conn.execute_batch(claims::SCHEMA)?;
+    conn.execute_batch(crate::sync::hub::SCHEMA)?;
     migrate(&conn)?;
     Ok(conn)
 }

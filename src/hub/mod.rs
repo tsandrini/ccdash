@@ -90,6 +90,11 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             web_dir.display()
         );
     }
+    let sync = crate::sync::hub::Mirror::open(store.clone(), &cfg.sync_dir(), hub.clone())?;
+    info!(
+        "keeping Claude Code's state in {}",
+        cfg.sync_dir().display()
+    );
     let tokens = collect::Tokens::new(cfg.collect.tokens.clone());
     if cfg.collect.tokens.is_empty() {
         info!("no collector tokens configured: nothing will report");
@@ -109,6 +114,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             public_url.clone(),
             push.clone(),
             web_dir.clone(),
+            sync.clone(),
         ));
     }
     tokio::spawn(ticker(hub.sender()));
