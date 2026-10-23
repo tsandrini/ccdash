@@ -29,6 +29,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, info, warn};
+use ureq::unversioned::{
+    resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver},
+    transport::{DefaultConnector, NextTimeout},
+};
 
 use super::{
     BODY_LIMIT, CHUNK, CONFLICTS_DIR, Changes, ConflictReport, HISTORY, HistoryPage, Probe, Probed,
@@ -1251,6 +1255,57 @@ impl std::fmt::Display for HubError {
 
 impl std::error::Error for HubError {}
 
+/// How long a name lookup of the hub is reused.
+const DNS_TTL: Duration = Duration::from_secs(300);
+
+/// Name lookups kept for `DNS_TTL`, and the last answer used when a lookup
+/// fails. ureq resolves the host for every request, before it looks for a
+/// pooled connection, so a backfill's thousands of requests went to the
+/// DNS server one by one: Pi-hole's per-client limit (1000 a minute) then
+/// refused every lookup from the whole machine.
+#[derive(Debug, Default)]
+struct CachedResolver {
+    inner: DefaultResolver,
+    /// `scheme://authority` → the addresses and when they were looked up.
+    known: Mutex<HashMap<String, (ResolvedSocketAddrs, Instant)>>,
+}
+
+impl Resolver for CachedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let key = format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or_default(),
+            uri.authority().map_or("", |a| a.as_str())
+        );
+        let cached = self.known.lock().ok().and_then(|k| k.get(&key).cloned());
+        if let Some((addrs, at)) = &cached
+            && at.elapsed() < DNS_TTL
+        {
+            return Ok(addrs.clone());
+        }
+        match self.inner.resolve(uri, config, timeout) {
+            Ok(addrs) => {
+                if let Ok(mut known) = self.known.lock() {
+                    known.insert(key, (addrs.clone(), Instant::now()));
+                }
+                Ok(addrs)
+            }
+            Err(e) => match cached {
+                Some((addrs, _)) => {
+                    debug!("sync: looking up {key} failed ({e}); using the last answer");
+                    Ok(addrs)
+                }
+                None => Err(e),
+            },
+        }
+    }
+}
+
 /// The `/sync/` routes over HTTP, with this machine's collector token.
 struct Client {
     agent: ureq::Agent,
@@ -1260,11 +1315,12 @@ struct Client {
 
 impl Client {
     fn new(base: String, token_file: PathBuf) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(120)))
             .http_status_as_error(false)
-            .build()
-            .into();
+            .build();
+        let agent =
+            ureq::Agent::with_parts(config, DefaultConnector::new(), CachedResolver::default());
         Self {
             agent,
             base: base.trim_end_matches('/').to_owned(),
@@ -1734,6 +1790,38 @@ mod tests {
             decide(stat(10, 1), Some(&s), None, None, false),
             Action::Upload { from: 0, expect: 0 }
         );
+    }
+
+    #[test]
+    fn lookups_are_reused_and_survive_failures() {
+        let resolver = CachedResolver::default();
+        let config = ureq::Agent::config_builder().build();
+        let timeout = || NextTimeout {
+            after: ureq::unversioned::transport::time::Duration::NotHappening,
+            reason: ureq::Timeout::Resolve,
+        };
+        let uri: ureq::http::Uri = "http://localhost:7837/sync/changes".parse().unwrap();
+        let first = resolver.resolve(&uri, &config, timeout()).unwrap();
+        assert!(!first.is_empty());
+        // the same host again comes from the cache, even with the answer swapped
+        let key = "http://localhost:7837".to_owned();
+        let mut planted = first.clone();
+        planted.truncate(1);
+        planted[0] = "192.0.2.7:7837".parse().unwrap();
+        resolver
+            .known
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (planted.clone(), Instant::now()));
+        assert!(resolver.resolve(&uri, &config, timeout()).unwrap() == planted);
+        // a failing lookup falls back to the last answer, however old
+        let gone: ureq::http::Uri = "http://no-such-host.invalid/x".parse().unwrap();
+        assert!(resolver.resolve(&gone, &config, timeout()).is_err());
+        resolver.known.lock().unwrap().insert(
+            "http://no-such-host.invalid".into(),
+            (planted.clone(), Instant::now() - DNS_TTL * 2),
+        );
+        assert!(resolver.resolve(&gone, &config, timeout()).unwrap() == planted);
     }
 
     #[test]
