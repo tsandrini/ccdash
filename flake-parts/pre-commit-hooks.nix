@@ -55,7 +55,14 @@ in
           shfmt.enable = true; # Shell parser and formatter
 
           # --- Misc ---
-          markdownlint.enable = true; # Markdown lint tool
+          markdownlint = {
+            enable = true; # Markdown lint tool
+            # NOTE: tables (prettier aligns them) and code may run past 80 columns
+            settings.configuration.MD013 = {
+              tables = false;
+              code_blocks = false;
+            };
+          };
           editorconfig-checker.enable = true; # .editorconfig file checker
           typos.enable = true; # Source code spell checker
           prettier = {
