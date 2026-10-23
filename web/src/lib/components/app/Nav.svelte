@@ -1,12 +1,13 @@
 <script lang="ts">
 	// The areas, from the registry; a count where the area has one.
+	// `compact`: icons only, for the collapsed sidebar.
 	import { page } from '$app/state';
 	import { areas } from '#lib/nav.js';
 	import { live } from '#lib/live/store.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
 	import { cn } from '#lib/utils.js';
 
-	let { onnavigate }: { onnavigate?: () => void } = $props();
+	let { onnavigate, compact = false }: { onnavigate?: () => void; compact?: boolean } = $props();
 
 	const inScope = $derived(live.list.filter((s) => scope.covers(s)));
 	const search = $derived(page.url.search);
@@ -19,18 +20,30 @@
 		<a
 			href={`${area.href}${search}`}
 			aria-current={active ? 'page' : undefined}
+			title={compact ? (badge ? `${area.label} (${badge})` : area.label) : undefined}
 			class={cn(
-				'flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+				'relative flex items-center gap-2.5 rounded-md py-2 text-sm hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+				compact ? 'justify-center px-2' : 'px-2.5',
 				active && 'bg-sidebar-accent font-medium text-sidebar-accent-foreground'
 			)}
 			onclick={onnavigate}
 		>
 			<area.icon class="size-4 shrink-0 opacity-80" />
-			<span class="flex-1">{area.label}</span>
-			{#if badge}
-				<span class="rounded-full bg-muted px-1.5 text-xs text-muted-foreground tabular-nums"
-					>{badge}</span
-				>
+			{#if compact}
+				<span class="sr-only">{area.label}</span>
+				{#if badge}
+					<span
+						class="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-muted px-1 text-center text-[10px] leading-4 text-muted-foreground tabular-nums"
+						>{badge}</span
+					>
+				{/if}
+			{:else}
+				<span class="flex-1">{area.label}</span>
+				{#if badge}
+					<span class="rounded-full bg-muted px-1.5 text-xs text-muted-foreground tabular-nums"
+						>{badge}</span
+					>
+				{/if}
 			{/if}
 		</a>
 	{/each}

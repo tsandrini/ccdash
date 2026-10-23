@@ -208,6 +208,12 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
         },
         ToHub::Dirs { dirs } => Cmd::Dirs { host, dirs },
         ToHub::Sync { status } => Cmd::SyncStatus { host, status },
+        ToHub::SyncResolved { id, error, copy } => Cmd::SyncResolved {
+            host,
+            id,
+            error,
+            copy,
+        },
     })
 }
 

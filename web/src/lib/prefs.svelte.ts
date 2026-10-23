@@ -50,7 +50,8 @@ class Prefs {
 	scheme = $state<Scheme>(
 		browser && localStorage.getItem(SCHEME_KEY) === 'ccdash' ? 'ccdash' : 'neutral'
 	);
-	/** The sidebar on wide screens; off for a narrow (vertical) monitor. */
+	/** The full sidebar on wide screens; off, a rail of icons (a narrow
+	 * vertical monitor). */
 	sidebar = $state<boolean>(!browser || localStorage.getItem(SIDEBAR_KEY) !== 'off');
 	/** A light grid behind the project pages. */
 	grid = $state<boolean>(browser && localStorage.getItem(GRID_KEY) === 'on');

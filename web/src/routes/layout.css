@@ -237,6 +237,11 @@ colours stay the validated ones. */
 		@apply min-h-full bg-background text-foreground;
 		overscroll-behavior-y: none;
 	}
+	/* NOTE: a long path or identifier breaks where it must instead of widening
+	the page past the phone's screen; tables and code scroll in their own box */
+	main {
+		overflow-wrap: anywhere;
+	}
 }
 
 /* Server-rendered markdown (src/markdown.rs) in replies and notes. */
@@ -285,7 +290,8 @@ colours stay the validated ones. */
 	@apply border-l-2 border-border pl-3;
 }
 .prose-chat table {
-	@apply border-collapse text-sm;
+	@apply block max-w-full border-collapse overflow-x-auto text-sm;
+	overflow-wrap: normal;
 }
 .prose-chat th,
 .prose-chat td {

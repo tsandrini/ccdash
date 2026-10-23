@@ -96,6 +96,49 @@ pub struct ConflictReport {
     pub size: u64,
     /// Where the collector keeps its copy, relative to the Claude config dir.
     pub copy: String,
+    #[serde(default)]
+    pub details: Option<ConflictDetails>,
+    /// The copy is the version the hub had before this machine's copy
+    /// replaced it ("use this copy").
+    #[serde(default)]
+    pub former_hub: bool,
+}
+
+/// How a set-aside copy compares with the version in place, worked out
+/// by the collector that holds both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct ConflictDetails {
+    /// The version in place (the hub's) and the copy.
+    pub current_size: u64,
+    pub copy_size: u64,
+    /// Bytes both start with.
+    pub shared: u64,
+    /// Lines each has after the shared part.
+    pub current_lines: u64,
+    pub copy_lines: u64,
+    /// When each was last written.
+    pub current_mtime: i64,
+    pub copy_mtime: i64,
+}
+
+/// Every copy a collector holds under `ccdash-conflicts/`, sent after each
+/// full pass and each resolution; the hub's list follows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictState {
+    pub copies: Vec<ConflictReport>,
+}
+
+/// Which version of a conflicted file stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum Keep {
+    /// The version in place: the copy is deleted.
+    Hub,
+    /// The copy: it replaces the hub's version on every machine, and the
+    /// version it replaced is set aside in its place.
+    Copy,
 }
 
 /// What a collector reports about its copy (`ToHub::Sync`).
@@ -142,6 +185,74 @@ pub struct SyncConflict {
     pub size: u64,
     pub copy: String,
     pub at: i64,
+    /// The session the file belongs to, and its title when the hub knows it.
+    pub session: Option<String>,
+    pub title: Option<String>,
+    pub details: Option<ConflictDetails>,
+    pub former_hub: bool,
+    /// A resolution sent to the host and not confirmed yet.
+    pub pending: Option<Keep>,
+    /// Why the last resolution failed.
+    pub error: Option<String>,
+}
+
+/// Bytes and files of a part of the state.
+#[derive(Debug, Clone, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct StatSize {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// One part of the state (a kind of file, or a project's sessions) with
+/// what it grew by.
+#[derive(Debug, Clone, Default, Serialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct StatGroup {
+    /// `projects/<dir>`, or the top-level directory (`file-history`, …).
+    pub key: String,
+    /// `workspace/project` for a project's sessions when the hub knows the
+    /// directory, else the key.
+    pub label: String,
+    pub size: StatSize,
+    /// Sessions in it (projects only).
+    pub sessions: u64,
+    /// Growth over the last day, week and 30 days, in bytes.
+    pub day: i64,
+    pub week: i64,
+    pub month: i64,
+}
+
+/// A session's files (transcript, subagents, tool results, rewind
+/// checkpoints, tasks).
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct StatSession {
+    pub session: String,
+    pub title: Option<String>,
+    pub label: Option<String>,
+    pub host: Option<String>,
+    pub size: StatSize,
+    pub last_write: i64,
+}
+
+/// `GET /api/v1/sync/stats`.
+#[derive(Debug, Serialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct SyncStats {
+    pub total: StatSize,
+    /// By top-level directory.
+    pub kinds: Vec<StatGroup>,
+    /// By project directory, largest first.
+    pub projects: Vec<StatGroup>,
+    /// The largest sessions.
+    pub sessions: Vec<StatSession>,
+    /// Bytes added per day (local dates), oldest first, the last 30 days.
+    pub days: Vec<(String, i64)>,
+    /// The first day growth was recorded.
+    pub since: Option<String>,
+    /// Prompt history lines and bytes.
+    pub history: StatSize,
 }
 
 /// `GET /api/v1/sync`.

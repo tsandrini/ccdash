@@ -170,10 +170,11 @@ impl Local {
 }
 
 pub const NOT_CONNECTED: &str = "the hub is not connected";
-/// After a stop, how long (in 100 ms polls) the process gets to exit
-/// before its files are synced anyway.
-const STOP_EXIT_POLLS: usize = 100;
-const STOP_FLUSH_WAIT: Duration = Duration::from_secs(60);
+/// How long a stop waits for the sync pass that uploads the session's
+/// last lines; the hub gives the whole stop 30 s.
+const STOP_FLUSH_WAIT: Duration = Duration::from_secs(12);
+/// How long a launch that continues a session waits for its transcript.
+const LAUNCH_FLUSH_WAIT: Duration = Duration::from_secs(60);
 const DIRS_EVERY_MS: i64 = 60_000;
 pub const TIMED_OUT: &str = "the hub did not answer in time";
 
@@ -471,6 +472,7 @@ impl Actor {
             launch: Launch {
                 command: Vec::new(),
                 stop: Vec::new(),
+                remove: Vec::new(),
             },
             attach: Vec::new(),
             dirs: BTreeMap::new(),
@@ -530,7 +532,7 @@ impl Actor {
         let sync = self.sync.clone().filter(|_| spec.resume.is_some());
         tokio::spawn(async move {
             if let Some(sync) = sync
-                && !sync.flush(STOP_FLUSH_WAIT).await
+                && !sync.flush(LAUNCH_FLUSH_WAIT).await
             {
                 warn!("launch {launch}: the sync pass did not finish in time");
             }
@@ -560,26 +562,20 @@ impl Actor {
             });
             return;
         };
-        let command = self.launch.stop.clone();
+        let (stop, remove) = (self.launch.stop.clone(), self.launch.remove.clone());
         let sync = self.sync.clone();
         tokio::spawn(async move {
-            let result = actions::stop(&command, &session).await;
-            if let Err(e) = &result {
-                warn!("stopping {id}: {e}");
+            let result = actions::stop(&stop, &remove, &session).await;
+            match &result {
+                Ok(how) => info!("stopping {id}: {how}"),
+                Err(e) => warn!("stopping {id}: {e}"),
             }
             // NOTE: the hub has the final bytes when the panel says stopped
             if result.is_ok()
                 && let Some(sync) = sync
+                && !sync.flush(STOP_FLUSH_WAIT).await
             {
-                for _ in 0..STOP_EXIT_POLLS {
-                    if !pid_alive(session.pid) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                if !sync.flush(STOP_FLUSH_WAIT).await {
-                    warn!("stopping {id}: the sync pass did not finish in time");
-                }
+                warn!("stopping {id}: the sync pass did not finish in time");
             }
             let _ = hub.send(ToHub::Stopped {
                 session: id,
@@ -850,6 +846,27 @@ impl Actor {
             ToCollector::Open { session } => self.open(&session),
             ToCollector::SyncChanged { .. } => self.kick_sync(SyncCmd::Changed),
             ToCollector::SyncResync => self.kick_sync(SyncCmd::Resync),
+            ToCollector::SyncResolve {
+                id,
+                path,
+                copy,
+                keep,
+            } => {
+                if self.sync.is_some() {
+                    self.kick_sync(SyncCmd::Resolve {
+                        id,
+                        path,
+                        copy,
+                        keep,
+                    });
+                } else {
+                    self.to_hub(ToHub::SyncResolved {
+                        id,
+                        error: Some("this machine does not sync".into()),
+                        copy: None,
+                    });
+                }
+            }
         }
     }
 

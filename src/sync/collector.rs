@@ -35,8 +35,9 @@ use ureq::unversioned::{
 };
 
 use super::{
-    BODY_LIMIT, CHUNK, CONFLICTS_DIR, Changes, ConflictReport, HISTORY, HistoryPage, Probe, Probed,
-    Refused, Row, SyncStatus, fp, fp_of, glob, line_digest, session_of, valid_path, watch,
+    BODY_LIMIT, CHUNK, CONFLICTS_DIR, Changes, ConflictDetails, ConflictReport, ConflictState,
+    HISTORY, HistoryPage, Keep, Probe, Probed, Refused, Row, SyncStatus, fp, fp_of, glob,
+    line_digest, session_of, valid_path, watch,
 };
 use crate::{
     protocol::ToHub,
@@ -56,6 +57,9 @@ pub const DEFAULT_INCLUDE: &[&str] = &[
 pub const DEFAULT_EXCLUDE: &[&str] = &["projects/-tmp-*"];
 /// Suffix of a download being written, renamed over the file when whole.
 const PART: &str = ".ccdash-part";
+/// Suffix of a `ccdash-conflicts/<time>` directory holding the version
+/// the hub had before a copy replaced it.
+const FORMER_HUB: &str = "-hub";
 /// The hub's changes are read at least this often without a signal
 /// (`SyncChanged` covers the rest; a reconnect asks again).
 const PULL_EVERY: Duration = Duration::from_secs(300);
@@ -91,6 +95,14 @@ pub enum Cmd {
     Rescan,
     /// The watcher stopped: scan every `interval` from now on.
     Unwatched,
+    /// Resolve conflict `id` as the owner chose; the result goes to the hub
+    /// as `ToHub::SyncResolved`.
+    Resolve {
+        id: i64,
+        path: String,
+        copy: String,
+        keep: Keep,
+    },
 }
 
 /// The collector's handle on the sync thread.
@@ -177,6 +189,8 @@ pub fn spawn(settings: Settings, hub: UnboundedSender<ToHub>) -> Result<Handle> 
 /// What the next pass has to cover.
 #[derive(Default)]
 struct Due {
+    /// Conflicts to resolve: id, path, copy, which version stays.
+    resolve: Vec<(i64, String, String, Keep)>,
     /// Scan everything.
     full: bool,
     /// Read the hub's changes.
@@ -204,11 +218,25 @@ impl Due {
                 *watching = false;
                 self.full = true;
             }
+            Cmd::Resolve {
+                id,
+                path,
+                copy,
+                keep,
+            } => {
+                self.pull = true;
+                self.resolve.push((id, path, copy, keep));
+            }
         }
     }
 
     fn any(&self) -> bool {
-        self.full || self.pull || self.resync || !self.dirty.is_empty() || !self.flushes.is_empty()
+        self.full
+            || self.pull
+            || self.resync
+            || !self.dirty.is_empty()
+            || !self.flushes.is_empty()
+            || !self.resolve.is_empty()
     }
 }
 
@@ -285,6 +313,19 @@ fn run(mut s: Syncer, rx: &mpsc::Receiver<Cmd>, to_self: &mpsc::Sender<Cmd>) {
         }
         let (full, pull) = (work.full || work.resync, work.pull || work.resync);
         s.status.watching = watching;
+        let resolutions = !work.resolve.is_empty();
+        for (id, path, copy, keep) in work.resolve {
+            let result = s.resolve(&path, &copy, keep);
+            match &result {
+                Ok(_) => info!("sync: conflict {id} on {path} resolved ({keep:?} kept)"),
+                Err(e) => warn!("sync: resolving conflict {id} on {path}: {e}"),
+            }
+            let (copy, error) = match result {
+                Ok(copy) => (copy, None),
+                Err(e) => (None, Some(e)),
+            };
+            let _ = s.hub.send(ToHub::SyncResolved { id, error, copy });
+        }
         match s.pass(pull, full, &work.dirty) {
             Ok(()) => {
                 s.status.error = None;
@@ -297,6 +338,11 @@ fn run(mut s: Syncer, rx: &mpsc::Receiver<Cmd>, to_self: &mpsc::Sender<Cmd>) {
                 if full && !watching {
                     watching = s.watch(to_self);
                     s.status.watching = watching;
+                }
+                if (full || resolutions)
+                    && let Err(e) = s.conflict_state()
+                {
+                    warn!("sync: reporting the conflict copies: {e:#}");
                 }
                 if pull {
                     last_pull = now;
@@ -928,7 +974,10 @@ impl Syncer {
             let len = (end - offset).min(CHUNK as u64) as usize;
             f.seek(SeekFrom::Start(offset))?;
             f.read_exact(&mut buf[..len])?;
-            match self.client.put(path, offset, expect, &buf[..len])? {
+            match self
+                .client
+                .put(path, offset, expect, &buf[..len], Some(l.mtime / 1_000_000))?
+            {
                 Ok(row) => {
                     expect = row.version;
                     offset += len as u64;
@@ -1038,13 +1087,147 @@ impl Syncer {
         self.index.del_file(path)?;
         self.files.remove(path);
         self.status.conflicts += 1;
+        let fetched = self.download(path, 0);
         let report = ConflictReport {
             path: path.to_owned(),
             size: l.size,
+            details: describe(&self.root, path, &copy),
             copy,
+            former_hub: false,
         };
         let _: serde_json::Value = self.client.post_json("/sync/conflicts", &report)?;
-        self.download(path, 0)
+        fetched
+    }
+
+    /// Tells the hub every copy this machine holds under
+    /// `ccdash-conflicts/`, with how each compares with the version in
+    /// place; the hub's list follows it.
+    fn conflict_state(&self) -> Result<()> {
+        let mut copies = Vec::new();
+        let base = self.root.join(CONFLICTS_DIR);
+        for stamp in fs::read_dir(&base).into_iter().flatten().flatten() {
+            let Ok(stamp_name) = stamp.file_name().into_string() else {
+                continue;
+            };
+            let mut stack = vec![(stamp.path(), String::new())];
+            while let Some((dir, rel)) = stack.pop() {
+                for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let Ok(name) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    let path = if rel.is_empty() {
+                        name
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    let Ok(meta) = entry.path().symlink_metadata() else {
+                        continue;
+                    };
+                    if meta.is_dir() {
+                        stack.push((entry.path(), path));
+                    } else if meta.is_file() && valid_path(&path) {
+                        let copy = format!("{CONFLICTS_DIR}/{stamp_name}/{path}");
+                        copies.push(ConflictReport {
+                            details: describe(&self.root, &path, &copy),
+                            size: meta.len(),
+                            former_hub: stamp_name.ends_with(FORMER_HUB),
+                            path,
+                            copy,
+                        });
+                    }
+                }
+            }
+        }
+        let _: serde_json::Value = self
+            .client
+            .post_json("/sync/conflicts/state", &ConflictState { copies })?;
+        Ok(())
+    }
+
+    /// Carries out a resolution the owner chose in the panel; after "use
+    /// the copy", where the version it replaced was set aside.
+    fn resolve(&mut self, path: &str, copy: &str, keep: Keep) -> Result<Option<String>, String> {
+        let ours = copy
+            .strip_prefix(CONFLICTS_DIR)
+            .is_some_and(|rest| rest.starts_with('/'));
+        if !valid_path(path) || !valid_path(copy) || !ours || !self.filter.travels(path) {
+            return Err("that is not a conflict copy of a synced file".into());
+        }
+        let copy_file = self.root.join(copy);
+        match keep {
+            Keep::Hub => {
+                match fs::remove_file(&copy_file) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("deleting the copy: {e}")),
+                }
+                prune(&self.root.join(CONFLICTS_DIR), copy_file.parent());
+                Ok(None)
+            }
+            Keep::Copy => {
+                if Live::read(&self.root).runs(path) {
+                    return Err("its session runs on this machine: stop it first".into());
+                }
+                let mut f = File::open(&copy_file).map_err(|e| format!("reading the copy: {e}"))?;
+                let size = f.metadata().map_err(|e| e.to_string())?.len();
+                let mut expect = self.remote.get(path).map_or(0, |r| r.version);
+                let (mut offset, mut buf) = (0u64, vec![0; CHUNK.min(size as usize)]);
+                let row = loop {
+                    let len = (size - offset).min(CHUNK as u64) as usize;
+                    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                    f.read_exact(&mut buf[..len]).map_err(|e| e.to_string())?;
+                    match self
+                        .client
+                        .put(path, offset, expect, &buf[..len], Some(now_ms()))
+                        .map_err(|e| format!("{e:#}"))?
+                    {
+                        Ok(row) => {
+                            expect = row.version;
+                            offset += len as u64;
+                            if offset >= size {
+                                break row;
+                            }
+                        }
+                        Err(refused) => {
+                            return Err(match refused.held_by {
+                                Some(holder) => {
+                                    format!("its session is open on {holder}: stop it there first")
+                                }
+                                None => "the hub's version changed meanwhile; try again".into(),
+                            });
+                        }
+                    }
+                };
+                // NOTE: the version the copy replaced is kept as the new copy
+                let current = self.root.join(path);
+                let mut aside = None;
+                if current.exists() {
+                    let rel = format!("{CONFLICTS_DIR}/{}{FORMER_HUB}/{path}", now_ms());
+                    let target = self.root.join(&rel);
+                    if let Some(dir) = target.parent() {
+                        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    }
+                    fs::rename(&current, &target).map_err(|e| e.to_string())?;
+                    aside = Some(rel);
+                }
+                if let Some(dir) = current.parent() {
+                    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                }
+                fs::rename(&copy_file, &current).map_err(|e| e.to_string())?;
+                prune(&self.root.join(CONFLICTS_DIR), copy_file.parent());
+                let synced = Synced {
+                    size,
+                    mtime: stat(&current).map_or(-1, |s| s.mtime),
+                    version: row.version,
+                    fp: fp_of(&current, size).map_err(|e| e.to_string())?,
+                    deleted: false,
+                };
+                self.record(path, synced).map_err(|e| format!("{e:#}"))?;
+                self.remember_remote(row).map_err(|e| format!("{e:#}"))?;
+                self.stat_again(path);
+                Ok(aside)
+            }
+        }
     }
 
     /// New complete lines of the local prompt history go up.
@@ -1173,6 +1356,80 @@ impl Syncer {
         if let Ok(mut b) = self.behind.lock() {
             *b = behind;
         }
+    }
+}
+
+/// How the copy at `copy` compares with the version in place at `path`.
+fn describe(root: &Path, path: &str, copy: &str) -> Option<ConflictDetails> {
+    let (current, copied) = (root.join(path), root.join(copy));
+    let (a, b) = (fs::metadata(&current).ok()?, fs::metadata(&copied).ok()?);
+    let shared = shared_prefix(&current, &copied).ok()?;
+    let millis = |m: &fs::Metadata| m.mtime() * 1000 + m.mtime_nsec() / 1_000_000;
+    Some(ConflictDetails {
+        current_size: a.len(),
+        copy_size: b.len(),
+        shared,
+        current_lines: lines_from(&current, shared).ok()?,
+        copy_lines: lines_from(&copied, shared).ok()?,
+        current_mtime: millis(&a),
+        copy_mtime: millis(&b),
+    })
+}
+
+/// Bytes two files start with in common.
+fn shared_prefix(a: &Path, b: &Path) -> io::Result<u64> {
+    let (mut a, mut b) = (File::open(a)?, File::open(b)?);
+    let (mut x, mut y) = (vec![0; 64 << 10], vec![0; 64 << 10]);
+    let mut shared = 0;
+    loop {
+        let n = read_full(&mut a, &mut x)?;
+        let m = read_full(&mut b, &mut y)?;
+        let both = n.min(m);
+        let same = x[..both]
+            .iter()
+            .zip(&y[..both])
+            .take_while(|(p, q)| p == q)
+            .count();
+        shared += same as u64;
+        if same < both || n != m || n == 0 {
+            return Ok(shared);
+        }
+    }
+}
+
+fn read_full(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+/// Newlines in a file from `offset` on.
+fn lines_from(path: &Path, offset: u64) -> io::Result<u64> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0; 64 << 10];
+    let mut lines = 0;
+    loop {
+        match f.read(&mut buf)? {
+            0 => return Ok(lines),
+            n => lines += buf[..n].iter().filter(|b| **b == b'\n').count() as u64,
+        }
+    }
+}
+
+/// Removes empty directories from `dir` up to (not including) `stop`.
+fn prune(stop: &Path, dir: Option<&Path>) {
+    let mut dir = dir.map(Path::to_path_buf);
+    while let Some(d) = dir {
+        if d == stop || !d.starts_with(stop) || fs::remove_dir(&d).is_err() {
+            return;
+        }
+        dir = d.parent().map(Path::to_path_buf);
     }
 }
 
@@ -1410,23 +1667,27 @@ impl Client {
     }
 
     /// Writes at `offset` expecting `expect`; the hub's row either way.
+    /// `mtime` (ms) dates the growth.
     fn put(
         &self,
         path: &str,
         offset: u64,
         expect: i64,
         data: &[u8],
+        mtime: Option<i64>,
     ) -> Result<Result<Row, Refused>> {
-        let response = self
+        let mut req = self
             .agent
             .put(format!("{}/sync/file", self.base))
             .header("Authorization", &self.bearer()?)
             .header("Content-Type", "application/octet-stream")
             .query("path", path)
             .query("offset", offset.to_string())
-            .query("expect", expect.to_string())
-            .send(data)
-            .map_err(|e| self.hub_err("/sync/file", e))?;
+            .query("expect", expect.to_string());
+        if let Some(mtime) = mtime {
+            req = req.query("mtime", mtime.to_string());
+        }
+        let response = req.send(data).map_err(|e| self.hub_err("/sync/file", e))?;
         if response.status() == 409 {
             let body = response
                 .into_body()
@@ -1822,6 +2083,53 @@ mod tests {
             (planted.clone(), Instant::now() - DNS_TTL * 2),
         );
         assert!(resolver.resolve(&gone, &config, timeout()).unwrap() == planted);
+    }
+
+    #[test]
+    fn copies_are_described_against_the_version_in_place() {
+        let root = std::env::temp_dir().join(format!("ccdash-describe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("projects/-w")).unwrap();
+        fs::create_dir_all(root.join("ccdash-conflicts/1/projects/-w")).unwrap();
+        let shared = "{\"n\":1}\n{\"n\":2}\n".repeat(5000);
+        fs::write(
+            root.join("projects/-w/s.jsonl"),
+            format!("{shared}{{\"hub\":1}}\n{{\"hub\":2}}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("ccdash-conflicts/1/projects/-w/s.jsonl"),
+            format!("{shared}{{\"mine\":1}}\n"),
+        )
+        .unwrap();
+        let d = describe(
+            &root,
+            "projects/-w/s.jsonl",
+            "ccdash-conflicts/1/projects/-w/s.jsonl",
+        )
+        .unwrap();
+        // both continue with `{"` after the shared lines
+        assert_eq!(d.shared, shared.len() as u64 + 2);
+        assert_eq!((d.current_lines, d.copy_lines), (2, 1));
+        assert_eq!(d.copy_size, shared.len() as u64 + 11);
+        assert!(describe(&root, "projects/-w/missing.jsonl", "ccdash-conflicts/1/x").is_none());
+        prune(
+            &root.join("ccdash-conflicts"),
+            Some(&root.join("ccdash-conflicts/1/projects/-w")),
+        );
+        assert!(
+            root.join("ccdash-conflicts/1/projects/-w").exists(),
+            "not empty: kept"
+        );
+        fs::remove_file(root.join("ccdash-conflicts/1/projects/-w/s.jsonl")).unwrap();
+        prune(
+            &root.join("ccdash-conflicts"),
+            Some(&root.join("ccdash-conflicts/1/projects/-w")),
+        );
+        assert!(
+            !root.join("ccdash-conflicts/1").exists() && root.join("ccdash-conflicts").exists()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

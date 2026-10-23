@@ -1,5 +1,6 @@
 <script lang="ts">
-	// The shell: sidebar (a drawer on the phone), topbar with the scope,
+	// The shell: sidebar (a drawer on the phone; on wide screens the full
+	// list or, collapsed, a rail of icons), topbar with the scope,
 	// the range where it applies, the connection state, the palette and the
 	// theme; the live store and
 	// the worker start here. `#token=`, `#session=` and `#pair` links from
@@ -7,7 +8,7 @@
 	import './layout.css';
 	import { onMount } from 'svelte';
 	import { browser } from '$app/env';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import MenuIcon from '@lucide/svelte/icons/menu';
 	import PanelLeftIcon from '@lucide/svelte/icons/panel-left';
@@ -34,6 +35,12 @@
 
 	let { children }: LayoutProps = $props();
 	let drawer = $state(false);
+	let mainEl = $state<HTMLElement | null>(null);
+
+	// NOTE: SvelteKit resets the window's scroll; the page scrolls inside `main`
+	afterNavigate(({ type, from, to }) => {
+		if (type !== 'popstate' && from?.url?.pathname !== to?.url?.pathname) mainEl?.scrollTo(0, 0);
+	});
 
 	const title = $derived(areas.find((a) => a.match(page.url.pathname))?.label ?? 'ccdash');
 
@@ -88,20 +95,30 @@
 <TooltipProvider delayDuration={300}>
 	<div class="flex h-full">
 		<aside
-			class="hidden w-52 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground {prefs.sidebar
-				? 'md:flex'
-				: ''}"
+			class="hidden h-full shrink-0 flex-col overflow-y-auto border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex {prefs.sidebar
+				? 'w-52'
+				: 'w-14'}"
 		>
-			<a href="/" class="flex items-center gap-2 px-4 py-3 font-semibold">
+			<a
+				href="/"
+				class="flex items-center gap-2 py-3 font-semibold {prefs.sidebar
+					? 'px-4'
+					: 'justify-center px-2'}"
+				title={prefs.sidebar ? undefined : 'ccdash'}
+			>
 				<img src="/icon.svg" alt="" width="20" height="20" />
-				ccdash
-				<span class="truncate text-xs font-normal text-muted-foreground">{live.host}</span>
+				{#if prefs.sidebar}
+					ccdash
+					<span class="truncate text-xs font-normal text-muted-foreground">{live.host}</span>
+				{:else}
+					<span class="sr-only">ccdash</span>
+				{/if}
 			</a>
-			<Nav />
+			<Nav compact={!prefs.sidebar} />
 		</aside>
-		<div class="flex min-w-0 flex-1 flex-col">
+		<div class="flex h-full min-w-0 flex-1 flex-col">
 			<header
-				class="sticky top-0 z-20 flex items-center gap-2 border-b bg-background/90 px-2 py-1.5 backdrop-blur sm:px-3"
+				class="z-20 flex items-center gap-2 border-b bg-background/90 px-2 py-1.5 backdrop-blur sm:px-3"
 			>
 				<Sheet.Root bind:open={drawer}>
 					<Sheet.Trigger>
@@ -125,7 +142,7 @@
 					variant="ghost"
 					size="icon"
 					class="hidden md:inline-flex"
-					aria-label={prefs.sidebar ? 'Hide the sidebar' : 'Show the sidebar'}
+					aria-label={prefs.sidebar ? 'Narrow the sidebar to icons' : 'Widen the sidebar'}
 					aria-pressed={!prefs.sidebar}
 					title="Sidebar"
 					onclick={() => prefs.setSidebar(!prefs.sidebar)}
@@ -155,7 +172,8 @@
 				<ScopeChips />
 				<RangePicker />
 			</div>
-			<main class="min-h-0 flex-1">
+			<!-- NOTE: the page scrolls here, not the window: the sidebar and the bar stay put -->
+			<main class="min-h-0 flex-1 overflow-y-auto" bind:this={mainEl}>
 				{@render children()}
 			</main>
 		</div>

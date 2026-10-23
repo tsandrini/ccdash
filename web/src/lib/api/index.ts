@@ -22,6 +22,8 @@ import type {
 	Session,
 	Stats,
 	Subscription,
+	Keep,
+	SyncStats,
 	SyncView,
 	Token,
 	Written
@@ -89,7 +91,16 @@ export const fetchSync = () => getJson<SyncView>('sync');
 export const resyncHost = (host: string) =>
 	postJson<{ ok: boolean }>(`sync/${encodeURIComponent(host)}/resync`, {});
 
+/** Hides a conflict; the copy stays on its machine. */
 export const dismissConflict = (id: number) => del<{ ok: boolean }>(`sync/conflicts/${id}`);
+
+/** Asks the machine holding the copy to keep the hub's version (the copy
+ * goes) or the copy (it replaces the hub's; the replaced one is kept). */
+export const resolveConflict = (id: number, keep: Keep) =>
+	postJson<{ ok: boolean }>(`sync/conflicts/${id}/resolve`, { keep });
+
+/** Sizes by kind, project and session, and growth per day. */
+export const fetchSyncStats = () => getJson<SyncStats>('sync/stats');
 
 export const fetchPrompts = (params: { session?: string; workspace?: string; limit?: number }) =>
 	getJson<{ prompts: Prompt[] }>(`prompts${query(params)}`);

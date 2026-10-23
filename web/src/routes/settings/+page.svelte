@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Pairing (a token per link), this device (install, push, its token),
 	// the devices with a token, theme, the composer's quick replies and
-	// templates, Claude Code's state on the hub, hosts.
+	// templates, a pointer to the State page, hosts.
 	import { clearToken, setToken, tokenFrom, Unauthorized } from '#lib/api/client.js';
 	import {
 		fetchPush,
@@ -15,7 +15,6 @@
 		type PushInfo,
 		type Token
 	} from '#lib/api/index.js';
-	import SyncSection from '#lib/components/app/SyncSection.svelte';
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Dialog from '#lib/components/ui/dialog/index.js';
@@ -462,7 +461,13 @@
 		</div>
 	</section>
 
-	<SyncSection />
+	<section class="flex flex-col gap-2">
+		<h2 class="text-base font-semibold">Claude Code state</h2>
+		<p class="text-sm text-muted-foreground">
+			Each machine's copy, Resync, conflicts and sizes are on the
+			<a href="/state" class="underline underline-offset-2">State</a> page.
+		</p>
+	</section>
 
 	<section class="flex flex-col gap-2">
 		<h2 class="text-base font-semibold">Hosts</h2>

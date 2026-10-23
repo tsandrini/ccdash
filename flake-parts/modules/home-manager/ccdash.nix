@@ -295,6 +295,11 @@ in
             "stop"
             "{id}"
           ];
+          remove = mkDefault [
+            (getExe claudeCode.package)
+            "rm"
+            "{id}"
+          ];
         };
       };
     })

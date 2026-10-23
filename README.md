@@ -348,9 +348,23 @@ machine.
 An ended session's page offers **Continue** (`claude --bg --resume`; Claude
 Code may continue a stopped background session as a copy under a new id,
 and the page follows it). **Stop**, on the session page and the cards'
-menu, asks first, then runs `launch.stop` (`claude stop <id>`) for a
-background session or sends SIGTERM to an interactive session's Claude
-process (never SIGKILL, and only to a process that is still Claude Code).
+menu, asks first and answers only once the session is over (never with
+SIGKILL):
+
+- an interactive session's Claude process gets SIGTERM (only a process
+  that is still Claude Code); if it is still there after 5 s, its child
+  processes get SIGTERM too, because Claude Code acts on the signal only
+  once an editor it opened for the prompt, or a running command, has
+  finished. If it still runs, Stop says what it waits for;
+- a background session gets `launch.stop` (`claude stop <id>`). Claude Code
+  keeps listing a background session whose turn ended and that waits for
+  your answer (`blocked`), often with no process left, sometimes for weeks;
+  when `claude stop` fails on one that no process runs, `launch.remove`
+  (`claude rm <id>`) removes it from Claude Code's list and keeps the
+  conversation.
+
+Such a waiting background session shows as your turn right after its turn
+ends and as parked otherwise; finished ones (`done`, `stopped`) end.
 **Open on** (the host's name) focuses the session's window or attaches a background
 session there (`attach.command`, as `ccdash open` does). **Forget**, when
 the session's host is offline, marks it ended on the hub; it comes back if
@@ -361,6 +375,7 @@ its host reports it running again.
 [launch]
 command = ["claude"]                # + the arguments above; [] is off
 stop = ["claude", "stop", "{id}"]
+remove = ["claude", "rm", "{id}"]     # when stop fails on a job nothing runs
 ```
 
 Anyone holding a token can answer your sessions' prompts, start sessions
@@ -437,11 +452,22 @@ the whole conversation. **Continue** on an ended session's page offers
 every connected machine that syncs; the collector fetches the transcript
 before it resumes.
 
-Settings › **Claude Code state** shows each machine's copy (files, what
-waits, the first run's progress) with **Resync**, which compares every
-file with the hub again, sends what the hub lacks and fetches what the
-machine lacks (deleted files included), and the conflicts, to dismiss once
-seen.
+The **State** page (in the sidebar) shows:
+
+- each machine's copy (files, what waits, the first run's progress,
+  whether it watches files) with **Resync**, which compares every file
+  with the hub again, sends what the hub lacks and fetches what the machine
+  lacks (deleted files included);
+- the conflicts, each with how the two versions compare (the bytes they
+  share, the lines each has after that, when each was written) and the
+  session it belongs to. **Keep the current version** deletes the
+  machine's copy; **Use the copy** puts it in place on every machine and
+  keeps the version it replaced as the copy, so either choice can be
+  undone until that copy is deleted; **Hide** leaves the copy alone. A
+  transcript copy also opens with `claude --resume <path>` on its machine;
+- where the space goes (by kind of file, by project, the largest sessions)
+  and the growth per day and project, counted from the first write the hub
+  records (a backfilled file counts on the day it was last written).
 
 ```toml
 # collector config
@@ -564,9 +590,10 @@ Every row carries the host it came from. The database keeps 30 days
 - `limit_samples`: per-model weekly limits from each `/usage` poll
 - `ui_tokens`, `push_subscriptions`: the devices' tokens (SHA-256, label,
   browser, last use) and their push subscriptions (not pruned)
-- `sync_files`, `sync_history`, `sync_conflicts` (with the state sync): the
-  index of the synced files, the merged prompt history and the conflicts
-  the collectors set aside (not pruned)
+- `sync_files`, `sync_history`, `sync_conflicts`, `sync_growth` (with the
+  state sync): the index of the synced files, the merged prompt history,
+  the conflicts the collectors set aside, and bytes added per day and
+  project (not pruned)
 - `telemetry` (with telemetry on): API requests (model, tokens, cost,
   latency), API errors, tool approval decisions, commits, pull requests,
   edit decisions and active time

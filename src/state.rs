@@ -78,6 +78,11 @@ pub struct AgentEntry {
     pub name: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// A background session's job state: `working`, `blocked` (its turn
+    /// ended and it waits for an answer, often with no process left),
+    /// `done`, `stopped` (only listed with `--all`).
+    #[serde(default)]
+    pub state: Option<String>,
     #[serde(default)]
     pub waiting_for: Option<String>,
     #[serde(default)]
@@ -1078,6 +1083,11 @@ impl State {
         let mut seen = HashSet::new();
         for e in list {
             let id = e.session_id.as_str();
+            // NOTE: a finished background session is listed, but over
+            if let Some(state) = e.state.as_deref().filter(|s| ENDED_JOBS.contains(s)) {
+                self.mark_gone(id, now, state, fx);
+                continue;
+            }
             seen.insert(id);
             self.ensure(id, e.cwd.as_deref(), e.started_at.unwrap_or(now), now, fx);
             let aux = self.aux.entry(id.to_owned()).or_default();
@@ -1743,7 +1753,23 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
 
 /// The poll's view of `s`, when it should override the hooks'. After a Stop,
 /// only hooks end the turn: the poll can report `busy` for minutes past it.
+/// Background job states of sessions that are over.
+const ENDED_JOBS: &[&str] = &["done", "stopped", "failed", "error", "cancelled"];
+
 fn agent_activity(e: &AgentEntry, s: &Session) -> Option<Activity> {
+    match e.state.as_deref() {
+        Some("working") => return Some(Activity::Working),
+        // NOTE: a turn that ended here waits on you; one found blocked (a hub
+        // restart, a job from weeks ago) is parked straight away
+        Some("blocked") => {
+            return match s.activity {
+                Activity::Working | Activity::Permission => Some(Activity::YourTurn),
+                Activity::Idle => Some(Activity::Parked),
+                _ => None,
+            };
+        }
+        _ => {}
+    }
     let waiting_permission = e
         .waiting_for
         .as_deref()
@@ -2389,6 +2415,38 @@ mod tests {
         assert_eq!(session(&st).activity, Activity::YourTurn);
         st.agents(&[], 205_000, &mut fx);
         assert_eq!(session(&st).activity, Activity::Gone);
+    }
+
+    #[test]
+    fn background_job_states() {
+        let entry = |state: &str| AgentEntry {
+            session_id: SID.into(),
+            id: Some("11111111".into()),
+            kind: Some("background".into()),
+            name: Some("job".into()),
+            state: Some(state.into()),
+            ..Default::default()
+        };
+        // found blocked (no process, e.g. weeks old): parked, not waiting on you
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.agents(&[entry("blocked")], 100_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::Parked);
+        // working, then its turn ends: your turn
+        st.agents(&[entry("working")], 101_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::Working);
+        st.agents(&[entry("blocked")], 102_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+        // done: gone, and not brought back by the next poll
+        st.agents(&[entry("done")], 103_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::Gone);
+        st.agents(&[entry("done")], 104_000, &mut fx);
+        assert_eq!(session(&st).activity, Activity::Gone);
+        // a finished job the state never knew is not created at all
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.agents(&[entry("stopped")], 100_000, &mut fx);
+        assert!(st.session(SID).is_none() && fx.created.is_empty());
     }
 
     #[test]

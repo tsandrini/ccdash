@@ -15,10 +15,12 @@ use crate::{
     knowledge::{Hit, Note, NoteOp, NoteView, Query, Upsert, Written},
     model::{Claim, Kind, RateLimits, ScopedLimit, Session, Update},
     state::{AgentEntry, NiriEvent, ProcPoll},
-    sync::SyncStatus,
+    sync::{Keep, SyncStatus},
     wire::Envelope,
 };
 
+/// 7: conflicts resolved from the panel (`SyncResolve` down,
+/// `SyncResolved` up).
 /// 6: Claude Code's state on the hub (`Sync` up, `SyncChanged` and
 /// `SyncResync` down) and the one-machine guard (`Call::Guard`).
 /// 5: `Dirs`, the project directories under each workspace on the
@@ -27,7 +29,7 @@ use crate::{
 /// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
 /// on sessions, `branch` on agents entries and envelopes, `launch` on
 /// envelopes.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +123,15 @@ pub enum ToHub {
     /// How this machine's copy of Claude Code's state stands.
     Sync {
         status: SyncStatus,
+    },
+    /// What came of `SyncResolve` for conflict `id`; after "use the copy",
+    /// where the replaced version now is.
+    SyncResolved {
+        id: i64,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        copy: Option<String>,
     },
 }
 
@@ -354,6 +365,14 @@ pub enum ToCollector {
     },
     /// Forget the sync records and compare everything again.
     SyncResync,
+    /// Resolve conflict `id`: keep the hub's version of `path` (delete the
+    /// copy) or the copy at `copy` (it replaces the hub's).
+    SyncResolve {
+        id: i64,
+        path: String,
+        copy: String,
+        keep: Keep,
+    },
 }
 
 #[cfg(test)]

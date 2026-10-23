@@ -178,9 +178,32 @@ pub fn launched_id(stdout: &str) -> Option<String> {
     })
 }
 
-/// Ends a running session: `stop_command` (`{id}` is its short id) for a
-/// background one, SIGTERM to its Claude process for an interactive one.
-pub async fn stop(stop_command: &[String], session: &Session) -> Result<(), String> {
+/// How long a stopped session gets to exit before Stop escalates, and
+/// again after it did.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// `claude stop` and `claude rm` answer within this, so the hub's stop
+/// (30 s) gets an answer and not a timeout.
+const STOP_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Ends a running session, never with SIGKILL; `Ok` says how, once it is
+/// over:
+/// - background: `stop_command` (`{id}` is its short id); when that fails
+///   and no process runs the session any more (Claude Code still lists a
+///   blocked job, sometimes for weeks), `remove_command` (`claude rm`, which
+///   keeps the conversation);
+/// - interactive: SIGTERM to its Claude process, then, if it is still
+///   there after `EXIT_GRACE`, to its child processes as well: Claude Code
+///   acts on the signal only once an editor it opened for the prompt, or a
+///   running command, has finished.
+///
+/// # Errors
+///
+/// Why the session is still running.
+pub async fn stop(
+    stop_command: &[String],
+    remove_command: &[String],
+    session: &Session,
+) -> Result<String, String> {
     match session.kind {
         Kind::Background => {
             let id = session
@@ -190,16 +213,19 @@ pub async fn stop(stop_command: &[String], session: &Session) -> Result<(), Stri
             if !paths::plain_session_id(&id) {
                 return Err("unusual session id".into());
             }
-            let argv: Vec<String> = stop_command
-                .iter()
-                .map(|a| a.replace("{id}", &id))
-                .collect();
-            let (program, args) = argv.split_first().ok_or("no stop command configured")?;
-            let output = run(Command::new(program).args(args)).await?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(failure(&output))
+            match run_with(stop_command, &id).await {
+                Ok(()) => Ok("stopped".into()),
+                Err(e) if !remove_command.is_empty() && !running(session.pid) => {
+                    run_with(remove_command, &id).await.map_err(|removing| {
+                        format!("{e}; removing it with `claude rm` failed too: {removing}")
+                    })?;
+                    Ok(
+                        "no process ran it any more, so it was removed from Claude Code's \
+                        background sessions; its conversation is kept"
+                            .into(),
+                    )
+                }
+                Err(e) => Err(e),
             }
         }
         Kind::Interactive => {
@@ -212,25 +238,116 @@ pub async fn stop(stop_command: &[String], session: &Session) -> Result<(), Stri
             if !String::from_utf8_lossy(&cmdline).contains("claude") {
                 return Err(format!("process {pid} is no longer Claude Code"));
             }
-            let output =
-                run(Command::new("kill").args(["-s", "TERM", "--", &pid.to_string()])).await?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(failure(&output))
+            terminate(pid).await?;
+            if exited(pid).await {
+                return Ok("stopped".into());
             }
+            let kids = children(pid);
+            for (child, _) in &kids {
+                let _ = terminate(*child).await;
+            }
+            let waited: Vec<&str> = kids.iter().map(|(_, name)| name.as_str()).collect();
+            if exited(pid).await {
+                return Ok(format!(
+                    "stopped once its child processes ended too ({})",
+                    waited.join(", ")
+                ));
+            }
+            let holding = children(pid)
+                .into_iter()
+                .map(|(child, name)| format!("{name} ({child})"))
+                .collect::<Vec<_>>();
+            Err(if holding.is_empty() {
+                format!(
+                    "Claude Code (pid {pid}) did not exit after SIGTERM; close it in its terminal"
+                )
+            } else {
+                format!(
+                    "Claude Code (pid {pid}) did not exit: it waits for {}; close that in its \
+                    terminal, or stop again",
+                    holding.join(", ")
+                )
+            })
         }
     }
 }
 
+/// Runs `command` with `{id}` replaced, within `STOP_TIMEOUT`.
+async fn run_with(command: &[String], id: &str) -> Result<(), String> {
+    let argv: Vec<String> = command.iter().map(|a| a.replace("{id}", id)).collect();
+    let (program, args) = argv.split_first().ok_or("no command configured")?;
+    let output = run_within(Command::new(program).args(args), STOP_TIMEOUT).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(failure(&output))
+    }
+}
+
+async fn terminate(pid: u32) -> Result<(), String> {
+    let output = run(Command::new("kill").args(["-s", "TERM", "--", &pid.to_string()])).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(failure(&output))
+    }
+}
+
+/// Waits up to `EXIT_GRACE` for `pid` to end.
+async fn exited(pid: u32) -> bool {
+    let polls = EXIT_GRACE.as_millis() / 100;
+    for _ in 0..polls {
+        if !running(Some(pid)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    !running(Some(pid))
+}
+
+/// Whether `pid` is a process that has not ended (a zombie has).
+fn running(pid: Option<u32>) -> bool {
+    pid.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+        })
+        .is_some_and(|state| state != "Z" && state != "X")
+}
+
+/// The direct child processes of `pid`, with their names.
+fn children(pid: u32) -> Vec<(u32, String)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|child| {
+            let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
+            let (head, rest) = stat.rsplit_once(')')?;
+            let name = head.split_once('(')?.1.to_owned();
+            let parent: u32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+            (parent == pid).then_some((child, name))
+        })
+        .collect()
+}
+
 async fn run(command: &mut Command) -> Result<std::process::Output, String> {
+    run_within(command, RUN_TIMEOUT).await
+}
+
+async fn run_within(
+    command: &mut Command,
+    limit: Duration,
+) -> Result<std::process::Output, String> {
     let program = command
         .as_std()
         .get_program()
         .to_string_lossy()
         .into_owned();
     match tokio::time::timeout(
-        RUN_TIMEOUT,
+        limit,
         command.stdin(Stdio::null()).kill_on_drop(true).output(),
     )
     .await
@@ -254,6 +371,54 @@ fn failure(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_of(kind: Kind, pid: Option<u32>) -> Session {
+        let mut s = Session::stub("navi", "f6c2b4cf-1b3e-4915-82a8-4be0eceab7ce", "/w");
+        s.kind = kind;
+        s.pid = pid;
+        s.short_id = (kind == Kind::Background).then(|| "f6c2b4cf".into());
+        s
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_claude_waiting_for_its_editor() {
+        // a shell defers its TERM trap until its foreground child (the
+        // "editor") ends, as Claude Code does with an editor it opened
+        let dir = std::env::temp_dir().join(format!("ccdash-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("claude");
+        std::fs::write(&script, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 600\n").unwrap();
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(&script).spawn().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let session = session_of(Kind::Interactive, Some(child.id()));
+        let how = stop(&[], &[], &session).await.unwrap();
+        assert!(
+            how.contains("child processes") && how.contains("sleep"),
+            "{how}"
+        );
+        assert!(child.wait().unwrap().success());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_removes_a_background_job_nothing_runs() {
+        let fail = vec!["false".to_owned()];
+        let ok = vec!["true".to_owned()];
+        let gone = session_of(Kind::Background, None);
+        let how = stop(&fail, &ok, &gone).await.unwrap();
+        assert!(how.contains("removed"), "{how}");
+        // a job with a live process is not removed behind its back
+        let live = session_of(Kind::Background, Some(std::process::id()));
+        assert!(stop(&fail, &ok, &live).await.is_err());
+        // and without a remove command the stop's failure stands
+        assert!(stop(&fail, &[], &gone).await.is_err());
+        assert_eq!(stop(&ok, &fail, &gone).await.unwrap(), "stopped");
+    }
 
     fn spec() -> LaunchSpec {
         LaunchSpec {

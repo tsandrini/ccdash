@@ -205,6 +205,19 @@ pub enum Cmd {
         session: String,
         reply: oneshot::Sender<Option<String>>,
     },
+    /// What `host` made of a conflict resolution.
+    SyncResolved {
+        host: String,
+        id: i64,
+        error: Option<String>,
+        copy: Option<String>,
+    },
+    /// Hands `msg` to `host`'s collector; fails when it is not connected.
+    SendTo {
+        host: String,
+        msg: Box<ToCollector>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Asks `host`'s collector to compare everything with the hub again.
     SyncResync {
         host: String,
@@ -422,6 +435,18 @@ impl Hub {
         self.send(Cmd::Holder {
             host: host.to_owned(),
             session: session.to_owned(),
+            reply,
+        })
+        .await?;
+        rx.await.context("hub stopped")
+    }
+
+    /// Hands `msg` to `host`'s collector.
+    pub async fn send_to(&self, host: &str, msg: ToCollector) -> Result<Result<(), String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SendTo {
+            host: host.to_owned(),
+            msg: Box::new(msg),
             reply,
         })
         .await?;
@@ -710,6 +735,40 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                 reply,
             } => {
                 let _ = reply.send(core.holder(&host, &session).map(|(h, _)| h.to_owned()));
+            }
+            Cmd::SyncResolved {
+                host,
+                id,
+                error,
+                copy,
+            } => {
+                let store = core.store.clone();
+                tokio::spawn(async move {
+                    let done = store
+                        .exec(move |conn| {
+                            crate::sync::hub::resolved(
+                                conn,
+                                &host,
+                                id,
+                                error.as_deref(),
+                                copy.as_deref(),
+                                now_ms(),
+                            )
+                        })
+                        .await;
+                    if let Err(e) = done.and_then(|r| r) {
+                        warn!("recording a conflict resolution: {e:#}");
+                    }
+                });
+            }
+            Cmd::SendTo { host, msg, reply } => {
+                let result = if core.links.contains_key(&host) {
+                    core.tell(&host, *msg);
+                    Ok(())
+                } else {
+                    Err(format!("{host} is not connected"))
+                };
+                let _ = reply.send(result);
             }
             Cmd::SyncResync { host, reply } => {
                 let _ = reply.send(core.sync_resync(&host));

@@ -133,6 +133,28 @@ issue: string | null, since: number,
  */
 until: number | null, };
 
+/**
+ * How a set-aside copy compares with the version in place, worked out
+ * by the collector that holds both.
+ */
+export type ConflictDetails = { 
+/**
+ * The version in place (the hub's) and the copy.
+ */
+current_size: number, copy_size: number, 
+/**
+ * Bytes both start with.
+ */
+shared: number, 
+/**
+ * Lines each has after the shared part.
+ */
+current_lines: number, copy_lines: number, 
+/**
+ * When each was last written.
+ */
+current_mtime: number, copy_mtime: number, };
+
 export type ContextHealth = { compactions: number, compactions_auto: number, 
 /**
  * Sessions that compacted at least once.
@@ -281,6 +303,11 @@ command?: string,
  * A Bash call's output, or a failed call's error, capped by the hub.
  */
 output?: string, } | { "kind": "permission", at: number, tool: string, summary: string, } | { "kind": "answered", at: number, tool: string, action: string, via: string, } | { "kind": "message", at: number, html: string, } | { "kind": "reply", at: number, html: string, } | { "kind": "error", at: number, error: string, } | { "kind": "subagent", at: number, agent_type: string, description: string | null, ms: number | null, tools: number | null, html: string, } | { "kind": "compact", at: number, trigger: string | null, html: string, } | { "kind": "task", at: number, subject: string, status: string, } | { "kind": "start", at: number, source: string, } | { "kind": "end", at: number, reason: string, };
+
+/**
+ * Which version of a conflicted file stays.
+ */
+export type Keep = "hub" | "copy";
 
 export type Kind = "interactive" | "background";
 
@@ -579,6 +606,8 @@ export type Rename = { title: string, };
 
 export type Reply = { text: string, };
 
+export type Resolve = { keep: Keep, };
+
 /**
  * CPU and memory of a session's process tree (Claude, its MCP servers and
  * running commands).
@@ -751,6 +780,40 @@ export type SourceUse = { source: string, requests: number, tokens: number, };
 
 export type Stamped = { at: number, text: string, };
 
+/**
+ * One part of the state (a kind of file, or a project's sessions) with
+ * what it grew by.
+ */
+export type StatGroup = { 
+/**
+ * `projects/<dir>`, or the top-level directory (`file-history`, …).
+ */
+key: string, 
+/**
+ * `workspace/project` for a project's sessions when the hub knows the
+ * directory, else the key.
+ */
+label: string, size: StatSize, 
+/**
+ * Sessions in it (projects only).
+ */
+sessions: number, 
+/**
+ * Growth over the last day, week and 30 days, in bytes.
+ */
+day: number, week: number, month: number, };
+
+/**
+ * A session's files (transcript, subagents, tool results, rewind
+ * checkpoints, tasks).
+ */
+export type StatSession = { session: string, title: string | null, label: string | null, host: string | null, size: StatSize, last_write: number, };
+
+/**
+ * Bytes and files of a part of the state.
+ */
+export type StatSize = { files: number, bytes: number, };
+
 export type Stats = { prompts: number, tools: number, failures: number, 
 /**
  * Distinct files edited successfully.
@@ -786,7 +849,19 @@ token_id: number | null, };
 /**
  * A conflict the hub recorded.
  */
-export type SyncConflict = { id: number, path: string, host: string, size: number, copy: string, at: number, };
+export type SyncConflict = { id: number, path: string, host: string, size: number, copy: string, at: number, 
+/**
+ * The session the file belongs to, and its title when the hub knows it.
+ */
+session: string | null, title: string | null, details: ConflictDetails | null, former_hub: boolean, 
+/**
+ * A resolution sent to the host and not confirmed yet.
+ */
+pending: Keep | null, 
+/**
+ * Why the last resolution failed.
+ */
+error: string | null, };
 
 /**
  * One machine in the panel's Sync section.
@@ -796,6 +871,35 @@ export type SyncHost = { host: string, connected: boolean,
  * Its last report; none from a collector without sync.
  */
 status: SyncStatus | null, };
+
+/**
+ * `GET /api/v1/sync/stats`.
+ */
+export type SyncStats = { total: StatSize, 
+/**
+ * By top-level directory.
+ */
+kinds: Array<StatGroup>, 
+/**
+ * By project directory, largest first.
+ */
+projects: Array<StatGroup>, 
+/**
+ * The largest sessions.
+ */
+sessions: Array<StatSession>, 
+/**
+ * Bytes added per day (local dates), oldest first, the last 30 days.
+ */
+days: Array<[string, number]>, 
+/**
+ * The first day growth was recorded.
+ */
+since: string | null, 
+/**
+ * Prompt history lines and bytes.
+ */
+history: StatSize, };
 
 /**
  * What a collector reports about its copy (`ToHub::Sync`).

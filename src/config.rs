@@ -229,6 +229,10 @@ pub struct Launch {
     pub command: Vec<String>,
     /// Stops a background session; `{id}` is replaced with its short id.
     pub stop: Vec<String>,
+    /// Removes a background session no process runs any more, when `stop`
+    /// fails on it (Claude Code keeps listing blocked jobs); `{id}` as
+    /// above. The conversation is kept. Empty never removes.
+    pub remove: Vec<String>,
 }
 
 /// Polls Claude Code's `/usage` report for the per-model weekly limits the
@@ -395,6 +399,7 @@ impl Default for Launch {
         Self {
             command: vec!["claude".into()],
             stop: ["claude", "stop", "{id}"].map(String::from).to_vec(),
+            remove: ["claude", "rm", "{id}"].map(String::from).to_vec(),
         }
     }
 }

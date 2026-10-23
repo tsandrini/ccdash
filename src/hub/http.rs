@@ -159,6 +159,8 @@ pub async fn serve(
         .route("/sync", get(sync_view))
         .route("/sync/{host}/resync", post(sync_resync))
         .route("/sync/conflicts/{id}", delete(sync_dismiss))
+        .route("/sync/conflicts/{id}/resolve", post(sync_resolve))
+        .route("/sync/stats", get(sync_stats))
         .layer(middleware::from_fn_with_state(
             Guard {
                 bootstrap: token,
@@ -1355,6 +1357,77 @@ async fn sync_resync(
         .await?
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Resolve {
+    keep: sync::Keep,
+}
+
+/// Sends the owner's choice to the machine holding the copy; the conflict
+/// shows the resolution as pending until that machine answers.
+async fn sync_resolve(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Json(body): Json<Resolve>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let conflict = app
+        .store
+        .exec(move |conn| sync::hub::request(conn, id, body.keep))
+        .await??
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let sent = app
+        .hub
+        .send_to(
+            &conflict.host,
+            crate::protocol::ToCollector::SyncResolve {
+                id,
+                path: conflict.path.clone(),
+                copy: conflict.copy.clone(),
+                keep: body.keep,
+            },
+        )
+        .await?;
+    if let Err(e) = sent {
+        let error = e.clone();
+        let host = conflict.host.clone();
+        app.store
+            .exec(move |conn| sync::hub::resolved(conn, &host, id, Some(&error), None, now_ms()))
+            .await??;
+        return Err(ApiError(StatusCode::CONFLICT, e));
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true }))))
+}
+
+/// Sizes and growth of Claude Code's state on the hub.
+async fn sync_stats(State(app): State<App>) -> Result<Json<sync::SyncStats>, ApiError> {
+    let (store, workspaces) = (app.store.clone(), app.workspaces.clone());
+    let stats = tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = store.reader()?;
+        let cwds: Vec<String> = conn
+            .prepare("SELECT DISTINCT cwd FROM sessions")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let labels: std::collections::HashMap<String, String> = cwds
+            .iter()
+            .filter_map(|cwd| {
+                let (ws, project) = workspaces.locate(cwd)?;
+                let label = project.map_or_else(|| ws.clone(), |p| format!("{ws}/{p}"));
+                Some((format!("projects/{}", sync::hub::dir_name(cwd)), label))
+            })
+            .collect();
+        let roots: Vec<(String, String)> = workspaces
+            .entries()
+            .into_iter()
+            .map(|w| (sync::hub::dir_name(&w.dir), w.name))
+            .collect();
+        sync::hub::stats(&conn, &labels, &roots)
+    })
+    .await
+    .context("sync stats")??;
+    Ok(Json(stats))
 }
 
 async fn sync_dismiss(
