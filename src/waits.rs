@@ -14,9 +14,9 @@ use crate::model::{Activity, PARKED_AFTER_MS};
 pub type Segment = (i64, i64, Activity);
 
 /// Event kinds that can end a wait, for SQL `IN (…)`; a task notification
-/// is Claude carrying on.
-pub const CLOSERS: &str =
-    "'prompt', 'task_notification', 'tool', 'permission', 'reply', 'error', 'end'";
+/// or a subagent's message is Claude carrying on.
+pub const CLOSERS: &str = "'prompt', 'task_notification', 'agent_message', 'tool', 'permission',
+    'reply', 'error', 'end'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[ts(export_to = "types.ts", rename = "WaitOutcome")]

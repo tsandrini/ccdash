@@ -26,19 +26,23 @@ links can be shared and the back button works.
 
 ## 2. A session's page
 
-| Tab     | Shows                                                                                                          |
-| ------- | -------------------------------------------------------------------------------------------------------------- |
-| Chat    | the exchanges with Claude's text, grouped tool calls, subagents, task notifications, messages between sessions |
-| Shell   | its Bash calls as a terminal transcript with their output                                                      |
-| Details | the turn, files, tasks, processes, the claim, totals                                                           |
+| Tab     | Shows                                                                                                                             |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Chat    | the exchanges with Claude's text, grouped tool calls, subagents, task notifications, subagent messages, messages between sessions |
+| Shell   | its Bash calls as a terminal transcript with their output                                                                         |
+| Details | the turn, files, tasks, processes, the claim, totals                                                                              |
 
 **Task notifications** are what Claude Code tells a session when a
 background task reports: a subagent finished, a background command exited,
-a monitor saw an event, an MCP task completed. They reach the hooks as if
-you had typed them; the hub records them apart, so the chat shows them on
-Claude's side in their own colour (what reported, its name, the outcome,
-the report or event) and they never count as your prompts: not in the
-prompt history, the session's last prompt, prompt counts or waits.
+a monitor saw an event, an MCP task completed. **Subagent messages** are a
+subagent's report handed back, or a message it sends while it runs. Both
+reach the hooks as if you had typed them; the hub records them apart, so
+the chat shows them on Claude's side in their own colour (what it is, the
+subagent's or task's name, the outcome, the report or event) and they
+never count as your prompts: not in the prompt history, the session's last
+prompt, prompt counts or waits. A notification Claude Code appends to
+Claude's text, when one arrives while Claude writes, is cut from it; Claude
+Code delivers it again on its own.
 
 Open prompts are pinned above a composer that sends a turn through the
 channel or leaves a note for the next prompt; it walks the prompt history,

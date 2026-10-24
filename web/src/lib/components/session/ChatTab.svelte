@@ -5,7 +5,7 @@
 	import type { Item, Session } from '#lib/api/types.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { fmtStamp } from '#lib/format.js';
-	import { busy } from '#lib/session.js';
+	import { busy, notice } from '#lib/session.js';
 	import ConvItem from './ConvItem.svelte';
 	import LiveBlock from './LiveBlock.svelte';
 	import MessageItem from './MessageItem.svelte';
@@ -118,8 +118,9 @@
 							>{fmtStamp(ex.at)}{ex.via === 'ccdash' ? ' · sent from ccdash' : ''}</time
 						>
 					</div>
-				{:else if ex.task}
-					<TaskNote task={ex.task} at={ex.at} />
+				{:else}
+					{@const n = notice(ex)}
+					{#if n}<TaskNote notice={n} at={ex.at} />{/if}
 				{/if}
 				{#each parts(ex.items, ex.omitted) as part, i (part.key)}
 					{#if part.kind === 'steps'}

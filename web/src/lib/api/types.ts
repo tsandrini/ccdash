@@ -2,6 +2,32 @@
 
 export type Activity = "idle" | "working" | "permission" | "your_turn" | "parked" | "gone";
 
+/**
+ * A subagent's message as the panel shows it.
+ */
+export type AgentMessage = { 
+/**
+ * The sending agent's id.
+ */
+from: string, 
+/**
+ * The description the session gave it, when the hub knew the agent.
+ */
+name: string | null, 
+/**
+ * Its type (`Explore`, `general-purpose`, …), when the hub knew it.
+ */
+agent_type: string | null, 
+/**
+ * The report of a finished subagent, rather than a message while it
+ * runs.
+ */
+hand_back: boolean, 
+/**
+ * The message (for a report, without Claude Code's frame), as HTML.
+ */
+html: string, };
+
 export type Analytics = { since: number, until: number, now: number, 
 /**
  * `DAY` or `HOUR` in ms.
@@ -205,7 +231,11 @@ via?: string,
  * What started the exchange instead of a prompt: a background task
  * reporting to Claude.
  */
-task?: TaskNotification, items: Array<Item>, 
+task?: TaskNotification, 
+/**
+ * What started the exchange instead of a prompt: a subagent's message.
+ */
+agent?: AgentMessage, items: Array<Item>, 
 /**
  * Oldest tool calls left out of `items` in very long exchanges.
  */

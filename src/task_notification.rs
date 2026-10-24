@@ -54,6 +54,22 @@ pub fn is(prompt: &str) -> bool {
     prompt.trim_start().starts_with(OPEN)
 }
 
+/// Claude's text without the task notifications Claude Code appended to it
+/// (one that arrived while Claude was still writing ends up in the text of
+/// its message and reply). Only whole blocks at the end, each on a line of
+/// its own, count: prose that mentions the tag stays.
+pub fn strip_trailing(text: &str) -> &str {
+    let mut own = text.trim_end();
+    while own.ends_with("</task-notification>") {
+        let Some(start) = own.rfind(OPEN) else { break };
+        if start > 0 && !own[..start].ends_with('\n') {
+            break;
+        }
+        own = own[..start].trim_end();
+    }
+    own
+}
+
 /// Reads a task notification; `None` when `text` is not one. A text cut
 /// short reads up to its end.
 ///
@@ -220,6 +236,18 @@ mod tests {
         let orphan =
             "3 background shell command tasks didn't finish before the previous session ended.";
         assert_eq!(read(orphan), ("shell".to_owned(), None, orphan.to_owned()));
+    }
+
+    #[test]
+    fn notifications_appended_to_claudes_text_are_stripped() {
+        let block = note("<status>completed</status>");
+        assert_eq!(
+            strip_trailing(&format!("Both are running.\n\n{block}\n{block}\n")),
+            "Both are running."
+        );
+        let prose = "It arrives as `<task-notification>…</task-notification>`";
+        assert_eq!(strip_trailing(prose), prose);
+        assert_eq!(strip_trailing(&block), "");
     }
 
     #[test]

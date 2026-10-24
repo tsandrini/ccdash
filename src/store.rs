@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::{
-    claims, knowledge, messages,
+    agent_message, claims, knowledge, messages,
     model::{Activity, Kind, Session, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
@@ -416,6 +416,101 @@ fn rewrite(conn: &Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
     }
+    if done < 2 {
+        let tx = conn.unchecked_transaction()?;
+        // Subagents' messages came in as prompts too.
+        tx.execute(
+            "UPDATE events SET kind = ?1 WHERE kind = 'prompt'
+                AND ltrim(json_extract(data, '$.text'), char(9, 10, 13, 32)) LIKE '<agent-message from=%'",
+            [agent_message::KIND],
+        )?;
+        name_agent_messages(&tx)?;
+        // And Claude's text kept a notification that arrived while it wrote.
+        let glued: Vec<(i64, String)> = tx
+            .prepare(
+                "SELECT rowid, data FROM events WHERE kind IN ('message', 'reply')
+                    AND data LIKE '%</task-notification>%'",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (rowid, data) in glued {
+            let Ok(mut data) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            let text = data["text"].as_str().unwrap_or_default();
+            let own = task_notification::strip_trailing(text);
+            if own.len() < text.len() {
+                data["text"] = own.into();
+                tx.execute(
+                    "UPDATE events SET data = ?1 WHERE rowid = ?2",
+                    params![data.to_string(), rowid],
+                )?;
+            }
+        }
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Names the subagent messages recorded before the hub named them on
+/// arrival: by a task notification carrying the sender's id, else (a
+/// report) by the one subagent stop recorded within 50 ms after it.
+fn name_agent_messages(tx: &rusqlite::Transaction) -> Result<()> {
+    let unnamed: Vec<(i64, i64, String, String)> = tx
+        .prepare(
+            "SELECT rowid, ts, session, data FROM events
+                WHERE kind = 'agent_message' AND json_extract(data, '$.name') IS NULL",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (rowid, ts, session, data) in unnamed {
+        let Ok(mut data) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let text = data["text"].as_str().unwrap_or_default();
+        let Some(message) = agent_message::parse(text, None, None) else {
+            continue;
+        };
+        let noted: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(data, '$.text') FROM events
+                    WHERE session = ?1 AND kind = 'task_notification'
+                        AND instr(data, '<task-id>' || ?2 || '</task-id>') > 0 LIMIT 1",
+                params![session, message.from],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut found = noted
+            .as_deref()
+            .and_then(task_notification::parse)
+            .filter(|n| n.source == "agent")
+            .and_then(|n| n.name)
+            .map(|name| (name, None));
+        if found.is_none() && message.hand_back {
+            let stops: Vec<(Option<String>, Option<String>)> = tx
+                .prepare_cached(
+                    "SELECT json_extract(data, '$.description'), json_extract(data, '$.agent_type')
+                        FROM events WHERE session = ?1 AND kind = 'subagent'
+                            AND ts BETWEEN ?2 AND ?2 + 50",
+                )?
+                .query_map(params![session, ts], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            if let [(Some(name), agent_type)] = stops.as_slice() {
+                found = Some((name.clone(), agent_type.clone()));
+            }
+        }
+        if let Some((name, agent_type)) = found {
+            data["name"] = name.into();
+            if agent_type.is_some() {
+                data["agent_type"] = agent_type.into();
+            }
+            tx.execute(
+                "UPDATE events SET data = ?1 WHERE rowid = ?2",
+                params![data.to_string(), rowid],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -581,7 +676,8 @@ pub fn ended_session(
 /// Rebuilds the progress of a session's last turn from its events.
 fn last_turn(conn: &Connection, session: &str) -> Result<Option<Turn>> {
     let started_at: Option<i64> = conn.query_row(
-        "SELECT max(ts) FROM events WHERE session = ?1 AND kind IN ('prompt', 'task_notification')",
+        "SELECT max(ts) FROM events
+            WHERE session = ?1 AND kind IN ('prompt', 'task_notification', 'agent_message')",
         [session],
         |r| r.get(0),
     )?;
@@ -630,7 +726,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn task_notifications_stored_as_prompts_get_their_kind_once() {
+    fn notifications_and_subagent_messages_stored_as_prompts_get_their_kind_once() {
         let dir = std::env::temp_dir().join(format!("ccdash-rewrite-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("t.db");
@@ -638,6 +734,8 @@ mod tests {
         for text in [
             "\n<task-notification>\n<summary>x</summary>",
             "fix <task-notification> parsing",
+            "<agent-message from=\"a1\">\nW1 request\n</agent-message>",
+            "<agent-message from=\"a2\">\n[Subagent hand-back] The report follows:\n  done\n</agent-message>",
         ] {
             conn.execute(
                 "INSERT INTO events VALUES (1, 'h', 's', 'prompt', ?1)",
@@ -645,6 +743,24 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO events VALUES (1, 'h', 's', 'subagent', ?1)",
+            [json!({ "description": "Map it", "agent_type": "Explore" }).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events VALUES (1, 'h', 's', 'task_notification', ?1)",
+            [json!({ "text": "<task-notification>\n<task-id>a1</task-id>\n<summary>Agent \"Port W1\" finished</summary>\n</task-notification>" }).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events VALUES (2, 'h', 's', 'reply', ?1)",
+            [
+                json!({ "text": "Running.\n\n<task-notification>\n</task-notification>" })
+                    .to_string(),
+            ],
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 0).unwrap();
         drop(conn);
 
@@ -656,11 +772,47 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(kinds, [task_notification::KIND, "prompt"]);
+        assert_eq!(
+            kinds,
+            [
+                task_notification::KIND,
+                "prompt",
+                agent_message::KIND,
+                agent_message::KIND,
+                "subagent",
+                task_notification::KIND,
+                "reply"
+            ]
+        );
+        let names: Vec<(Option<String>, Option<String>)> = conn
+            .prepare(
+                "SELECT json_extract(data, '$.name'), json_extract(data, '$.agent_type') FROM events
+                    WHERE kind = 'agent_message' ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            names,
+            [
+                (Some("Port W1".into()), None),
+                (Some("Map it".into()), Some("Explore".into()))
+            ]
+        );
+        let reply: String = conn
+            .query_row(
+                "SELECT json_extract(data, '$.text') FROM events WHERE kind = 'reply'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reply, "Running.");
         let done: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(done, 1);
+        assert_eq!(done, 2);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }

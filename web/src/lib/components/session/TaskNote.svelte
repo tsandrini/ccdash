@@ -1,8 +1,8 @@
 <script lang="ts">
-	// What a background task reported to Claude (a task notification), on
-	// Claude's side in its own colour: what reported and its name, the
-	// outcome, a subagent's tool calls and time, then its report, a
-	// monitor's event or an MCP task's result.
+	// What a background task or a subagent told Claude (a task notification,
+	// a subagent's report or message), on Claude's side in its own colour:
+	// what it is and its name, the outcome, a subagent's tool calls and
+	// time, then its report, a monitor's event or an MCP task's result.
 	import BellIcon from '@lucide/svelte/icons/bell';
 	import BotIcon from '@lucide/svelte/icons/bot';
 	import EyeIcon from '@lucide/svelte/icons/eye';
@@ -10,12 +10,11 @@
 	import TerminalIcon from '@lucide/svelte/icons/terminal';
 	import WorkflowIcon from '@lucide/svelte/icons/workflow';
 	import type { Component } from 'svelte';
-	import type { TaskNotification } from '#lib/api/types.js';
 	import { fmtDuration, fmtStamp, known, plural } from '#lib/format.js';
-	import { TASK_SOURCE } from '#lib/session.js';
+	import type { Notice } from '#lib/session.js';
 	import Prose from './Prose.svelte';
 
-	let { task: t, at }: { task: TaskNotification; at: number } = $props();
+	let { notice: t, at }: { notice: Notice; at: number } = $props();
 
 	const ICONS: Record<string, Component> = {
 		agent: BotIcon,
@@ -42,7 +41,7 @@
 <div class="flex flex-col items-start gap-1">
 	<span class="flex items-center gap-1 text-xs text-muted-foreground">
 		<Icon class="size-3.5 text-task" />
-		<span class="font-medium">{TASK_SOURCE[t.source] ?? 'Background task'}</span>
+		<span class="font-medium">{t.label}</span>
 		· {fmtStamp(at)}
 	</span>
 	<div
@@ -51,9 +50,9 @@
 		<p class="flex flex-wrap items-baseline gap-x-2 break-words">
 			{#if t.name}
 				<strong>{t.name}</strong>
-				{#if t.summary}<span class={outcome}>{t.summary}</span>{/if}
+				{#if t.outcome}<span class={outcome}>{t.outcome}</span>{/if}
 			{:else}
-				<span class={outcome}>{t.summary}</span>
+				<span class={outcome}>{t.outcome}</span>
 			{/if}
 			{#if usage}<span class="text-xs text-muted-foreground">{usage}</span>{/if}
 		</p>

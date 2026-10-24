@@ -108,8 +108,8 @@ pub fn anatomy(sessions: &[SessionEvents], clock: &Clock, buckets: &mut [Bucket]
         for ev in &session.events {
             let ts = ev.ts;
             match ev.kind.as_str() {
-                // NOTE: a task notification is no prompt of yours, but Claude's turn all the same
-                "prompt" | "task_notification" => {
+                // NOTE: notifications and subagents' messages are no prompts of yours, but turns
+                "prompt" | "task_notification" | "agent_message" => {
                     if let Some(t) = turn.take() {
                         out.close(t, ts, clock, buckets);
                     }

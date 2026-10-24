@@ -1,6 +1,6 @@
 //! A session's conversation rebuilt from hook events: one exchange per
-//! prompt or task notification, holding the tool calls, subagents,
-//! compactions and replies that followed it.
+//! prompt, task notification or subagent message, holding the tool calls,
+//! subagents, compactions and replies that followed it.
 
 use anyhow::Result;
 use rusqlite::{Connection, named_params, params};
@@ -9,6 +9,7 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
+    agent_message::{self, AgentMessage},
     history::{Transition, segments},
     markdown,
     model::Activity,
@@ -45,6 +46,10 @@ pub struct Exchange {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub task: Option<TaskNotification>,
+    /// What started the exchange instead of a prompt: a subagent's message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent: Option<AgentMessage>,
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
     pub omitted: u32,
@@ -62,6 +67,7 @@ impl Exchange {
             prompt,
             via: None,
             task: None,
+            agent: None,
             items: Vec::new(),
             omitted: 0,
             last_message: None,
@@ -199,7 +205,8 @@ pub fn conversation(
     let prompts: Vec<i64> = conn
         .prepare_cached(
             "SELECT ts FROM events
-                WHERE session = ?1 AND kind IN ('prompt', 'task_notification') AND ts < ?2
+                WHERE session = ?1 AND kind IN ('prompt', 'task_notification', 'agent_message')
+                    AND ts < ?2
                 ORDER BY ts DESC LIMIT ?3",
         )?
         .query_map(params![session, before, i64::try_from(limit)? + 1], |r| {
@@ -236,6 +243,14 @@ pub fn conversation(
             let mut exchange = Exchange::new(id, at, None);
             match task_notification::parse(&raw) {
                 Some(task) => exchange.task = Some(task),
+                None => exchange.prompt = Some(raw),
+            }
+            exchanges.push(exchange);
+        } else if kind == agent_message::KIND {
+            let raw = text(&data, "text");
+            let mut exchange = Exchange::new(id, at, None);
+            match agent_message::parse(&raw, data["name"].as_str(), data["agent_type"].as_str()) {
+                Some(agent) => exchange.agent = Some(agent),
                 None => exchange.prompt = Some(raw),
             }
             exchanges.push(exchange);
@@ -692,6 +707,31 @@ mod tests {
         let json = serde_json::to_value(&conversation(&conn, "s", None, 10).unwrap().exchanges[0])
             .unwrap();
         assert!(json.get("task").is_none(), "absent on a prompt's exchange");
+    }
+
+    #[test]
+    fn a_subagent_message_starts_an_exchange_with_its_name() {
+        use serde_json::json;
+        let conn = db();
+        event(&conn, 1, "prompt", json!({"text": "go"}));
+        let report = "<agent-message from=\"a1\">\nmapped\n</agent-message>";
+        event(
+            &conn,
+            2,
+            agent_message::KIND,
+            json!({ "text": report, "name": "Map it", "agent_type": "Explore" }),
+        );
+        let c = conversation(&conn, "s", None, 1).unwrap();
+        assert!(c.more);
+        let agent = c.exchanges[0].agent.as_ref().unwrap();
+        assert_eq!(
+            (
+                agent.from.as_str(),
+                agent.name.as_deref(),
+                agent.html.as_str()
+            ),
+            ("a1", Some("Map it"), "<p>mapped</p>\n")
+        );
     }
 
     #[test]

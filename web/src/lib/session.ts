@@ -1,7 +1,7 @@
 // What the panel derives from a session: its shown state, grouping,
 // labels, and the signature that tells the page to reload the chat.
 
-import type { Activity, Session, TaskNotification } from './api/types';
+import type { Activity, Exchange, Session } from './api/types';
 
 export type Shown = Activity | 'finished';
 
@@ -85,9 +85,51 @@ export const TASK_SOURCE: Record<string, string> = {
 	workflow: 'Workflow'
 };
 
-/** A task notification in a few words: what reported and its name. */
-export const taskTitle = (t: TaskNotification) =>
-	`${TASK_SOURCE[t.source] ?? 'Background task'}: ${t.name ?? t.summary}`;
+/** What started an exchange instead of a prompt (a task notification or a
+ * subagent's message), as its bubble shows it. */
+export type Notice = {
+	/** `TaskNotification.source`; `agent` for a subagent's message. */
+	source: string;
+	label: string;
+	name: string | null;
+	/** After the name: the outcome, or the subagent's type. */
+	outcome: string;
+	status: string | null;
+	tools: number | null;
+	ms: number | null;
+	event: string | null;
+	html: string | null;
+};
+
+export function notice(ex: Exchange): Notice | null {
+	const t = ex.task;
+	if (t)
+		return {
+			...t,
+			label: TASK_SOURCE[t.source] ?? 'Background task',
+			outcome: t.summary
+		};
+	const a = ex.agent;
+	if (a)
+		return {
+			source: 'agent',
+			label: a.hand_back ? 'Subagent report' : 'Subagent message',
+			name: a.name ?? `agent ${a.from.slice(0, 8)}`,
+			outcome: a.agent_type ?? '',
+			status: null,
+			tools: null,
+			ms: null,
+			event: null,
+			html: a.html
+		};
+	return null;
+}
+
+/** An exchange's notice in a few words: what it is and its name. */
+export function noticeTitle(ex: Exchange): string | null {
+	const n = notice(ex);
+	return n && `${n.label}: ${n.name ?? n.outcome}`;
+}
 
 /** Changes that add or alter conversation items. */
 export const signature = (s: Session) =>

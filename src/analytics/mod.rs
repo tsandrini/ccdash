@@ -443,8 +443,8 @@ fn session_events(
                 coalesce(x.host, e.host)
             FROM events e LEFT JOIN sessions x ON x.id = e.session
             WHERE e.ts >= :since AND e.ts < :until AND {IN_SCOPE}
-                AND e.kind IN ('prompt', 'task_notification', 'reply', 'error', 'tool',
-                    'permission', 'activity', 'compact', 'denied')
+                AND e.kind IN ('prompt', 'task_notification', 'agent_message', 'reply', 'error',
+                    'tool', 'permission', 'activity', 'compact', 'denied')
             ORDER BY e.session, e.ts, e.rowid"
     ))?;
     let rows = stmt.query_map(

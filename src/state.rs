@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
+    agent_message,
     ask::Answer,
     model::{
         Activity, Ask, AskKind, Claim, Kind, Limit, Message, PARKED_AFTER_MS, ProcInfo, RateLimits,
@@ -463,14 +464,16 @@ impl State {
             }
             "UserPromptSubmit" => {
                 let raw = str_of(p, "prompt").unwrap_or_default();
-                // NOTE: Claude Code's own message, not one you typed: no prompt, no window
+                // NOTE: Claude Code's or a subagent's message, not one you typed: no prompt, no window
                 let notice = task_notification::is(raw);
-                let relayed = if notice { None } else { channel_text(raw) };
+                let sender = agent_message::sender(raw).filter(|_| !notice);
+                let typed = !notice && sender.is_none();
+                let relayed = if typed { channel_text(raw) } else { None };
                 let text = relayed.as_deref().unwrap_or(raw);
                 if relayed.is_some() {
                     s.outbox.clear();
                 }
-                if !notice {
+                if typed {
                     s.prompt = Some(Stamped {
                         at: ts,
                         text: truncate(text, PREVIEW_LEN),
@@ -493,16 +496,28 @@ impl State {
                     title_changed = true;
                 }
                 set_activity(s, Activity::Working, ts, store);
-                let (kind, data) = match relayed {
+                let (kind, data) = match (sender, relayed.is_some()) {
                     _ if notice => (
                         task_notification::KIND,
                         json!({ "text": truncate(raw, MESSAGE_MAX) }),
                     ),
-                    Some(_) => ("prompt", json!({ "text": text, "via": "ccdash" })),
-                    None => ("prompt", json!({ "text": text })),
+                    // NOTE: named now: a report arrives just before its SubagentStop
+                    (Some(from), _) => {
+                        let agent = s.subagents.iter().find(|a| a.id == from);
+                        (
+                            agent_message::KIND,
+                            json!({
+                                "text": truncate(raw, MESSAGE_MAX),
+                                "name": agent.and_then(|a| a.description.as_deref()),
+                                "agent_type": agent.map(|a| a.agent_type.as_str()),
+                            }),
+                        )
+                    }
+                    (None, true) => ("prompt", json!({ "text": text, "via": "ccdash" })),
+                    (None, false) => ("prompt", json!({ "text": text })),
                 };
                 record(store, ts, id, kind, data);
-                focus_candidate = !notice;
+                focus_candidate = typed;
             }
             "PreToolUse" => {
                 let run = ToolRun {
@@ -661,7 +676,10 @@ impl State {
                 }
             }
             "Stop" => {
-                let text = str_of(p, "last_assistant_message").unwrap_or_default();
+                // NOTE: Claude Code delivers an appended notification again as its own prompt
+                let text = task_notification::strip_trailing(
+                    str_of(p, "last_assistant_message").unwrap_or_default(),
+                );
                 if !text.is_empty() {
                     s.reply = Some(Stamped {
                         at: ts,
@@ -760,13 +778,14 @@ impl State {
                     }
                     if p.get("final").and_then(Value::as_bool) == Some(true) {
                         let text = aux.streams.remove(message).unwrap_or_default();
-                        if !text.trim().is_empty() {
+                        let text = task_notification::strip_trailing(&text).trim();
+                        if !text.is_empty() {
                             record(
                                 store,
                                 ts,
                                 id,
                                 "message",
-                                json!({ "text": truncate(text.trim(), MESSAGE_MAX) }),
+                                json!({ "text": truncate(text, MESSAGE_MAX) }),
                             );
                         }
                     }
@@ -2585,6 +2604,43 @@ mod tests {
         hook(&mut st, 4, "UserPromptSubmit", json!({ "prompt": "typed" }));
         agents(&mut st, 5, "interactive", "busy");
         assert_eq!(session(&st).window.as_ref().map(|w| w.id), Some(7));
+    }
+
+    #[test]
+    fn a_subagent_message_is_named_and_a_glued_notification_stripped() {
+        let mut st = state();
+        hook(
+            &mut st,
+            1,
+            "PreToolUse",
+            json!({"tool_name": "Agent", "tool_input": {"description": "Largest files", "subagent_type": "Explore"}}),
+        );
+        hook(
+            &mut st,
+            2,
+            "SubagentStart",
+            json!({"agent_id": "af08", "agent_type": "Explore"}),
+        );
+        let note = "<task-notification>\n<status>completed</status>\n</task-notification>";
+        let fx = hook(
+            &mut st,
+            3,
+            "Stop",
+            json!({ "last_assistant_message": format!("Both are running.\n\n{note}") }),
+        );
+        assert_eq!(
+            session(&st).reply.as_ref().unwrap().text,
+            "Both are running."
+        );
+        assert!(fx.store.iter().any(|m| matches!(m,
+            StoreMsg::Event { kind: "reply", data, .. } if data["text"] == "Both are running.")));
+
+        let report = "<agent-message from=\"af08\">\n[Subagent hand-back] The report follows:\n  done\n</agent-message>";
+        let fx = hook(&mut st, 4, "UserPromptSubmit", json!({ "prompt": report }));
+        assert!(session(&st).prompt.is_none());
+        assert!(fx.store.iter().any(|m| matches!(m,
+            StoreMsg::Event { kind: agent_message::KIND, data, .. }
+                if data["name"] == "Largest files" && data["agent_type"] == "Explore")));
     }
 
     #[test]
