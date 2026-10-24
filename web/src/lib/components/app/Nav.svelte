@@ -1,6 +1,6 @@
 <script lang="ts">
-	// The areas, from the registry; a count where the area has one.
-	// `compact`: icons only, for the collapsed sidebar.
+	// The areas, from the registry; a count where the area has one; the
+	// links keep the range. `compact`: icons only, for the collapsed sidebar.
 	import { page } from '$app/state';
 	import { areas } from '#lib/nav.js';
 	import { live } from '#lib/live/store.svelte.js';
@@ -10,7 +10,7 @@
 	let { onnavigate, compact = false }: { onnavigate?: () => void; compact?: boolean } = $props();
 
 	const inScope = $derived(live.list.filter((s) => scope.covers(s)));
-	const search = $derived(page.url.search);
+	const range = $derived(page.url.searchParams.get('range'));
 </script>
 
 <nav class="flex flex-col gap-0.5 p-2" aria-label="Areas">
@@ -18,7 +18,7 @@
 		{@const active = area.match(page.url.pathname)}
 		{@const badge = area.badge?.(inScope)}
 		<a
-			href={`${area.href}${search}`}
+			href={range ? `${area.href}?range=${encodeURIComponent(range)}` : area.href}
 			aria-current={active ? 'page' : undefined}
 			title={compact ? (badge ? `${area.label} (${badge})` : area.label) : undefined}
 			class={cn(

@@ -1,5 +1,5 @@
 <script lang="ts">
-	// Workspace and host filters, kept in the URL query.
+	// Workspace and host filters, kept on the device (`scope`).
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
@@ -22,7 +22,7 @@
 	}
 </script>
 
-{#if live.workspaces.length}
+{#if live.workspaces.length || current.ws.length}
 	<DropdownMenu.Root>
 		<DropdownMenu.Trigger>
 			{#snippet child({ props })}

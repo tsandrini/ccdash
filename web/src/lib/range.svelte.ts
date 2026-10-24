@@ -1,10 +1,14 @@
-// The range the page shows, from the URL (`range`), else the page's own
-// default; resolved against the hub's clock.
+// The range the page shows, from the URL (`range`, so links and the back
+// button keep it), else the page's own default; resolved against the hub's
+// clock.
 
+import { goto } from '$app/navigation';
 import { page } from '$app/state';
 import { live } from './live/store.svelte';
 import { decodeRange, encodeRange, rangeParams, rangeSetup, type Range } from './range';
-import { scope } from './scope.svelte';
+
+/** The page's URL as a plain one (`page.url` is read-only). */
+const pageUrl = () => new URL(page.url.href);
 
 export const rangeState = {
 	/** Whether the page has a range at all. */
@@ -13,7 +17,8 @@ export const rangeState = {
 	},
 	get current(): Range {
 		const setup = rangeSetup(page.url.pathname);
-		return decodeRange(scope.current.range) ?? setup?.fallback ?? { kind: 'days', days: 7 };
+		const text = page.url.searchParams.get('range') ?? '';
+		return decodeRange(text) ?? setup?.fallback ?? { kind: 'days', days: 7 };
 	},
 	get quick(): Range[] {
 		return rangeSetup(page.url.pathname)?.quick ?? [];
@@ -23,7 +28,9 @@ export const rangeState = {
 		return Date.now() + live.skew;
 	},
 	set(range: Range) {
-		scope.set({ range: encodeRange(range) });
+		const url = pageUrl();
+		url.searchParams.set('range', encodeRange(range));
+		goto(`${url.pathname}${url.search}`, { replace: true });
 	},
 	/** `since` and `until` for the API, for the range as of now. */
 	params() {

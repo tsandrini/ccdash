@@ -1,9 +1,10 @@
 # The panel
 
 The web panel (`web/`, SvelteKit) is served by the hub at `/` and is built
-phone first. Every view can be narrowed to workspaces and hosts; the scope,
-the time range and the analytics section live in the URL, so links can be
-shared and the back button works.
+phone first. Every view can be narrowed to workspaces and hosts: the scope
+is kept per device (browser storage), across pages and reloads, until you
+change it. The time range and the analytics section live in the URL, so
+links can be shared and the back button works.
 
 1. [Now and Sessions](#1-now-and-sessions)
 2. [A session's page](#2-a-sessions-page)
