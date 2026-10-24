@@ -76,6 +76,14 @@ export const fetchLaunch = (id: string) =>
 export const stopSession = (id: string) =>
 	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/stop`, {});
 
+/** Sends the wrap-up prompt; the hub closes the session when that turn ends. */
+export const resolveSession = (id: string) =>
+	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/resolved`, {});
+
+/** Takes the resolved mark back: the session stays open after its wrap-up. */
+export const keepSessionOpen = (id: string) =>
+	del<{ session: Session }>(`sessions/${encodeURIComponent(id)}/resolved`);
+
 /** Marks the session ended on the hub (a ghost, an offline host). */
 export const forgetSession = (id: string) =>
 	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/forget`, {});

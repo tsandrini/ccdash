@@ -1,13 +1,15 @@
 <script lang="ts">
 	// The session page: header (title with inline rename, state, where and
-	// branch, context, cost, Open in Claude, Stop / Open / Forget), Chat /
-	// Shell / Details, the open asks pinned above the composer; an ended
-	// session (also one only history still knows) offers Continue.
+	// branch, context, cost, Open in Claude, Open on and Resolved with the
+	// other actions in a menu), Chat / Shell / Details, the open asks pinned
+	// above the composer; an ended session (also one only history still
+	// knows) offers Continue.
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import ArrowDownIcon from '@lucide/svelte/icons/arrow-down';
 	import ExternalLinkIcon from '@lucide/svelte/icons/external-link';
 	import PencilIcon from '@lucide/svelte/icons/pencil';
+	import { resolvedNote } from '#lib/actions.js';
 	import { Unauthorized } from '#lib/api/client.js';
 	import { renameSession } from '#lib/api/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
@@ -196,7 +198,7 @@
 						{/if}
 					</h2>
 					<div class="ml-auto flex shrink-0 flex-col items-end gap-1">
-						<SessionActions session={s} resume={false} />
+						<SessionActions session={s} pin={['open', 'resolve']} omit={['continue']} labelled />
 					</div>
 				</div>
 			{/if}
@@ -207,6 +209,9 @@
 							>{label(parent)}</a
 						>{:else}Background session{/if}
 				</p>
+			{/if}
+			{#if resolvedNote(s)}
+				<p class="text-xs font-medium text-your-turn">{resolvedNote(s)}</p>
 			{/if}
 			{#if s.claim && s.activity !== 'gone'}
 				<p class="truncate text-xs" title={claimPaths(s).join(', ')}>

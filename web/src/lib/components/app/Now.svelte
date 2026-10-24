@@ -1,7 +1,8 @@
 <script lang="ts">
-	// What needs the owner, with the answer inline; then what is working,
-	// the hosts and the limits, and the last progress entries. "Start a
-	// session" opens the start sheet in the scope's workspace.
+	// What needs the owner, with the answer inline and the session's
+	// actions (Resolved and Kill pinned); then what is working, the hosts
+	// and the limits, and the last progress entries. "Start a session"
+	// opens the start sheet in the scope's workspace.
 	import PlayIcon from '@lucide/svelte/icons/play';
 	import { Unauthorized } from '#lib/api/client.js';
 	import { fetchNotes, type Hit } from '#lib/api/index.js';
@@ -15,6 +16,7 @@
 	import Clock from './Clock.svelte';
 	import LimitTile from './LimitTile.svelte';
 	import QuickReply from './QuickReply.svelte';
+	import SessionActions from './SessionActions.svelte';
 	import SessionCard from './SessionCard.svelte';
 	import StateBadge from './StateBadge.svelte';
 
@@ -110,6 +112,9 @@
 						<QuickReply session={s} />
 					{/if}
 				{/if}
+				<div class="flex justify-end">
+					<SessionActions session={s} pin={['resolve', 'kill']} />
+				</div>
 			</div>
 		{/each}
 	</section>

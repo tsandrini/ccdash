@@ -32,6 +32,7 @@ use crate::{
     util::{self, now_ms},
     wire::Envelope,
     workspace::Workspaces,
+    wrap_up,
 };
 
 const MAX_TITLE: usize = 100;
@@ -174,6 +175,17 @@ pub enum Cmd {
         host: String,
         session: String,
         error: Option<String>,
+    },
+    /// Marks the session `key` names resolved: the wrap-up prompt goes
+    /// through its channel, and the session closes when that turn ends.
+    MarkResolved {
+        key: String,
+        reply: oneshot::Sender<Result<Session, String>>,
+    },
+    /// Takes the resolved mark of the session `key` names back.
+    KeepOpen {
+        key: String,
+        reply: oneshot::Sender<Result<Session, String>>,
     },
     /// Marks the session `key` names gone (a ghost, an offline host).
     Forget {
@@ -613,7 +625,13 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                 let _ = reply.send(core.rename(&key, &title));
             }
             Cmd::Reply(key, text, reply) => {
-                let _ = reply.send(core.reply(&key, &text));
+                let _ = reply.send(core.reply(&key, &text, false));
+            }
+            Cmd::MarkResolved { key, reply } => {
+                let _ = reply.send(core.reply(&key, wrap_up::PROMPT, true));
+            }
+            Cmd::KeepOpen { key, reply } => {
+                let _ = reply.send(core.keep_open(&key));
             }
             Cmd::Message { key, text, reply } => core.message(&key, &text, reply),
             Cmd::Inbox { session, inbox } => core.set_inbox(&session, inbox),
@@ -668,7 +686,7 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                         continue;
                     }
                     Call::Rename { session, title } => core.rename(&session, &title),
-                    Call::Reply { session, text } => core.reply(&session, &text),
+                    Call::Reply { session, text } => core.reply(&session, &text, false),
                     Call::Answer {
                         session,
                         ask,
@@ -1860,6 +1878,9 @@ impl Core {
     }
 
     fn stopped(&mut self, host: &str, session: &str, error: Option<String>) {
+        if let Some(e) = &error {
+            self.close_failed(host, session, e);
+        }
         let current = self
             .states
             .get(host)
@@ -2106,8 +2127,9 @@ impl Core {
     }
 
     /// Passes `text` to the session through the collector that runs its
-    /// channel and shows it as queued until Claude takes it.
-    fn reply(&mut self, key: &str, text: &str) -> Result<Session, String> {
+    /// channel and shows it as queued until Claude takes it; `resolve`
+    /// marks the session resolved with it (`text` is the wrap-up prompt).
+    fn reply(&mut self, key: &str, text: &str, resolve: bool) -> Result<Session, String> {
         let text = text.trim();
         if text.is_empty() {
             return Err("the message is empty".into());
@@ -2120,6 +2142,9 @@ impl Core {
             .ok_or_else(|| format!("no session matches {key:?}"))?;
         if s.activity == Activity::Gone {
             return Err("the session has ended".into());
+        }
+        if resolve && s.resolved.is_some() {
+            return Err("the session is resolved already: it closes after its wrap-up".into());
         }
         let (host, id) = (host.to_owned(), s.id.clone());
         let pid = s
@@ -2134,7 +2159,12 @@ impl Core {
         }
         let mut fx = Effects::default();
         let state = self.states.get_mut(&host).ok_or("session vanished")?;
-        state.sent_reply(&id, text, now_ms(), &mut fx);
+        let now = now_ms();
+        state.sent_reply(&id, text, now, &mut fx);
+        if resolve {
+            info!("resolving {id} on {host}");
+            state.mark_resolved(&id, now, &mut fx);
+        }
         let session = state.session(&id).cloned().ok_or("session vanished")?;
         self.tell(
             &host,
@@ -2147,10 +2177,56 @@ impl Core {
         Ok(session)
     }
 
+    /// Takes the session's resolved mark back: it stays open after its
+    /// wrap-up.
+    fn keep_open(&mut self, key: &str) -> Result<Session, String> {
+        let (host, id) = self
+            .resolve(key)
+            .map(|(host, s)| (host.to_owned(), s.id.clone()))
+            .ok_or_else(|| format!("no session matches {key:?}"))?;
+        let mut fx = Effects::default();
+        let state = self.states.get_mut(&host).ok_or("session vanished")?;
+        if !state.keep_open(&id, now_ms(), &mut fx) {
+            return Err("the session is not marked resolved".into());
+        }
+        let session = state.session(&id).cloned().ok_or("session vanished")?;
+        self.flush(&host, fx);
+        Ok(session)
+    }
+
+    /// Closes a resolved session whose wrap-up turn ended, as Kill does;
+    /// when that cannot start, the session is back on your turn with why.
+    fn close_resolved(&mut self, host: &str, id: &str) {
+        let Some(s) = self.states.get(host).and_then(|st| st.session(id)) else {
+            return;
+        };
+        let stop = ToCollector::Stop {
+            session: s.id.clone(),
+            pid: s.pid,
+            kind: s.kind,
+        };
+        if self.links.contains_key(host) {
+            info!("closing {id} on {host}: resolved and wrapped up");
+            self.tell(host, stop);
+        } else {
+            self.close_failed(host, id, &format!("{host} is not connected"));
+        }
+    }
+
+    fn close_failed(&mut self, host: &str, id: &str, error: &str) {
+        warn!("closing {id} on {host} after its wrap-up: {error}");
+        let mut fx = Effects::default();
+        if let Some(state) = self.states.get_mut(host) {
+            state.close_failed(id, error, now_ms(), &mut fx);
+        }
+        self.flush(host, fx);
+    }
+
     /// Restores, stores and broadcasts what an input changed on `host`;
-    /// lets go of asks the state closed and refreshes the notification
-    /// candidates.
-    fn flush(&mut self, host: &str, fx: Effects) {
+    /// lets go of asks the state closed, refreshes the notification
+    /// candidates and closes the sessions that wrapped up.
+    fn flush(&mut self, host: &str, mut fx: Effects) {
+        let close = std::mem::take(&mut fx.close);
         let Some(state) = self.states.get_mut(host) else {
             return;
         };
@@ -2250,6 +2326,9 @@ impl Core {
                 }
                 changed
             });
+        }
+        for id in close {
+            self.close_resolved(host, &id);
         }
     }
 }

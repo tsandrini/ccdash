@@ -134,6 +134,7 @@ pub async fn serve(
         .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
         .route("/sessions/{id}/stop", post(stop))
+        .route("/sessions/{id}/resolved", post(resolve).delete(keep_open))
         .route("/sessions/{id}/forget", post(forget))
         .route("/sessions/{id}/open", post(open))
         .route("/launches", post(launch))
@@ -645,6 +646,30 @@ async fn stop(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Val
         )
     })??;
     let session = result.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// Marks a session resolved: Claude gets the wrap-up prompt through its
+/// channel, and the hub closes the session when that turn ends.
+async fn resolve(State(app): State<App>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .session_cmd(|reply| Cmd::MarkResolved { key: id, reply })
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
+/// Takes a session's resolved mark back: it stays open after its wrap-up.
+async fn keep_open(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .hub
+        .session_cmd(|reply| Cmd::KeepOpen { key: id, reply })
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "session": session })))
 }
 

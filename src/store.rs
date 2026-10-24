@@ -19,12 +19,13 @@ use tracing::warn;
 
 use crate::{
     agent_message, claims, knowledge, messages,
-    model::{Activity, Kind, Session, Stamped, Turn},
+    model::{Activity, Kind, Resolved, Session, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
     task_notification, tokens,
     util::{now_ms, truncate},
     workspace::Workspaces,
+    wrap_up,
 };
 
 pub(crate) const SCHEMA: &str = "
@@ -584,9 +585,56 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         claim: claims::load(&conn, session, now)?,
         branch,
         launched,
+        resolved: last_resolved(&conn, session)?,
     };
     conn.finish()?;
     Ok(restored)
+}
+
+/// The resolved mark the session still carries, as the reducer would
+/// have it from the events: none once the owner took it back, typed on
+/// or the session ended, or once its wrap-up turn ended (the hub went
+/// down while closing it).
+fn last_resolved(conn: &Connection, session: &str) -> Result<Option<Resolved>> {
+    let Some((at, mark)) = conn
+        .prepare_cached(
+            "SELECT ts, data FROM events WHERE session = ?1 AND kind = 'resolved'
+                ORDER BY ts DESC, rowid DESC LIMIT 1",
+        )?
+        .query_row([session], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let data = |raw: &str| serde_json::from_str::<Value>(raw).unwrap_or_default();
+    if data(&mark)["keep"].as_bool() == Some(true) {
+        return Ok(None);
+    }
+    let mut wrapping_up = false;
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, data FROM events WHERE session = ?1 AND ts >= ?2
+            AND kind IN ('prompt', 'reply', 'error', 'end') ORDER BY ts, rowid",
+    )?;
+    let rows = stmt.query_map(params![session, at], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (kind, raw) = row?;
+        let event = data(&raw);
+        match kind.as_str() {
+            "prompt"
+                if event["via"] == "ccdash"
+                    && event["text"].as_str().is_some_and(wrap_up::asked) =>
+            {
+                wrapping_up = true;
+            }
+            "reply" if !wrapping_up => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(Resolved { at, wrapping_up }))
 }
 
 /// A session the live state no longer holds, rebuilt from its row (by id
@@ -724,6 +772,52 @@ mod tests {
     use super::*;
     use crate::model::TaskStatus;
     use serde_json::json;
+
+    #[test]
+    fn a_resolved_mark_survives_a_restart_until_its_wrap_up_ends() {
+        let dir = std::env::temp_dir().join(format!("ccdash-resolved-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let conn = open_writer(&dir.join("t.db")).unwrap();
+        let add = |ts: i64, session: &str, kind: &str, data: Value| {
+            conn.execute(
+                "INSERT INTO events VALUES (?1, 'h', ?2, ?3, ?4)",
+                params![ts, session, kind, data.to_string()],
+            )
+            .unwrap();
+        };
+        let mark = json!({ "keep": false });
+        let wrap = json!({ "text": wrap_up::PROMPT, "via": "ccdash" });
+        let reply = json!({ "text": "done" });
+        for s in ["asked", "wrapping", "wrapped", "typed", "kept", "ended"] {
+            add(1, s, "resolved", mark.clone());
+        }
+        add(2, "wrapping", "reply", reply.clone());
+        add(3, "wrapping", "prompt", wrap.clone());
+        add(2, "wrapped", "prompt", wrap);
+        add(3, "wrapped", "reply", reply);
+        add(2, "typed", "prompt", json!({ "text": "one more" }));
+        add(2, "kept", "resolved", json!({ "keep": true }));
+        add(2, "ended", "end", json!({ "reason": "other" }));
+        let at = |s: &str| last_resolved(&conn, s).unwrap();
+        assert_eq!(
+            at("asked"),
+            Some(Resolved {
+                at: 1,
+                wrapping_up: false
+            })
+        );
+        assert_eq!(
+            at("wrapping"),
+            Some(Resolved {
+                at: 1,
+                wrapping_up: true
+            })
+        );
+        for s in ["wrapped", "typed", "kept", "ended", "never"] {
+            assert_eq!(at(s), None, "{s}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn notifications_and_subagent_messages_stored_as_prompts_get_their_kind_once() {

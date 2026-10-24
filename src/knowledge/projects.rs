@@ -7,11 +7,11 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use super::{COLUMNS, Card, LinkKind, Note, NoteKind, Status, row_note};
+use super::{COLUMNS, Card, LinkKind, LinkRef, Note, NoteKind, Status, row_note};
 use crate::model::{Activity, Session};
 
 const DAY_MS: i64 = 86_400_000;
@@ -51,7 +51,7 @@ pub struct Project {
     /// Hot documents first, then by update.
     pub docs: Vec<Doc>,
     /// Newest first.
-    pub progress: Vec<Card>,
+    pub progress: Vec<Entry>,
     /// Active memories first, then the flagged ones; by recalls within.
     pub memories: Vec<Card>,
 }
@@ -78,6 +78,33 @@ pub struct Working {
     /// The session's claim names the issue (else it is inferred from
     /// what it wrote).
     pub claimed: bool,
+}
+
+/// A progress entry with what the timeline shows around it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct Entry {
+    #[serde(flatten)]
+    pub card: Card,
+    /// When it was logged (an edit moves `updated_at`, not this).
+    pub logged_at: i64,
+    /// The issue it is on: its title and status while the note exists.
+    pub on: Option<LinkRef>,
+    /// The session that logged it; none when the owner did, or an import.
+    pub by: Option<Author>,
+}
+
+/// A session that wrote a note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct Author {
+    pub session: String,
+    /// Unknown when the hub never saw the session.
+    pub host: Option<String>,
+    /// Its title, else its name or id prefix.
+    pub label: String,
+    /// The session still runs.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -124,10 +151,33 @@ pub fn build(
     now: i64,
 ) -> Result<WorkspaceProjects> {
     let live = notes(conn, workspace, &[Status::Active, Status::Stale])?;
-    let closed: Vec<Note> = notes(conn, workspace, &[Status::Archived])?
-        .into_iter()
+    let archived = notes(conn, workspace, &[Status::Archived])?;
+    let closed: Vec<Note> = archived
+        .iter()
         .filter(|n| n.kind == NoteKind::Issue && closed_at(n) >= now - DONE_MS)
+        .cloned()
         .collect();
+    let any_note: HashMap<&str, &Note> = live
+        .iter()
+        .chain(&archived)
+        .map(|n| (n.slug.as_str(), n))
+        .collect();
+    let authors = authors(conn, &live, sessions)?;
+    let entry = |n: &Note| Entry {
+        card: n.card(),
+        logged_at: n.created_at,
+        on: n.extra["issue"].as_str().map(|slug| {
+            let issue = any_note.get(slug);
+            LinkRef {
+                slug: slug.to_owned(),
+                kind: LinkKind::Relates,
+                title: issue.map(|i| i.title.clone()),
+                note_kind: issue.map(|i| i.kind),
+                status: issue.map(|i| i.status),
+            }
+        }),
+        by: by_session(n.created_by.as_deref()).and_then(|id| authors.get(id).cloned()),
+    };
     let sessions: Vec<&Session> = sessions
         .iter()
         .filter(|s| s.activity != Activity::Gone && s.workspace.as_deref() == Some(workspace))
@@ -242,7 +292,7 @@ pub fn build(
                 progress: progress
                     .into_iter()
                     .take(PROGRESS_PER_PROJECT)
-                    .map(Note::card)
+                    .map(entry)
                     .collect(),
                 memories: memories.into_iter().map(Note::card).collect(),
             }
@@ -254,6 +304,54 @@ pub fn build(
         flagged,
         total: live.len(),
     })
+}
+
+/// The sessions that logged the live progress entries, by id: from the
+/// live state, else from the sessions table.
+fn authors(
+    conn: &Connection,
+    live: &[Note],
+    sessions: &[Session],
+) -> Result<HashMap<String, Author>> {
+    let mut out = HashMap::new();
+    for n in live.iter().filter(|n| n.kind == NoteKind::Progress) {
+        let Some(id) = by_session(n.created_by.as_deref()) else {
+            continue;
+        };
+        if out.contains_key(id) {
+            continue;
+        }
+        let author = match sessions.iter().find(|s| s.id == id) {
+            Some(s) => Author {
+                session: s.id.clone(),
+                host: Some(s.host.clone()),
+                label: working(s, false).label,
+                live: s.activity != Activity::Gone,
+            },
+            None => conn
+                .prepare_cached("SELECT host, COALESCE(title, name) FROM sessions WHERE id = ?1")?
+                .query_row([id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .optional()?
+                .map_or_else(
+                    || Author {
+                        session: id.to_owned(),
+                        host: None,
+                        label: id.chars().take(8).collect(),
+                        live: false,
+                    },
+                    |(host, label)| Author {
+                        session: id.to_owned(),
+                        host: Some(host),
+                        label: label.unwrap_or_else(|| id.chars().take(8).collect()),
+                        live: false,
+                    },
+                ),
+        };
+        out.insert(id.to_owned(), author);
+    }
+    Ok(out)
 }
 
 /// Who signed a write, unless it was the owner (`panel`) or an import.
@@ -425,6 +523,79 @@ mod tests {
     }
 
     #[test]
+    fn progress_names_its_issue_and_the_session_that_logged_it() {
+        let conn = db();
+        let now = 100 * DAY_MS;
+        let issue = add_issue(&conn, "Ship it", "s1", now - DAY_MS);
+        let log = |by: &str, issue: Option<&str>, at: i64| {
+            apply(
+                &conn,
+                "ws",
+                Some("repo"),
+                Some(by),
+                &NoteOp::Progress {
+                    text: format!("by {by}"),
+                    issue: issue.map(str::to_owned),
+                    project: None,
+                },
+                at,
+            )
+            .unwrap();
+        };
+        log("s7", Some(&issue), now - 3000);
+        log("s8", None, now - 2000);
+        log("panel", None, now - 1000);
+        apply(
+            &conn,
+            "ws",
+            Some("repo"),
+            Some("s7"),
+            &NoteOp::IssueUpdate {
+                slug: issue.clone(),
+                status: Some("closed".into()),
+                title: None,
+                body: None,
+                priority: None,
+                comment: None,
+            },
+            now - 500,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, host, cwd, title, kind, started_at)
+                VALUES ('s7', 'flat', '/ws/repo', 'Old one', 'interactive', 0)",
+            [],
+        )
+        .unwrap();
+
+        let view = build(&conn, "ws", &[], now).unwrap();
+        let progress = &view.projects.last().unwrap().progress;
+        let by: Vec<Option<(&str, Option<&str>, bool)>> = progress
+            .iter()
+            .map(|e| {
+                e.by.as_ref()
+                    .map(|a| (a.label.as_str(), a.host.as_deref(), a.live))
+            })
+            .collect();
+        assert_eq!(
+            by,
+            [
+                None,
+                Some(("s8", None, false)),
+                Some(("Old one", Some("flat"), false))
+            ],
+            "the owner signs nothing; unknown sessions show their id"
+        );
+        let on = progress[2].on.as_ref().unwrap();
+        assert_eq!(
+            (on.title.as_deref(), on.status),
+            (Some("Ship it"), Some(Status::Archived)),
+            "a closed issue keeps its title"
+        );
+        assert!(progress[1].on.is_none());
+    }
+
+    #[test]
     fn issues_derive_their_state_from_what_sessions_do() {
         let conn = db();
         let now = 100 * DAY_MS;
@@ -546,9 +717,25 @@ mod tests {
         assert_eq!(repo.closed[0].closed_at, Some(now - DAY_MS));
         assert!(!repo.closed[0].in_progress);
         assert_eq!(repo.progress.len(), 2);
+        let entry = &repo.progress[0];
         assert_eq!(
-            repo.progress[0].issue.as_deref(),
+            entry.card.issue.as_deref(),
             Some(progressed.card.slug.as_str())
+        );
+        assert_eq!(entry.logged_at, now - 2 * 3_600_000);
+        let on = entry.on.as_ref().unwrap();
+        assert_eq!(
+            (on.title.as_deref(), on.status),
+            (Some("progressed"), Some(Status::Active))
+        );
+        assert_eq!(
+            entry.by,
+            Some(Author {
+                session: "s2".into(),
+                host: Some("navi".into()),
+                label: "session s2".into(),
+                live: true
+            })
         );
 
         let graph = graph(&conn, "ws", &[Status::Active, Status::Stale]).unwrap();

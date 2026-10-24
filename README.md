@@ -32,7 +32,9 @@ and notes in step across machines.
   answered at the desk never sends one.
   ([prompts and notifications](docs/prompts-and-notifications.md))
 - **Talk to** a running session, **start** one in a known project,
-  **continue** an ended one on any machine, **stop** one, even a stuck one.
+  **continue** an ended one on any machine, mark one **resolved** (Claude
+  wraps up, records what it learned, then it closes) or **kill** one, even
+  a stuck one.
   ([sessions](docs/sessions.md))
 - **Move between machines:** a session ended on the desk resumes on the
   laptop with a plain `claude --resume`; a session is never open on two
@@ -188,7 +190,7 @@ the real one): [development](docs/development.md).
 | [architecture](docs/architecture.md)                           | components, protocol, what Claude Code interfaces are used    |
 | [panel](docs/panel.md)                                         | every page of the panel and the DMS plugin                    |
 | [prompts and notifications](docs/prompts-and-notifications.md) | answering prompts, Web Push, the channel, renaming            |
-| [sessions](docs/sessions.md)                                   | start, continue, stop, open, forget                           |
+| [sessions](docs/sessions.md)                                   | start, continue, resolve, kill, open, forget                  |
 | [state sync](docs/state-sync.md)                               | `~/.claude` on every machine, the one-machine rule, conflicts |
 | [knowledge](docs/knowledge.md)                                 | notes, tools, injections, import and export                   |
 | [security](docs/security.md)                                   | tokens, devices, what can reach the hub                       |

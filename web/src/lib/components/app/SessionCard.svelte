@@ -1,7 +1,8 @@
 <script lang="ts">
 	// A session in a list: state, title, where (with the branch), what it
-	// is doing, claim, inbox, meta, the last hour; its actions in a menu
-	// beside the link.
+	// is doing, claim, inbox, a resolved mark, meta, the last hour; its
+	// Actions menu beside the link.
+	import { resolvedNote } from '#lib/actions.js';
 	import type { Lane, Session } from '#lib/api/types.js';
 	import { fmtBytes, fmtDuration, fmtUsd, known, plain, plural, toolLabel } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
@@ -52,6 +53,7 @@
 		const paths = claimPaths(s);
 		return [s.claim.what, paths.length ? paths.join(', ') : null].filter(Boolean).join(' · ');
 	});
+	const resolved = $derived(resolvedNote(s));
 	const inbox = $derived(
 		s.activity !== 'gone' && s.inbox?.length ? s.inbox[s.inbox.length - 1] : null
 	);
@@ -111,6 +113,9 @@
 					><span class="font-medium text-muted-foreground">Claims</span> {claim}</span
 				>
 			{/if}
+			{#if resolved}
+				<span class="text-xs font-medium text-your-turn">{resolved}</span>
+			{/if}
 			{#if inbox}
 				<span class="truncate text-xs" title={inbox.text}
 					><span class="font-medium text-muted-foreground"
@@ -145,5 +150,5 @@
 		{/if}
 		<Strip session={s} {lane} />
 	</a>
-	<div class="absolute top-2 right-2"><SessionActions session={s} menu /></div>
+	<div class="absolute top-2 right-2"><SessionActions session={s} /></div>
 </div>

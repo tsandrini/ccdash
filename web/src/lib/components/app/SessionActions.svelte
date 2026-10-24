@@ -1,47 +1,56 @@
 <script lang="ts">
-	// What can be done to a session from here: Stop (its host connected),
-	// Open on the desktop (a background session on a connected host),
-	// Forget (its host offline), Continue (ended). Stop and Forget ask
-	// first, naming the session and the host. Buttons on the session page,
-	// a menu on the cards.
+	// A session's actions (#lib/actions): those in `pin` as buttons, the
+	// others in an Actions menu, `omit`ted ones nowhere. One blocked shows
+	// disabled in the menu with why; those that ask first open a dialog
+	// naming the session and the host.
+	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import EllipsisIcon from '@lucide/svelte/icons/ellipsis';
+	import { ACTIONS, type ActionId, type SessionAction } from '#lib/actions.js';
 	import { Unauthorized } from '#lib/api/client.js';
-	import { forgetSession, openSession, stopSession, type Session } from '#lib/api/index.js';
+	import type { Session } from '#lib/api/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Dialog from '#lib/components/ui/dialog/index.js';
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
 	import { live } from '#lib/live/store.svelte.js';
-	import { isAgent, label } from '#lib/session.js';
-	import { starter } from '#lib/starter.svelte.js';
 
 	let {
 		session: s,
-		menu = false,
-		resume = true
-	}: { session: Session; menu?: boolean; resume?: boolean } = $props();
+		pin = [],
+		omit = [],
+		labelled = false
+	}: {
+		session: Session;
+		pin?: ActionId[];
+		omit?: ActionId[];
+		/** The menu's trigger reads "Actions" rather than "…". */
+		labelled?: boolean;
+	} = $props();
 
-	let confirming = $state<'stop' | 'forget' | null>(null);
+	let confirming = $state<SessionAction | null>(null);
 	let busy = $state(false);
 	let error = $state('');
 	let note = $state('');
 
-	const ended = $derived(s.activity === 'gone');
-	const online = $derived(live.connected(s.host));
-	const canStop = $derived(!ended && online);
-	const canOpen = $derived(!ended && online && isAgent(s));
-	const canForget = $derived(!ended && !online);
-	const canContinue = $derived(resume && ended && Boolean(s.workspace));
-	const any = $derived(canStop || canOpen || canForget || canContinue);
+	const offered = $derived(ACTIONS.filter((a) => !omit.includes(a.id) && a.offered(s)));
+	const pinned = $derived(offered.filter((a) => pin.includes(a.id) && !a.blocked?.(s)));
+	const rest = $derived(offered.filter((a) => !pinned.includes(a)));
+	const prompt = $derived(confirming?.confirm?.(s) ?? null);
+	// Outside a row of buttons (a card's corner) the outcome floats.
+	const floating = $derived(!pinned.length && !labelled);
 
-	async function act(what: 'stop' | 'forget' | 'open') {
-		busy = true;
+	function start(a: SessionAction) {
 		error = '';
 		note = '';
+		if (a.confirm) confirming = a;
+		else run(a);
+	}
+
+	async function run(a: SessionAction) {
+		busy = true;
 		try {
-			const call = { stop: stopSession, forget: forgetSession, open: openSession }[what];
-			live.put((await call(s.id)).session);
+			const said = await a.run(s);
 			confirming = null;
-			if (what === 'open') note = `Opening on ${s.host}.`;
+			if (said) note = said;
 		} catch (e) {
 			if (e instanceof Unauthorized) live.needToken = true;
 			else error = (e as Error).message;
@@ -59,65 +68,66 @@
 		}, 6000);
 		return () => clearTimeout(timer);
 	});
-
-	const cont = () => starter.show({ resume: s });
 </script>
 
-{#if any}
-	{#if menu}
-		<DropdownMenu.Root>
-			<DropdownMenu.Trigger>
-				{#snippet child({ props })}
-					<Button variant="ghost" size="icon-xs" aria-label="Session actions" {...props}>
-						<EllipsisIcon />
-					</Button>
-				{/snippet}
-			</DropdownMenu.Trigger>
-			<DropdownMenu.Content align="end">
-				{#if canOpen}
-					<DropdownMenu.Item onSelect={() => act('open')}>Open on {s.host}</DropdownMenu.Item>
-				{/if}
-				{#if canContinue}
-					<DropdownMenu.Item onSelect={cont}>Continue…</DropdownMenu.Item>
-				{/if}
-				{#if canStop}
-					<DropdownMenu.Item variant="destructive" onSelect={() => (confirming = 'stop')}
-						>Stop…</DropdownMenu.Item
-					>
-				{/if}
-				{#if canForget}
-					<DropdownMenu.Item onSelect={() => (confirming = 'forget')}>Forget…</DropdownMenu.Item>
-				{/if}
-			</DropdownMenu.Content>
-		</DropdownMenu.Root>
-	{:else}
-		<span class="flex flex-wrap items-center gap-1.5">
-			{#if canOpen}
-				<Button variant="outline" size="xs" disabled={busy} onclick={() => act('open')}
-					>Open on {s.host}</Button
-				>
-			{/if}
-			{#if canContinue}
-				<Button size="xs" onclick={cont}>Continue</Button>
-			{/if}
-			{#if canStop}
-				<Button variant="outline" size="xs" onclick={() => (confirming = 'stop')}>Stop</Button>
-			{/if}
-			{#if canForget}
-				<Button variant="outline" size="xs" onclick={() => (confirming = 'forget')}>Forget</Button>
-			{/if}
-		</span>
-	{/if}
-	{#if (error || note) && !confirming}
-		<p
-			class="text-xs {error ? 'text-critical' : 'text-muted-foreground'} {menu
-				? 'absolute top-7 right-0 z-10 w-max max-w-60 rounded-md border bg-popover p-1.5 shadow'
-				: ''}"
-			role="status"
-		>
-			{error || note}
-		</p>
-	{/if}
+{#if offered.length}
+	<span class="relative flex flex-wrap items-center gap-1.5">
+		{#each pinned as a (a.id)}
+			<Button
+				variant={a.id === 'resolve' || a.id === 'continue' ? 'default' : 'outline'}
+				size="xs"
+				disabled={busy}
+				onclick={() => start(a)}
+			>
+				<a.icon />
+				{a.label(s)}
+			</Button>
+		{/each}
+		{#if rest.length}
+			<DropdownMenu.Root>
+				<DropdownMenu.Trigger>
+					{#snippet child({ props })}
+						{#if labelled || pinned.length}
+							<Button variant="outline" size="xs" aria-label="Session actions" {...props}>
+								{#if labelled}Actions <ChevronDownIcon />{:else}<EllipsisIcon />{/if}
+							</Button>
+						{:else}
+							<Button variant="ghost" size="icon-xs" aria-label="Session actions" {...props}>
+								<EllipsisIcon />
+							</Button>
+						{/if}
+					{/snippet}
+				</DropdownMenu.Trigger>
+				<DropdownMenu.Content align="end" class="max-w-72">
+					{#each rest as a, i (a.id)}
+						{@const why = a.blocked?.(s) ?? null}
+						{#if a.destructive && i > 0}<DropdownMenu.Separator />{/if}
+						<DropdownMenu.Item
+							variant={a.destructive ? 'destructive' : 'default'}
+							disabled={Boolean(why)}
+							onSelect={() => start(a)}
+						>
+							<a.icon />
+							<span class="flex flex-col">
+								<span>{a.label(s)}{a.confirm && !a.label(s).endsWith('…') ? '…' : ''}</span>
+								{#if why}<span class="text-xs text-muted-foreground">{why}</span>{/if}
+							</span>
+						</DropdownMenu.Item>
+					{/each}
+				</DropdownMenu.Content>
+			</DropdownMenu.Root>
+		{/if}
+		{#if (error || note) && !confirming}
+			<span
+				class="text-xs {error ? 'text-critical' : 'text-muted-foreground'} {floating
+					? 'absolute top-7 right-0 z-10 w-max max-w-60 rounded-md border bg-popover p-1.5 shadow'
+					: 'basis-full text-right'}"
+				role="status"
+			>
+				{error || note}
+			</span>
+		{/if}
+	</span>
 {/if}
 
 <Dialog.Root
@@ -130,29 +140,20 @@
 	}}
 >
 	<Dialog.Content>
-		<Dialog.Header>
-			<Dialog.Title>
-				{confirming === 'stop' ? 'Stop' : 'Forget'} “{label(s)}” on {s.host}?
-			</Dialog.Title>
-			<Dialog.Description>
-				{#if confirming === 'forget'}
-					{s.host} is offline, so nothing can stop the session from here. Forgetting marks it ended on
-					the hub; it comes back if {s.host} reports it running again.
-				{:else if isAgent(s)}
-					Runs <code class="font-mono">claude stop {s.short_id ?? s.id.slice(0, 8)}</code> on {s.host}.
-					The conversation is kept: continue it later from its page.
-				{:else}
-					Sends SIGTERM to its Claude process{s.pid ? ` (pid ${s.pid})` : ''} on {s.host}: the
-					session in that terminal ends. The conversation is kept: continue it later from its page.
-				{/if}
-			</Dialog.Description>
-		</Dialog.Header>
-		{#if error}<p class="text-sm text-critical" role="alert">{error}</p>{/if}
-		<Dialog.Footer>
-			<Button variant="outline" onclick={() => (confirming = null)}>Cancel</Button>
-			<Button variant="destructive" disabled={busy} onclick={() => confirming && act(confirming)}
-				>{confirming === 'stop' ? 'Stop' : 'Forget'}</Button
-			>
-		</Dialog.Footer>
+		{#if confirming && prompt}
+			<Dialog.Header>
+				<Dialog.Title>{prompt.title}</Dialog.Title>
+				<Dialog.Description>{prompt.body}</Dialog.Description>
+			</Dialog.Header>
+			{#if error}<p class="text-sm text-critical" role="alert">{error}</p>{/if}
+			<Dialog.Footer>
+				<Button variant="outline" onclick={() => (confirming = null)}>Cancel</Button>
+				<Button
+					variant={confirming.destructive || confirming.id === 'forget' ? 'destructive' : 'default'}
+					disabled={busy}
+					onclick={() => confirming && run(confirming)}>{prompt.button}</Button
+				>
+			</Dialog.Footer>
+		{/if}
 	</Dialog.Content>
 </Dialog.Root>

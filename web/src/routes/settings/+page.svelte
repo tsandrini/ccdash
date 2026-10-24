@@ -2,6 +2,7 @@
 	// Pairing (a token per link), this device (install, push, its token),
 	// the devices with a token, theme, the composer's quick replies and
 	// templates, a pointer to the State page, hosts.
+	import PencilIcon from '@lucide/svelte/icons/pencil';
 	import { clearToken, setToken, tokenFrom, Unauthorized } from '#lib/api/client.js';
 	import {
 		fetchPush,
@@ -34,6 +35,7 @@
 	let editId = $state<number | null>(null);
 	let editLabel = $state('');
 	let editRef = $state<HTMLInputElement | null>(null);
+	let saving = $state(false);
 	let revoking = $state<Token | null>(null);
 	let push = $state<PushInfo | null>(null);
 	let pushError = $state('');
@@ -116,18 +118,26 @@
 		editLabel = t.label;
 	}
 
+	/** Renames the device being edited; the field stays open when that fails. */
 	async function saveLabel() {
 		const id = editId;
-		if (id === null) return;
-		editId = null;
+		if (id === null || saving) return;
 		const value = editLabel.trim();
 		const was = devices?.tokens.find((t) => t.id === id);
-		if (!value || !was || value === was.label) return;
+		if (!value || !was || value === was.label) {
+			editId = null;
+			return;
+		}
+		saving = true;
+		devicesError = '';
 		try {
 			const { token } = await relabelToken(id, value);
 			if (devices) devices.tokens = devices.tokens.map((t) => (t.id === id ? token : t));
+			editId = null;
 		} catch (e) {
 			failed(e, (m) => (devicesError = m));
+		} finally {
+			saving = false;
 		}
 	}
 
@@ -331,8 +341,8 @@
 	<section class="flex flex-col gap-2">
 		<h2 class="text-base font-semibold">Devices</h2>
 		<p class="text-sm text-muted-foreground">
-			Every device paired with a link of its own; click a label to rename it. Revoking signs the
-			device out at its next request and ends its push notifications.
+			Every device paired with a link of its own; the pencil renames one. Revoking signs the device
+			out at its next request and ends its push notifications.
 		</p>
 		{#if devices}
 			{#if devices.tokens.length}
@@ -342,24 +352,42 @@
 							<div class="flex min-w-0 flex-1 flex-col gap-0.5">
 								<div class="flex items-center gap-2 text-sm">
 									{#if editId === t.id}
-										<Input
-											bind:ref={editRef}
-											bind:value={editLabel}
-											class="h-7 max-w-56"
-											aria-label="Label"
-											maxlength={60}
-											onblur={saveLabel}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') saveLabel();
-												else if (e.key === 'Escape') editId = null;
+										<form
+											class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5"
+											onsubmit={(e) => {
+												e.preventDefault();
+												saveLabel();
 											}}
-										/>
+										>
+											<Input
+												bind:ref={editRef}
+												bind:value={editLabel}
+												class="h-7 max-w-56"
+												aria-label="Name of {t.label}"
+												maxlength={60}
+												disabled={saving}
+												onkeydown={(e) => {
+													if (e.key === 'Escape') editId = null;
+												}}
+											/>
+											<Button type="submit" size="xs" disabled={saving || !editLabel.trim()}
+												>Save</Button
+											>
+											<Button
+												type="button"
+												variant="ghost"
+												size="xs"
+												onclick={() => (editId = null)}>Cancel</Button
+											>
+										</form>
 									{:else}
-										<button
-											type="button"
-											class="truncate font-medium hover:underline"
+										<span class="truncate font-medium">{t.label}</span>
+										<Button
+											variant="ghost"
+											size="icon-xs"
+											aria-label="Rename {t.label}"
 											title="Rename"
-											onclick={() => edit(t)}>{t.label}</button
+											onclick={() => edit(t)}><PencilIcon /></Button
 										>
 									{/if}
 									{#if t.current}<Badge variant="secondary">this device</Badge>{/if}

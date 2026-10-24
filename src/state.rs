@@ -10,13 +10,14 @@ use crate::{
     ask::Answer,
     model::{
         Activity, Ask, AskKind, Claim, Kind, Limit, Message, PARKED_AFTER_MS, ProcInfo, RateLimits,
-        Resources, ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
-        WindowRef,
+        Resolved, Resources, ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun,
+        Turn, WindowRef,
     },
     task_notification,
     util::{tail, truncate},
     wire::{Envelope, Source},
     workspace::Workspaces,
+    wrap_up,
 };
 
 const GONE_RETENTION_MS: i64 = 10 * 60 * 1000;
@@ -157,6 +158,8 @@ pub struct Effects {
     pub removed: Vec<String>,
     pub store: Vec<StoreMsg>,
     pub rate_limits: bool,
+    /// Resolved sessions whose wrap-up turn ended: the hub closes them.
+    pub close: Vec<String>,
 }
 
 /// Persisted fields used to refill a session first seen after a daemon restart.
@@ -174,6 +177,7 @@ pub struct Restored {
     pub claim: Option<Claim>,
     pub branch: Option<String>,
     pub launched: bool,
+    pub resolved: Option<Resolved>,
 }
 
 #[derive(Debug, Default)]
@@ -320,6 +324,7 @@ impl State {
             s.claim = s.claim.take().or(saved.claim);
             s.branch = s.branch.take().or(saved.branch);
             s.launched |= saved.launched;
+            s.resolved = s.resolved.or(saved.resolved);
         }
     }
 
@@ -443,6 +448,7 @@ impl State {
         // Only set inside a subagent (and on Subagent* events, as the subagent's own id).
         let agent_id = str_of(p, "agent_id");
         let mut focus_candidate = false;
+        let mut close = false;
         match event {
             "SessionStart" => {
                 let source = str_of(p, "source").unwrap_or("startup");
@@ -472,6 +478,14 @@ impl State {
                 let text = relayed.as_deref().unwrap_or(raw);
                 if relayed.is_some() {
                     s.outbox.clear();
+                }
+                if relayed.as_deref().is_some_and(wrap_up::asked) {
+                    if let Some(r) = &mut s.resolved {
+                        r.wrapping_up = true;
+                    }
+                } else if typed {
+                    // NOTE: the owner carried on instead
+                    s.resolved = None;
                 }
                 if typed {
                     s.prompt = Some(Stamped {
@@ -691,7 +705,13 @@ impl State {
                 if let Some(turn) = &mut s.turn {
                     turn.ended_at = Some(ts);
                 }
-                set_activity(s, Activity::YourTurn, ts, store);
+                close = s.resolved.is_some_and(|r| r.wrapping_up);
+                let next = if close {
+                    Activity::Idle
+                } else {
+                    Activity::YourTurn
+                };
+                set_activity(s, next, ts, store);
                 record(store, ts, id, "reply", json!({ "text": text }));
             }
             "StopFailure" => {
@@ -700,6 +720,7 @@ impl State {
                     .unwrap_or("turn failed");
                 s.tool = None;
                 s.waiting_for = Some(format!("error: {error}"));
+                s.resolved = None;
                 if let Some(turn) = &mut s.turn {
                     turn.ended_at = Some(ts);
                 }
@@ -808,6 +829,9 @@ impl State {
                 );
             }
             _ => {}
+        }
+        if close {
+            fx.close.push(id.to_owned());
         }
         if title_changed {
             self.match_titles(fx);
@@ -1011,6 +1035,47 @@ impl State {
                 fx.touched.insert(s.id.clone());
             }
         }
+    }
+
+    /// Marks the session resolved, its wrap-up prompt sent: the session
+    /// closes when the turn that prompt starts ends.
+    pub fn mark_resolved(&mut self, id: &str, now: i64, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        s.resolved = Some(Resolved {
+            at: now,
+            wrapping_up: false,
+        });
+        record(&mut fx.store, now, id, "resolved", json!({ "keep": false }));
+        fx.touched.insert(id.to_owned());
+    }
+
+    /// Takes the resolved mark back: the session stays open after its
+    /// wrap-up. False when it had none.
+    pub fn keep_open(&mut self, id: &str, now: i64, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id).filter(|s| s.resolved.is_some()) else {
+            return false;
+        };
+        s.resolved = None;
+        record(&mut fx.store, now, id, "resolved", json!({ "keep": true }));
+        fx.touched.insert(id.to_owned());
+        true
+    }
+
+    /// The hub could not close a session after its wrap-up: back to your
+    /// turn, with why.
+    pub fn close_failed(&mut self, id: &str, error: &str, now: i64, fx: &mut Effects) {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return;
+        };
+        if s.activity != Activity::Idle || !s.resolved.is_some_and(|r| r.wrapping_up) {
+            return;
+        }
+        s.resolved = None;
+        s.waiting_for = Some(format!("error: closing it failed: {error}"));
+        set_activity(s, Activity::YourTurn, now, &mut fx.store);
+        fx.touched.insert(id.to_owned());
     }
 
     /// Shows a reply sent through the channel until Claude picks it up.
@@ -1359,6 +1424,7 @@ impl State {
             outbox: Vec::new(),
             inbox: Vec::new(),
             claim: None,
+            resolved: None,
             resources: None,
             turn: None,
             tasks: Vec::new(),
@@ -1383,6 +1449,7 @@ impl State {
         s.tool = None;
         s.waiting_for = None;
         s.subagents.clear();
+        s.resolved = None;
         set_activity(s, Activity::Gone, ts, &mut fx.store);
         record(&mut fx.store, ts, id, "end", json!({ "reason": reason }));
         fx.store.push(session_row(s, Some(ts)));
@@ -1785,6 +1852,10 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
 const ENDED_JOBS: &[&str] = &["done", "stopped", "failed", "error", "cancelled"];
 
 fn agent_activity(e: &AgentEntry, s: &Session) -> Option<Activity> {
+    // NOTE: wrapped up and being closed: only its end counts
+    if s.activity == Activity::Idle && s.resolved.is_some_and(|r| r.wrapping_up) {
+        return None;
+    }
     match e.state.as_deref() {
         Some("working") => return Some(Activity::Working),
         // NOTE: a turn that ended here waits on you; one found blocked (a hub
@@ -2896,6 +2967,101 @@ mod tests {
         assert!(fx.touched.contains(SID));
         let s = session(&st);
         assert!(!s.channel && s.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_resolved_session_wraps_up_then_closes() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        hook(&mut st, 2, "Stop", json!({}));
+        let mut fx = Effects::default();
+        st.sent_reply(SID, wrap_up::PROMPT, 3, &mut fx);
+        st.mark_resolved(SID, 3, &mut fx);
+        assert_eq!(kinds(&fx), ["resolved"]);
+        assert_eq!(
+            session(&st).resolved,
+            Some(Resolved {
+                at: 3,
+                wrapping_up: false
+            })
+        );
+        let relayed = format!(
+            "<channel source=\"plugin:ccdash:ccdash\">\n{}\n</channel>",
+            wrap_up::PROMPT
+        );
+        hook(&mut st, 4, "UserPromptSubmit", json!({ "prompt": relayed }));
+        assert!(session(&st).resolved.unwrap().wrapping_up);
+        let fx = hook(
+            &mut st,
+            5,
+            "Stop",
+            json!({"last_assistant_message": "Recorded."}),
+        );
+        assert_eq!(fx.close, [SID]);
+        assert_eq!(
+            session(&st).activity,
+            Activity::Idle,
+            "nobody's turn while it closes"
+        );
+        agents(&mut st, 30_000, "interactive", "waiting");
+        assert_eq!(
+            session(&st).activity,
+            Activity::Idle,
+            "the poll leaves it be"
+        );
+
+        let mut fx = Effects::default();
+        st.close_failed(SID, "process 1 is no longer Claude Code", 31_000, &mut fx);
+        let s = session(&st);
+        assert_eq!((s.activity, s.resolved), (Activity::YourTurn, None));
+        assert!(
+            s.waiting_for
+                .as_deref()
+                .unwrap()
+                .contains("closing it failed")
+        );
+    }
+
+    #[test]
+    fn a_resolved_mark_ends_with_a_typed_prompt_a_failed_turn_or_keep_open() {
+        let mut st = state();
+        hook(&mut st, 1, "UserPromptSubmit", json!({"prompt": "go"}));
+        st.mark_resolved(SID, 2, &mut Effects::default());
+        let fx = hook(&mut st, 3, "Stop", json!({}));
+        assert!(
+            fx.close.is_empty(),
+            "the turn it was resolved in is not the wrap-up"
+        );
+        assert_eq!(session(&st).activity, Activity::YourTurn);
+        hook(
+            &mut st,
+            4,
+            "UserPromptSubmit",
+            json!({"prompt": "one more"}),
+        );
+        assert_eq!(session(&st).resolved, None, "the owner typed on");
+
+        st.mark_resolved(SID, 5, &mut Effects::default());
+        let relayed = format!(
+            "<channel source=\"ccdash\">\n{}\n</channel>",
+            wrap_up::PROMPT
+        );
+        hook(&mut st, 6, "UserPromptSubmit", json!({ "prompt": relayed }));
+        let fx = hook(&mut st, 7, "StopFailure", json!({"error": "overloaded"}));
+        assert!(fx.close.is_empty());
+        assert_eq!(session(&st).resolved, None, "a failed wrap-up stays open");
+
+        st.mark_resolved(SID, 8, &mut Effects::default());
+        let mut fx = Effects::default();
+        assert!(st.keep_open(SID, 9, &mut fx));
+        assert_eq!(kinds(&fx), ["resolved"]);
+        assert_eq!(session(&st).resolved, None);
+        assert!(!st.keep_open(SID, 10, &mut Effects::default()));
+        st.close_failed(SID, "x", 11, &mut Effects::default());
+        assert_eq!(
+            session(&st).waiting_for.as_deref(),
+            Some("error: overloaded")
+        );
     }
 
     #[test]

@@ -64,7 +64,7 @@ open would split it. The hub knows where each session is open:
   shows a warning first.
 - The hub refuses that machine's writes to the session's files (a blocked
   prompt still writes bookkeeping lines).
-- Stop the session there (its page's **Stop**, or **Forget** when that
+- End the session there (its **Kill**, or **Forget** when that
   machine is offline), then send the prompt again. If the other machine
   added to the session after it was opened here, the hook asks you to quit
   and resume it, to load the whole conversation.

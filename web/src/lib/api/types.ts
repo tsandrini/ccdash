@@ -113,6 +113,23 @@ input: Array<[string, string]>,
  */
 always: string | null, } | { "kind": "question", questions: Array<Question>, } | { "kind": "plan", plan: string, });
 
+/**
+ * A session that wrote a note.
+ */
+export type Author = { session: string, 
+/**
+ * Unknown when the hub never saw the session.
+ */
+host: string | null, 
+/**
+ * Its title, else its name or id prefix.
+ */
+label: string, 
+/**
+ * The session still runs.
+ */
+live: boolean, };
+
 export type Bucket = { 
 /**
  * Local midnight (or the hour), as a timestamp.
@@ -212,6 +229,27 @@ export type Doc = { hot: boolean, workspace: string, slug: string, kind: NoteKin
 issue: string | null, excerpt: string, };
 
 export type EditUse = { language: string, accepted: number, rejected: number, };
+
+/**
+ * A progress entry with what the timeline shows around it.
+ */
+export type Entry = { 
+/**
+ * When it was logged (an edit moves `updated_at`, not this).
+ */
+logged_at: number, 
+/**
+ * The issue it is on: its title and status while the note exists.
+ */
+on: LinkRef | null, 
+/**
+ * The session that logged it; none when the owner did, or an import.
+ */
+by: Author | null, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
+/**
+ * The issue a progress entry is on.
+ */
+issue: string | null, excerpt: string, };
 
 export type Exchange = { 
 /**
@@ -599,7 +637,7 @@ docs: Array<Doc>,
 /**
  * Newest first.
  */
-progress: Array<Card>, 
+progress: Array<Entry>, 
 /**
  * Active memories first, then the flagged ones; by recalls within.
  */
@@ -651,6 +689,20 @@ export type Rename = { title: string, };
 export type Reply = { text: string, };
 
 export type Resolve = { keep: Keep, };
+
+/**
+ * A session the owner marked resolved from the panel.
+ */
+export type Resolved = { 
+/**
+ * When the owner did.
+ */
+at: number, 
+/**
+ * The wrap-up prompt reached Claude: the session closes when this
+ * turn ends.
+ */
+wrapping_up: boolean, };
 
 /**
  * CPU and memory of a session's process tree (Claude, its MCP servers and
@@ -787,7 +839,11 @@ inbox: Array<Message>,
 /**
  * What the session says it is working on.
  */
-claim: Claim | null, resources: Resources | null, turn: Turn | null, tasks: Array<Task>, subagents: Array<Subagent>, started_at: number, 
+claim: Claim | null, 
+/**
+ * The owner marked it resolved: Claude wraps up, then the hub closes it.
+ */
+resolved: Resolved | null, resources: Resources | null, turn: Turn | null, tasks: Array<Task>, subagents: Array<Subagent>, started_at: number, 
 /**
  * When this host's process opened the session (started or resumed
  * it); who opened it first holds it when two hosts have it open.

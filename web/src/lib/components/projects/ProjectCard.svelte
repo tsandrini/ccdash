@@ -65,7 +65,7 @@
 			class="flex flex-col gap-0.5 text-left text-xs hover:underline"
 			onclick={() => notePanel.show(ws, last.slug)}
 		>
-			<span class="text-muted-foreground">Last progress · {fmtStamp(last.updated_at)}</span>
+			<span class="text-muted-foreground">Last progress · {fmtStamp(last.logged_at)}</span>
 			<span class="line-clamp-2">{last.title}</span>
 		</button>
 	{/if}

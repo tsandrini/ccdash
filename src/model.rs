@@ -7,7 +7,8 @@ use ts_rs::TS;
 #[ts(export_to = "types.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Activity {
-    /// Started, no prompt yet.
+    /// Started, no prompt yet; or resolved, its wrap-up done, while the
+    /// hub closes it.
     Idle,
     Working,
     /// Blocked on a permission prompt.
@@ -228,6 +229,17 @@ pub struct ScopedLimit {
     pub read_at: i64,
 }
 
+/// A session the owner marked resolved from the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub struct Resolved {
+    /// When the owner did.
+    pub at: i64,
+    /// The wrap-up prompt reached Claude: the session closes when this
+    /// turn ends.
+    pub wrapping_up: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export_to = "types.ts")]
 pub struct Session {
@@ -292,6 +304,9 @@ pub struct Session {
     /// What the session says it is working on.
     #[serde(default)]
     pub claim: Option<Claim>,
+    /// The owner marked it resolved: Claude wraps up, then the hub closes it.
+    #[serde(default)]
+    pub resolved: Option<Resolved>,
     pub resources: Option<Resources>,
     pub turn: Option<Turn>,
     pub tasks: Vec<Task>,
@@ -344,6 +359,7 @@ impl Session {
             outbox: Vec::new(),
             inbox: Vec::new(),
             claim: None,
+            resolved: None,
             resources: None,
             turn: None,
             tasks: Vec::new(),

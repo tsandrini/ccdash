@@ -7,7 +7,7 @@
 	import Grid3x3Icon from '@lucide/svelte/icons/grid-3x3';
 	import PlayIcon from '@lucide/svelte/icons/play';
 	import PlusIcon from '@lucide/svelte/icons/plus';
-	import type { Card, Doc, Issue } from '#lib/api/types.js';
+	import type { Card, Doc, Entry, Issue } from '#lib/api/types.js';
 	import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
 	import * as Tabs from '#lib/components/ui/tabs/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
@@ -64,7 +64,7 @@
 			.sort((a: Doc, b: Doc) => Number(b.hot) - Number(a.hot) || b.updated_at - a.updated_at)
 	);
 	const progress = $derived(
-		parts.flatMap((p) => p.progress).sort((a: Card, b: Card) => b.updated_at - a.updated_at)
+		parts.flatMap((p) => p.progress).sort((a: Entry, b: Entry) => b.logged_at - a.logged_at)
 	);
 	const memories = $derived(
 		parts

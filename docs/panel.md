@@ -15,14 +15,17 @@ links can be shared and the back button works.
 ## 1. Now and Sessions
 
 - **Now** lists what needs you, with the answer inline (permission prompts,
-  questions, plans, sessions on your turn with a quick reply), then what is
-  working, the hosts with their link state, the account limits and the last
-  progress entries. **Start a session** is here ([sessions](sessions.md)).
+  questions, plans, sessions on your turn with a quick reply) and
+  **Resolved** and **Kill** at hand, then what is working, the hosts with
+  their link state, the account limits and the last progress entries.
+  **Start a session** is here ([sessions](sessions.md)).
 - **Sessions** groups every session: those that need you, then working,
   parked and idle, then background ones (which show the session that
   started them and "Finished" instead of "Your turn").
 - A session left on your turn for an hour is **parked**: most likely done,
   it no longer counts as needing you.
+- Every session card has an **Actions** menu: Open on, Resolved, Keep open,
+  Continue, Kill, Forget, whichever apply ([sessions](sessions.md)).
 
 ## 2. A session's page
 
@@ -46,8 +49,9 @@ Code delivers it again on its own.
 
 Open prompts are pinned above a composer that sends a turn through the
 channel or leaves a note for the next prompt; it walks the prompt history,
-inserts `[[note]]` links and keeps drafts. The title renames in place; the
-page also offers **Stop**, **Continue**, **Open on** and **Forget**
+inserts `[[note]]` links and keeps drafts. The title renames in place;
+**Open on** and **Resolved** sit beside it, the other actions in its
+**Actions** menu, **Continue** at the foot once it ended
 ([sessions](sessions.md)).
 
 ## 3. Projects
@@ -55,6 +59,12 @@ page also offers **Stop**, **Continue**, **Open on** and **Forget**
 Each workspace's projects with their board (open issues), live sessions,
 progress, documents, memories and the note graph, and a reader and editor
 for every note ([knowledge](knowledge.md)).
+
+**Progress** is a timeline, newest day first (with its entries, issues and
+sessions counted): each entry with its time, title and first lines, the
+issue it is on and whether that is open or closed now, the session that
+logged it (a link, with its host) and the project. **All of it** unfolds
+the whole entry in place.
 
 ## 4. History and Analytics
 

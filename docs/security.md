@@ -31,9 +31,9 @@ token minted for that one device: good for an hour until the link is
 opened, then for as long as the device keeps it.
 
 Settings › Devices lists them with their browser and last use; rename one
-in place, or revoke it to sign it out at its next request and end its push
-notifications. A device still on the bootstrap token sees "shared token"
-there and can take one of its own.
+with its pencil, or revoke it to sign it out at its next request and end
+its push notifications. A device still on the bootstrap token sees "shared
+token" there and can take one of its own.
 
 ## 3. What reaches the hub
 
