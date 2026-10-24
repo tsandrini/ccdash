@@ -22,7 +22,7 @@ use crate::{
     model::{Activity, Kind, Session, Stamped, Turn},
     paths, push,
     state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
-    tokens,
+    task_notification, tokens,
     util::{now_ms, truncate},
     workspace::Workspaces,
 };
@@ -211,6 +211,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(claims::SCHEMA)?;
     conn.execute_batch(crate::sync::hub::SCHEMA)?;
     migrate(&conn)?;
+    rewrite(&conn)?;
     Ok(conn)
 }
 
@@ -401,6 +402,23 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites of stored data, each run once: `user_version` counts the done.
+fn rewrite(conn: &Connection) -> Result<()> {
+    let done: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if done < 1 {
+        let tx = conn.unchecked_transaction()?;
+        // Task notifications came in as prompts before they had a kind.
+        tx.execute(
+            "UPDATE events SET kind = ?1 WHERE kind = 'prompt'
+                AND ltrim(json_extract(data, '$.text'), char(9, 10, 13, 32)) LIKE '<task-notification>%'",
+            [task_notification::KIND],
+        )?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Interactive => "interactive",
@@ -563,7 +581,7 @@ pub fn ended_session(
 /// Rebuilds the progress of a session's last turn from its events.
 fn last_turn(conn: &Connection, session: &str) -> Result<Option<Turn>> {
     let started_at: Option<i64> = conn.query_row(
-        "SELECT max(ts) FROM events WHERE session = ?1 AND kind = 'prompt'",
+        "SELECT max(ts) FROM events WHERE session = ?1 AND kind IN ('prompt', 'task_notification')",
         [session],
         |r| r.get(0),
     )?;
@@ -610,6 +628,42 @@ mod tests {
     use super::*;
     use crate::model::TaskStatus;
     use serde_json::json;
+
+    #[test]
+    fn task_notifications_stored_as_prompts_get_their_kind_once() {
+        let dir = std::env::temp_dir().join(format!("ccdash-rewrite-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("t.db");
+        let conn = open_writer(&path).unwrap();
+        for text in [
+            "\n<task-notification>\n<summary>x</summary>",
+            "fix <task-notification> parsing",
+        ] {
+            conn.execute(
+                "INSERT INTO events VALUES (1, 'h', 's', 'prompt', ?1)",
+                [json!({ "text": text }).to_string()],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(conn);
+
+        let conn = open_writer(&path).unwrap();
+        let kinds: Vec<String> = conn
+            .prepare("SELECT kind FROM events ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(kinds, [task_notification::KIND, "prompt"]);
+        let done: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(done, 1);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn writes_and_restores() {

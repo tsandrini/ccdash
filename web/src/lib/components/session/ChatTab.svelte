@@ -1,7 +1,7 @@
 <script lang="ts">
-	// The exchanges (prompt, grouped steps, Claude's text, subagents,
-	// compactions), messages between sessions at their time, and the live
-	// block for what is happening now.
+	// The exchanges (your prompt or a background task's notification,
+	// grouped steps, Claude's text, subagents, compactions), messages between
+	// sessions at their time, and the live block for what is happening now.
 	import type { Item, Session } from '#lib/api/types.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { fmtStamp } from '#lib/format.js';
@@ -10,6 +10,7 @@
 	import LiveBlock from './LiveBlock.svelte';
 	import MessageItem from './MessageItem.svelte';
 	import Steps from './Steps.svelte';
+	import TaskNote from './TaskNote.svelte';
 	import type { Convo } from './convo.svelte.js';
 
 	const MESSAGE_SLACK_MS = 3000;
@@ -117,6 +118,8 @@
 							>{fmtStamp(ex.at)}{ex.via === 'ccdash' ? ' · sent from ccdash' : ''}</time
 						>
 					</div>
+				{:else if ex.task}
+					<TaskNote task={ex.task} at={ex.at} />
 				{/if}
 				{#each parts(ex.items, ex.omitted) as part, i (part.key)}
 					{#if part.kind === 'steps'}

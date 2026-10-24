@@ -108,7 +108,8 @@ pub fn anatomy(sessions: &[SessionEvents], clock: &Clock, buckets: &mut [Bucket]
         for ev in &session.events {
             let ts = ev.ts;
             match ev.kind.as_str() {
-                "prompt" => {
+                // NOTE: a task notification is no prompt of yours, but Claude's turn all the same
+                "prompt" | "task_notification" => {
                     if let Some(t) = turn.take() {
                         out.close(t, ts, clock, buckets);
                     }
@@ -328,5 +329,30 @@ mod tests {
         assert_eq!(a.commands[0].failed, 1);
         assert_eq!(a.tools[0].name, "Read");
         assert_eq!(a.slowest.len(), 3);
+    }
+
+    #[test]
+    fn a_task_notification_starts_a_turn() {
+        let clock = Clock {
+            offset_ms: 0,
+            bucket_ms: 1_000_000,
+            first: 0,
+            count: 1,
+        };
+        let mut buckets = vec![Bucket::default()];
+        let session = SessionEvents {
+            id: "a".into(),
+            host: "h".into(),
+            cwd: "/w".into(),
+            label: "a".into(),
+            events: vec![
+                ev(0, "prompt", json!({})),
+                ev(10, "reply", json!({})),
+                ev(100, "task_notification", json!({})),
+                ev(130, "reply", json!({})),
+            ],
+        };
+        let a = anatomy(&[session], &clock, &mut buckets);
+        assert_eq!((a.turns, a.claude_ms), (2, 40));
     }
 }

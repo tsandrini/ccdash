@@ -13,8 +13,10 @@ use crate::model::{Activity, PARKED_AFTER_MS};
 /// `[from, to, activity]`, as in history lanes.
 pub type Segment = (i64, i64, Activity);
 
-/// Event kinds that can end a wait, for SQL `IN (…)`.
-pub const CLOSERS: &str = "'prompt', 'tool', 'permission', 'reply', 'error', 'end'";
+/// Event kinds that can end a wait, for SQL `IN (…)`; a task notification
+/// is Claude carrying on.
+pub const CLOSERS: &str =
+    "'prompt', 'task_notification', 'tool', 'permission', 'reply', 'error', 'end'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[ts(export_to = "types.ts", rename = "WaitOutcome")]
@@ -371,6 +373,15 @@ mod tests {
         assert_eq!(segments[1], (100, 300, Idle));
         assert_eq!(segments[3], (320, 700, Idle));
         assert_eq!(segments[4], (700, 800, YourTurn));
+    }
+
+    #[test]
+    fn a_task_notification_resumes_rather_than_answers() {
+        let conn = db();
+        let mut segments = vec![(0, 100, Working), (100, 150, YourTurn)];
+        let closes = [Close::new(crate::task_notification::KIND, 150, None)];
+        let waits = run(&conn, &mut segments, &closes, (0, 150), false, 0);
+        assert_eq!(waits[0].outcome, Outcome::Resumed);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // What the panel derives from a session: its shown state, grouping,
 // labels, and the signature that tells the page to reload the chat.
 
-import type { Activity, Session } from './api/types';
+import type { Activity, Session, TaskNotification } from './api/types';
 
 export type Shown = Activity | 'finished';
 
@@ -76,10 +76,24 @@ export function claimPaths(s: Session): string[] {
 	);
 }
 
+/** What reported, by `TaskNotification.source`. */
+export const TASK_SOURCE: Record<string, string> = {
+	agent: 'Subagent',
+	shell: 'Background command',
+	monitor: 'Monitor',
+	mcp: 'MCP task',
+	workflow: 'Workflow'
+};
+
+/** A task notification in a few words: what reported and its name. */
+export const taskTitle = (t: TaskNotification) =>
+	`${TASK_SOURCE[t.source] ?? 'Background task'}: ${t.name ?? t.summary}`;
+
 /** Changes that add or alter conversation items. */
 export const signature = (s: Session) =>
 	[
 		s.activity,
+		s.turn?.started_at,
 		s.prompt?.at,
 		s.reply?.at,
 		s.turn?.tools,

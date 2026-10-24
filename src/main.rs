@@ -28,6 +28,7 @@ mod push;
 mod state;
 mod store;
 mod sync;
+mod task_notification;
 mod tokens;
 mod usage;
 mod util;

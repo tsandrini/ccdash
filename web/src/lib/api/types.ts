@@ -200,7 +200,12 @@ prompt: string | null,
 /**
  * `"ccdash"` for prompts sent from the dashboard.
  */
-via?: string, items: Array<Item>, 
+via?: string, 
+/**
+ * What started the exchange instead of a prompt: a background task
+ * reporting to Claude.
+ */
+task?: TaskNotification, items: Array<Item>, 
 /**
  * Oldest tool calls left out of `items` in very long exchanges.
  */
@@ -959,6 +964,43 @@ export type Task = { id: string, subject: string,
  * Present-tense label shown while the task is in progress.
  */
 active_form: string | null, status: TaskStatus, };
+
+/**
+ * A task notification as the panel shows it.
+ */
+export type TaskNotification = { 
+/**
+ * What reported: `agent` (a subagent), `shell` (a background command),
+ * `monitor`, `mcp` (an MCP task), `workflow`, else `task`.
+ */
+source: string, 
+/**
+ * Its name as Claude Code quotes it: the subagent's, the command's or
+ * the monitor's description; an MCP task's tool.
+ */
+name: string | null, 
+/**
+ * `completed`, `failed`, `stopped` or `killed`; none for a monitor's
+ * event.
+ */
+status: string | null, 
+/**
+ * Claude Code's summary after the name (`finished`, `completed (exit
+ * code 0)`); all of it when it names nothing.
+ */
+summary: string, 
+/**
+ * The subagent's report or the MCP task's result, as HTML.
+ */
+html: string | null, 
+/**
+ * A monitor's event.
+ */
+event: string | null, 
+/**
+ * A subagent's tool calls and run time.
+ */
+tools: number | null, ms: number | null, };
 
 export type TaskStatus = "pending" | "in_progress" | "completed";
 

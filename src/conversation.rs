@@ -1,6 +1,6 @@
 //! A session's conversation rebuilt from hook events: one exchange per
-//! prompt, holding the tool calls, subagents, compactions and replies that
-//! followed it.
+//! prompt or task notification, holding the tool calls, subagents,
+//! compactions and replies that followed it.
 
 use anyhow::Result;
 use rusqlite::{Connection, named_params, params};
@@ -12,6 +12,7 @@ use crate::{
     history::{Transition, segments},
     markdown,
     model::Activity,
+    task_notification::{self, TaskNotification},
     waits::{self, CLOSERS, Close, Edges},
     workspace::IN_SCOPE,
 };
@@ -39,6 +40,11 @@ pub struct Exchange {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub via: Option<String>,
+    /// What started the exchange instead of a prompt: a background task
+    /// reporting to Claude.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub task: Option<TaskNotification>,
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
     pub omitted: u32,
@@ -55,6 +61,7 @@ impl Exchange {
             at,
             prompt,
             via: None,
+            task: None,
             items: Vec::new(),
             omitted: 0,
             last_message: None,
@@ -191,7 +198,8 @@ pub fn conversation(
     let before = before.unwrap_or(i64::MAX);
     let prompts: Vec<i64> = conn
         .prepare_cached(
-            "SELECT ts FROM events WHERE session = ?1 AND kind = 'prompt' AND ts < ?2
+            "SELECT ts FROM events
+                WHERE session = ?1 AND kind IN ('prompt', 'task_notification') AND ts < ?2
                 ORDER BY ts DESC LIMIT ?3",
         )?
         .query_map(params![session, before, i64::try_from(limit)? + 1], |r| {
@@ -222,6 +230,14 @@ pub fn conversation(
         if kind == "prompt" {
             let mut exchange = Exchange::new(id, at, Some(text(&data, "text")));
             exchange.via = data.get("via").and_then(Value::as_str).map(str::to_owned);
+            exchanges.push(exchange);
+        } else if kind == task_notification::KIND {
+            let raw = text(&data, "text");
+            let mut exchange = Exchange::new(id, at, None);
+            match task_notification::parse(&raw) {
+                Some(task) => exchange.task = Some(task),
+                None => exchange.prompt = Some(raw),
+            }
             exchanges.push(exchange);
         } else if let Some(item) = item(id, at, &kind, &data) {
             if exchanges.is_empty() {
@@ -651,6 +667,31 @@ mod tests {
             })
             .collect();
         assert_eq!((c.exchanges[0].id, ids.as_slice()), (1, [2, 3].as_slice()));
+    }
+
+    #[test]
+    fn a_task_notification_starts_an_exchange_and_a_page() {
+        use serde_json::json;
+        let conn = db();
+        event(&conn, 1, "prompt", json!({"text": "go"}));
+        event(&conn, 2, "reply", json!({"text": "started it"}));
+        let note = "<task-notification>\n<status>completed</status>\n<summary>Agent \"Map it\" finished</summary>\n</task-notification>";
+        event(&conn, 3, task_notification::KIND, json!({ "text": note }));
+        event(&conn, 4, "reply", json!({"text": "it is mapped"}));
+
+        let newest = conversation(&conn, "s", None, 1).unwrap();
+        assert!(newest.more);
+        let ex = &newest.exchanges[0];
+        assert_eq!((ex.id, ex.at, ex.prompt.as_deref()), (3, 3, None));
+        let task = ex.task.as_ref().unwrap();
+        assert_eq!(
+            (task.name.as_deref(), task.summary.as_str()),
+            (Some("Map it"), "finished")
+        );
+        assert_eq!(ex.items.len(), 1);
+        let json = serde_json::to_value(&conversation(&conn, "s", None, 10).unwrap().exchanges[0])
+            .unwrap();
+        assert!(json.get("task").is_none(), "absent on a prompt's exchange");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::{
         Resources, ScopedLimit, Session, Stamped, Subagent, Task, TaskStatus, ToolRun, Turn,
         WindowRef,
     },
+    task_notification,
     util::{tail, truncate},
     wire::{Envelope, Source},
     workspace::Workspaces,
@@ -462,15 +463,19 @@ impl State {
             }
             "UserPromptSubmit" => {
                 let raw = str_of(p, "prompt").unwrap_or_default();
-                let relayed = channel_text(raw);
+                // NOTE: Claude Code's own message, not one you typed: no prompt, no window
+                let notice = task_notification::is(raw);
+                let relayed = if notice { None } else { channel_text(raw) };
                 let text = relayed.as_deref().unwrap_or(raw);
                 if relayed.is_some() {
                     s.outbox.clear();
                 }
-                s.prompt = Some(Stamped {
-                    at: ts,
-                    text: truncate(text, PREVIEW_LEN),
-                });
+                if !notice {
+                    s.prompt = Some(Stamped {
+                        at: ts,
+                        text: truncate(text, PREVIEW_LEN),
+                    });
+                }
                 s.message = None;
                 s.tool = None;
                 s.waiting_for = None;
@@ -488,12 +493,16 @@ impl State {
                     title_changed = true;
                 }
                 set_activity(s, Activity::Working, ts, store);
-                let data = match relayed {
-                    Some(_) => json!({ "text": text, "via": "ccdash" }),
-                    None => json!({ "text": text }),
+                let (kind, data) = match relayed {
+                    _ if notice => (
+                        task_notification::KIND,
+                        json!({ "text": truncate(raw, MESSAGE_MAX) }),
+                    ),
+                    Some(_) => ("prompt", json!({ "text": text, "via": "ccdash" })),
+                    None => ("prompt", json!({ "text": text })),
                 };
-                record(store, ts, id, "prompt", data);
-                focus_candidate = true;
+                record(store, ts, id, kind, data);
+                focus_candidate = !notice;
             }
             "PreToolUse" => {
                 let run = ToolRun {
@@ -2551,6 +2560,31 @@ mod tests {
 
         st.niri(NiriEvent::WindowClosed(7), &mut fx);
         assert!(session(&st).window.is_none());
+    }
+
+    #[test]
+    fn a_task_notification_is_no_prompt_of_yours() {
+        let mut st = state();
+        let mut fx = Effects::default();
+        st.niri(
+            NiriEvent::Windows(vec![window(7, "✳ Claude Code", true)]),
+            &mut fx,
+        );
+        hook(&mut st, 1, "Stop", json!({}));
+        let note = "<task-notification>\n<status>completed</status>\n<summary>Agent \"Map it\" finished</summary>\n</task-notification>";
+        let fx = hook(&mut st, 2, "UserPromptSubmit", json!({ "prompt": note }));
+        agents(&mut st, 3, "interactive", "busy");
+        let s = session(&st);
+        assert!(s.prompt.is_none() && s.window.is_none());
+        assert_eq!(s.activity, Activity::Working);
+        assert_eq!(s.turn.as_ref().map(|t| t.started_at), Some(2));
+        assert!(fx.store.iter().any(|m| matches!(m,
+            StoreMsg::Event { kind: task_notification::KIND, data, .. } if data["text"] == note)));
+        assert!(!kinds(&fx).contains(&"prompt"));
+
+        hook(&mut st, 4, "UserPromptSubmit", json!({ "prompt": "typed" }));
+        agents(&mut st, 5, "interactive", "busy");
+        assert_eq!(session(&st).window.as_ref().map(|w| w.id), Some(7));
     }
 
     #[test]

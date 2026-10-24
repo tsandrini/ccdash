@@ -45,6 +45,8 @@
 	--good: #0ca30c;
 	--warning: #fab219;
 	--critical: #d03b3b;
+	/* what background tasks report to Claude (task notifications) */
+	--task: var(--series-5);
 	/* note kinds: three categorical hues (all pairs distinct for colour-blind
 	readers); progress is the neutral fold and differs by shape too */
 	--kind-memory: #2a78d6;
@@ -218,6 +220,7 @@ colours stay the validated ones. */
 	--color-good: var(--good);
 	--color-warning: var(--warning);
 	--color-critical: var(--critical);
+	--color-task: var(--task);
 	--color-kind-memory: var(--kind-memory);
 	--color-kind-issue: var(--kind-issue);
 	--color-kind-doc: var(--kind-doc);

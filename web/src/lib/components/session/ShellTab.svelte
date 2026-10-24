@@ -6,6 +6,7 @@
 	import type { Item } from '#lib/api/types.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { fmtDuration, fmtStamp, fmtTime, known } from '#lib/format.js';
+	import { taskTitle } from '#lib/session.js';
 	import type { Convo } from './convo.svelte.js';
 
 	let { convo }: { convo: Convo } = $props();
@@ -17,7 +18,7 @@
 			.map((ex) => ({
 				id: ex.id,
 				at: ex.at,
-				prompt: ex.prompt,
+				prompt: ex.prompt ?? (ex.task ? taskTitle(ex.task) : null),
 				calls: ex.items.filter((i): i is Call => i.kind === 'tool' && i.name === 'Bash')
 			}))
 			.filter((g) => g.calls.length)
