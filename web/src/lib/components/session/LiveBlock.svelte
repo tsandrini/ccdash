@@ -32,7 +32,8 @@
 </script>
 
 {#if s.activity !== 'gone' && s.outbox?.length}
-	{#each s.outbox as m (m.at)}
+	<!-- NOTE: by position: two sends can share a millisecond; it is a queue -->
+	{#each s.outbox as m, i (i)}
 		{@const stuck = !busy && live.now - m.at > UNDELIVERED_MS}
 		<div class="flex flex-col items-end gap-1">
 			<div

@@ -18,8 +18,8 @@
 	let { convo, session: s }: { convo: Convo; session: Session } = $props();
 
 	type Part =
-		| { kind: 'steps'; at: number; items: Item[]; omitted: number }
-		| { kind: 'item'; at: number; item: Item };
+		| { kind: 'steps'; key: string; items: Item[]; omitted: number }
+		| { kind: 'item'; key: string; item: Item };
 
 	/** Steps grouped into runs between Claude's messages. */
 	function parts(items: Item[], omitted: number): Part[] {
@@ -28,7 +28,7 @@
 		let left = omitted;
 		const flush = () => {
 			if (!run.length) return;
-			out.push({ kind: 'steps', at: run[0].at, items: run, omitted: left });
+			out.push({ kind: 'steps', key: `s${run[0].id}`, items: run, omitted: left });
 			run = [];
 			left = 0;
 		};
@@ -38,7 +38,7 @@
 				continue;
 			}
 			flush();
-			out.push({ kind: 'item', at: item.at, item });
+			out.push({ kind: 'item', key: `i${item.id}`, item });
 		}
 		flush();
 		return out;
@@ -68,13 +68,13 @@
 		};
 		for (const ex of convo.exchanges) {
 			flushBefore(ex.at);
-			out.push({ kind: 'exchange', key: `e${ex.at}`, at: ex.at, ex });
+			out.push({ kind: 'exchange', key: `e${ex.id}`, at: ex.at, ex });
 		}
 		flushBefore(Infinity);
 		return out;
 	});
 
-	const lastReply = $derived(convo.lastReplyAt);
+	const lastReply = $derived(convo.lastReplyId);
 	const messageShown = $derived(
 		Boolean(
 			s.message &&
@@ -83,7 +83,7 @@
 			)
 		)
 	);
-	const lastExchangeAt = $derived(convo.exchanges[convo.exchanges.length - 1]?.at);
+	const lastExchange = $derived(convo.exchanges[convo.exchanges.length - 1]?.id);
 </script>
 
 <div class="flex flex-col gap-3">
@@ -118,17 +118,17 @@
 						>
 					</div>
 				{/if}
-				{#each parts(ex.items, ex.omitted) as part, i (part.at + part.kind + i)}
+				{#each parts(ex.items, ex.omitted) as part, i (part.key)}
 					{#if part.kind === 'steps'}
 						<Steps
 							items={part.items}
 							omitted={part.omitted}
-							open={ex.at === lastExchangeAt &&
+							open={ex.id === lastExchange &&
 								busy(s) &&
 								i === parts(ex.items, ex.omitted).length - 1}
 						/>
 					{:else}
-						<ConvItem item={part.item} isLastReply={part.item.at === lastReply} />
+						<ConvItem item={part.item} isLastReply={part.item.id === lastReply} />
 					{/if}
 				{/each}
 			</section>

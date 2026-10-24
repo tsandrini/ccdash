@@ -187,7 +187,12 @@ issue: string | null, excerpt: string, };
 
 export type EditUse = { language: string, accepted: number, rejected: number, };
 
-export type Exchange = { at: number, 
+export type Exchange = { 
+/**
+ * The prompt's event id (the first event's before any prompt): the
+ * exchange's identity, as `at` may repeat.
+ */
+id: number, at: number, 
 /**
  * None for events that came before the first prompt in the store.
  */
@@ -294,7 +299,11 @@ working: Working | null, last_progress: Card | null, closed_at: number | null, w
  */
 issue: string | null, excerpt: string, };
 
-export type Item = { "kind": "tool", at: number, name: string, summary: string, ms: number | null, ok: boolean, 
+/**
+ * Every variant's `id` is its event's id: unique and stable, unlike `at`
+ * (the events of parallel tool calls can share a millisecond).
+ */
+export type Item = { "kind": "tool", id: number, at: number, name: string, summary: string, ms: number | null, ok: boolean, 
 /**
  * A Bash call's whole command (the summary is its first line).
  */
@@ -302,7 +311,7 @@ command?: string,
 /**
  * A Bash call's output, or a failed call's error, capped by the hub.
  */
-output?: string, } | { "kind": "permission", at: number, tool: string, summary: string, } | { "kind": "answered", at: number, tool: string, action: string, via: string, } | { "kind": "message", at: number, html: string, } | { "kind": "reply", at: number, html: string, } | { "kind": "error", at: number, error: string, } | { "kind": "subagent", at: number, agent_type: string, description: string | null, ms: number | null, tools: number | null, html: string, } | { "kind": "compact", at: number, trigger: string | null, html: string, } | { "kind": "task", at: number, subject: string, status: string, } | { "kind": "start", at: number, source: string, } | { "kind": "end", at: number, reason: string, };
+output?: string, } | { "kind": "permission", id: number, at: number, tool: string, summary: string, } | { "kind": "answered", id: number, at: number, tool: string, action: string, via: string, } | { "kind": "message", id: number, at: number, html: string, } | { "kind": "reply", id: number, at: number, html: string, } | { "kind": "error", id: number, at: number, error: string, } | { "kind": "subagent", id: number, at: number, agent_type: string, description: string | null, ms: number | null, tools: number | null, html: string, } | { "kind": "compact", id: number, at: number, trigger: string | null, html: string, } | { "kind": "task", id: number, at: number, subject: string, status: string, } | { "kind": "start", id: number, at: number, source: string, } | { "kind": "end", id: number, at: number, reason: string, };
 
 /**
  * Which version of a conflicted file stays.

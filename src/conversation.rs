@@ -29,6 +29,9 @@ pub struct Conversation {
 #[derive(Debug, Serialize, TS)]
 #[ts(export_to = "types.ts")]
 pub struct Exchange {
+    /// The prompt's event id (the first event's before any prompt): the
+    /// exchange's identity, as `at` may repeat.
+    pub id: i64,
     pub at: i64,
     /// None for events that came before the first prompt in the store.
     pub prompt: Option<String>,
@@ -46,8 +49,9 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    fn new(at: i64, prompt: Option<String>) -> Self {
+    fn new(id: i64, at: i64, prompt: Option<String>) -> Self {
         Self {
+            id,
             at,
             prompt,
             via: None,
@@ -75,9 +79,12 @@ impl Exchange {
 
 #[derive(Debug, PartialEq, Serialize, TS)]
 #[ts(export_to = "types.ts")]
+/// Every variant's `id` is its event's id: unique and stable, unlike `at`
+/// (the events of parallel tool calls can share a millisecond).
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Item {
     Tool {
+        id: i64,
         at: i64,
         name: String,
         summary: String,
@@ -93,12 +100,14 @@ pub enum Item {
         output: Option<String>,
     },
     Permission {
+        id: i64,
         at: i64,
         tool: String,
         summary: String,
     },
     /// A prompt answered from ccdash (`via`: `web` or `notification`).
     Answered {
+        id: i64,
         at: i64,
         tool: String,
         action: String,
@@ -106,18 +115,22 @@ pub enum Item {
     },
     /// Text Claude wrote during a turn (between tool calls).
     Message {
+        id: i64,
         at: i64,
         html: String,
     },
     Reply {
+        id: i64,
         at: i64,
         html: String,
     },
     Error {
+        id: i64,
         at: i64,
         error: String,
     },
     Subagent {
+        id: i64,
         at: i64,
         agent_type: String,
         description: Option<String>,
@@ -126,20 +139,24 @@ pub enum Item {
         html: String,
     },
     Compact {
+        id: i64,
         at: i64,
         trigger: Option<String>,
         html: String,
     },
     Task {
+        id: i64,
         at: i64,
         subject: String,
         status: String,
     },
     Start {
+        id: i64,
         at: i64,
         source: String,
     },
     End {
+        id: i64,
         at: i64,
         reason: String,
     },
@@ -185,7 +202,7 @@ pub fn conversation(
     let from = if more { prompts[limit - 1] } else { i64::MIN };
 
     let mut stmt = conn.prepare_cached(
-        "SELECT ts, kind, data FROM events
+        "SELECT rowid, ts, kind, data FROM events
             WHERE session = ?1 AND ts >= ?2 AND ts < ?3 AND kind != 'activity'
                 AND kind != 'notification'
             ORDER BY ts, rowid",
@@ -193,21 +210,22 @@ pub fn conversation(
     let rows = stmt.query_map(params![session, from, before], |r| {
         Ok((
             r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
+            r.get::<_, i64>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
         ))
     })?;
     let mut exchanges: Vec<Exchange> = Vec::new();
     for row in rows {
-        let (at, kind, data) = row?;
+        let (id, at, kind, data) = row?;
         let data: Value = serde_json::from_str(&data).unwrap_or_default();
         if kind == "prompt" {
-            let mut exchange = Exchange::new(at, Some(text(&data, "text")));
+            let mut exchange = Exchange::new(id, at, Some(text(&data, "text")));
             exchange.via = data.get("via").and_then(Value::as_str).map(str::to_owned);
             exchanges.push(exchange);
-        } else if let Some(item) = item(at, &kind, &data) {
+        } else if let Some(item) = item(id, at, &kind, &data) {
             if exchanges.is_empty() {
-                exchanges.push(Exchange::new(at, None));
+                exchanges.push(Exchange::new(id, at, None));
             }
             exchanges
                 .last_mut()
@@ -221,9 +239,10 @@ pub fn conversation(
     Ok(Conversation { exchanges, more })
 }
 
-fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
+fn item(id: i64, at: i64, kind: &str, data: &Value) -> Option<Item> {
     Some(match kind {
         "tool" => Item::Tool {
+            id,
             at,
             name: text(data, "name"),
             summary: text(data, "summary"),
@@ -233,17 +252,20 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
             output: data["output"].as_str().map(str::to_owned),
         },
         "permission" => Item::Permission {
+            id,
             at,
             tool: text(data, "tool"),
             summary: text(data, "summary"),
         },
         "answered" => Item::Answered {
+            id,
             at,
             tool: text(data, "tool"),
             action: text(data, "action"),
             via: text(data, "via"),
         },
         "message" => Item::Message {
+            id,
             at,
             html: markdown::render(&text(data, "text")),
         },
@@ -253,15 +275,18 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
                 return None;
             }
             Item::Reply {
+                id,
                 at,
                 html: markdown::render(&reply),
             }
         }
         "error" => Item::Error {
+            id,
             at,
             error: text(data, "error"),
         },
         "subagent" => Item::Subagent {
+            id,
             at,
             agent_type: text(data, "agent_type"),
             description: data["description"].as_str().map(str::to_owned),
@@ -270,20 +295,24 @@ fn item(at: i64, kind: &str, data: &Value) -> Option<Item> {
             html: markdown::render(&text(data, "text")),
         },
         "compact" => Item::Compact {
+            id,
             at,
             trigger: data["trigger"].as_str().map(str::to_owned),
             html: markdown::render(&text(data, "summary")),
         },
         "task" => Item::Task {
+            id,
             at,
             subject: text(data, "subject"),
             status: text(data, "status"),
         },
         "start" => Item::Start {
+            id,
             at,
             source: text(data, "source"),
         },
         "end" => Item::End {
+            id,
             at,
             reason: text(data, "reason"),
         },
@@ -540,6 +569,7 @@ mod tests {
         assert_eq!(
             all.exchanges[0].items,
             [Item::Start {
+                id: 1,
                 at: 1,
                 source: "startup".into()
             }]
@@ -549,6 +579,7 @@ mod tests {
         assert_eq!(
             all.exchanges[1].items[2],
             Item::Reply {
+                id: 6,
                 at: 5,
                 html: "<p><strong>done</strong></p>\n".into()
             }
@@ -598,6 +629,31 @@ mod tests {
     }
 
     #[test]
+    fn parallel_calls_in_one_millisecond_keep_their_own_ids() {
+        use serde_json::json;
+        let conn = db();
+        event(&conn, 1, "prompt", json!({"text": "go"}));
+        for summary in ["cat a", "cat b"] {
+            event(
+                &conn,
+                2,
+                "tool",
+                json!({"name": "Bash", "summary": summary, "ok": true}),
+            );
+        }
+        let c = conversation(&conn, "s", None, 10).unwrap();
+        let ids: Vec<i64> = c.exchanges[0]
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::Tool { id, at: 2, .. } => *id,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!((c.exchanges[0].id, ids.as_slice()), (1, [2, 3].as_slice()));
+    }
+
+    #[test]
     fn caps_tools_in_long_exchanges() {
         use serde_json::json;
         let conn = db();
@@ -631,6 +687,7 @@ mod tests {
         assert_eq!(
             c.exchanges[0].items[0],
             Item::Tool {
+                id: 2,
                 at: 2,
                 name: "Bash".into(),
                 summary: "make".into(),
@@ -643,6 +700,7 @@ mod tests {
         let json = serde_json::to_value(&c.exchanges[0].items[0]).unwrap();
         assert_eq!(json["output"], "Exit code 2");
         let json = serde_json::to_value(&Item::Tool {
+            id: 1,
             at: 1,
             name: "Read".into(),
             summary: "a".into(),

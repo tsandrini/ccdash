@@ -15,6 +15,7 @@
 	const groups = $derived(
 		convo.exchanges
 			.map((ex) => ({
+				id: ex.id,
 				at: ex.at,
 				prompt: ex.prompt,
 				calls: ex.items.filter((i): i is Call => i.kind === 'tool' && i.name === 'Bash')
@@ -28,7 +29,7 @@
 	async function copy(call: Call) {
 		const text = [call.command ?? call.summary, call.output ?? ''].filter(Boolean).join('\n');
 		await navigator.clipboard?.writeText(text);
-		copied = call.at;
+		copied = call.id;
 		setTimeout(() => (copied = null), 1500);
 	}
 </script>
@@ -50,12 +51,12 @@
 			started storing them.
 		</p>
 	{/if}
-	{#each groups as g (g.at)}
+	{#each groups as g (g.id)}
 		<section class="flex flex-col gap-1.5">
 			<p class="truncate text-xs text-muted-foreground" title={g.prompt ?? ''}>
 				{fmtStamp(g.at)}{g.prompt ? ` · ${g.prompt.split('\n')[0]}` : ''}
 			</p>
-			{#each g.calls as call (call.at)}
+			{#each g.calls as call (call.id)}
 				<div
 					class="group relative overflow-hidden rounded-md border bg-neutral-950 font-mono text-xs text-neutral-200 {call.ok
 						? ''
@@ -77,7 +78,7 @@
 							aria-label="Copy"
 							onclick={() => copy(call)}
 						>
-							{#if copied === call.at}<CheckIcon />{:else}<CopyIcon />{/if}
+							{#if copied === call.id}<CheckIcon />{:else}<CopyIcon />{/if}
 						</Button>
 					</div>
 					{#if call.output}

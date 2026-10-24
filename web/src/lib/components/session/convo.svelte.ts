@@ -86,11 +86,11 @@ export class Convo {
 		this.changed = { mode, n: this.changed.n + 1 };
 	}
 
-	/** When Claude last gave a final reply, to leave only that one unfolded. */
-	get lastReplyAt(): number | null {
+	/** Claude's last final reply, to leave only that one unfolded. */
+	get lastReplyId(): number | null {
 		for (let i = this.exchanges.length - 1; i >= 0; i--) {
 			const reply = this.exchanges[i].items.findLast((it) => it.kind === 'reply');
-			if (reply) return reply.at;
+			if (reply) return reply.id;
 		}
 		return null;
 	}

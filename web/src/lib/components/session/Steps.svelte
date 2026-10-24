@@ -73,7 +73,7 @@
 				>
 			</li>
 		{/if}
-		{#each shownItems as item (item.at + item.kind)}
+		{#each shownItems as item (item.id)}
 			<li class="flex items-start gap-2 {item.kind === 'tool' && !item.ok ? 'text-critical' : ''}">
 				<time class="shrink-0 text-muted-foreground tabular-nums">{fmtTime(item.at)}</time>
 				{#if item.kind === 'permission'}
