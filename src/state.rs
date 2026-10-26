@@ -133,6 +133,8 @@ pub enum StoreMsg {
         ended_at: Option<i64>,
         branch: Option<String>,
         launched: bool,
+        /// The explicit project (None leaves a stored one alone).
+        project: Option<String>,
     },
     /// A scoped limit read from `/usage`.
     Limit { ts: i64, limit: ScopedLimit },
@@ -178,6 +180,8 @@ pub struct Restored {
     pub branch: Option<String>,
     pub launched: bool,
     pub resolved: Option<Resolved>,
+    /// The explicit project, when one was set.
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -325,16 +329,48 @@ impl State {
             s.branch = s.branch.take().or(saved.branch);
             s.launched |= saved.launched;
             s.resolved = s.resolved.or(saved.resolved);
+            if !s.project_pinned
+                && let Some(project) = saved.project
+            {
+                s.project = Some(project);
+                s.project_pinned = true;
+            }
         }
     }
 
-    /// Flags the session as started from the panel; true when it is known.
-    pub fn set_launched(&mut self, id: &str, fx: &mut Effects) -> bool {
+    /// Pins the session's project (the launch, a `claim`, the panel), or
+    /// with None lets the directory decide again; true when it is known.
+    /// The caller checks the name against the known projects.
+    pub fn set_project(&mut self, id: &str, project: Option<String>, fx: &mut Effects) -> bool {
         let Some(s) = self.sessions.get_mut(id) else {
             return false;
         };
-        if !s.launched {
+        let (project, pinned) = match project {
+            Some(p) => (Some(p), true),
+            None => (self.workspaces.locate(&s.cwd).and_then(|(_, p)| p), false),
+        };
+        if s.project != project || s.project_pinned != pinned {
+            s.project = project;
+            s.project_pinned = pinned;
+            fx.store.push(session_row(s, None));
+            fx.touched.insert(id.to_owned());
+        }
+        true
+    }
+
+    /// Flags the session as started from the panel, under the launch's
+    /// project; true when it is known.
+    pub fn set_launched(&mut self, id: &str, project: Option<&str>, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        let pin = project.filter(|_| !s.project_pinned);
+        if !s.launched || pin.is_some() {
             s.launched = true;
+            if let Some(p) = pin {
+                s.project = Some(p.to_owned());
+                s.project_pinned = true;
+            }
             fx.store.push(session_row(s, None));
             fx.touched.insert(id.to_owned());
         }
@@ -417,10 +453,14 @@ impl State {
             && cwd != s.cwd
         {
             s.cwd = cwd.to_owned();
-            (s.workspace, s.project) = match self.workspaces.locate(cwd) {
+            let (workspace, project) = match self.workspaces.locate(cwd) {
                 Some((ws, project)) => (Some(ws), project),
                 None => (None, None),
             };
+            s.workspace = workspace;
+            if !s.project_pinned {
+                s.project = project;
+            }
         }
         if let Some(mode) = str_of(p, "permission_mode") {
             s.permission_mode = Some(mode.to_owned());
@@ -1397,6 +1437,7 @@ impl State {
             project: cwd
                 .and_then(|cwd| self.workspaces.locate(cwd))
                 .and_then(|(_, p)| p),
+            project_pinned: false,
             branch: None,
             launched: false,
             name: None,
@@ -1843,6 +1884,7 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
         ended_at,
         branch: s.branch.clone(),
         launched: s.launched,
+        project: s.project.clone().filter(|_| s.project_pinned),
     }
 }
 

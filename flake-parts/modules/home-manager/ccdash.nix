@@ -149,6 +149,32 @@ in
       {option}`settings.sync` (`include`, `exclude`, `root`)
     '';
 
+    launch = {
+      direnv = mkOption {
+        type = types.bool;
+        default = config.programs.direnv.enable;
+        defaultText = literalExpression "config.programs.direnv.enable";
+        description = ''
+          Whether sessions started from the panel get the direnv environment
+          of the directory they start in (the variables matching
+          {option}`launch.env`), through their settings file. `claude --bg`
+          runs in Claude Code's background daemon, which never sees the
+          collector's environment, so this is the only way in. A direnv
+          failure (not allowed, an error) fails the launch.
+        '';
+      };
+
+      env = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "CLAUDE_META_*" ];
+        description = ''
+          Globs (`*`, `?`) of the direnv variables launched sessions get;
+          nothing passes without a match.
+        '';
+      };
+    };
+
     dms.enable = mkEnableOption ''
       the DankMaterialShell plugin: bar pill, popout list, dash tab and
       card, notifications, and `dms ipc call ccdash …`. Linked into
@@ -249,11 +275,23 @@ in
     {
       home.packages = [ cfg.package ];
 
-      services.ccdash.settings.hub = {
-        url = mkDefault cfg.hub.url;
-        token_file = mkDefault cfg.hub.tokenFile;
+      services.ccdash.settings = {
+        hub = {
+          url = mkDefault cfg.hub.url;
+          token_file = mkDefault cfg.hub.tokenFile;
+        };
+        sync.enable = mkDefault cfg.sync.enable;
+        launch = {
+          direnv = mkDefault (
+            optionals cfg.launch.direnv [
+              (getExe config.programs.direnv.package)
+              "export"
+              "json"
+            ]
+          );
+          env = mkDefault cfg.launch.env;
+        };
       };
-      services.ccdash.settings.sync.enable = mkDefault cfg.sync.enable;
 
       xdg.configFile."ccdash/config.toml".source = configFile;
 

@@ -30,6 +30,15 @@ Sessions reach the notes through tools the channel server exposes:
 
 - Every call is scoped to the calling session's workspace; a session never
   sees another workspace's notes.
+- A note belongs to a **project** or to the whole workspace. The project
+  is a label from a closed set: a directory directly under the workspace
+  on some host, or one that already has notes; anything else is refused.
+  A call names it with `project`, else the note takes the session's.
+- A session's project is the launch's (the panel), else the one it
+  `claim`s with `project` or the owner picks on its page (Details), else
+  the directory it runs in, else none. Claude Code runs at the workspace
+  root as a rule, so a session there is told at its start to claim its
+  project; claim `paths` resolve under the project's directory.
 - A call is one round trip session → collector → hub with a 5 s budget.
 - `doc_write` carries the version the edit was based on, and the hub
   refuses a stale one, so a shared document never loses an edit silently.

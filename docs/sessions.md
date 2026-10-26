@@ -21,22 +21,32 @@ permission mode (the host's default, plan, accept edits) and the prompt.
 The panel waits until the session reports and opens its page; its prompts
 reach the phone like any other's, and a finished turn notifies "Finished".
 
-The hub resolves the directory from the workspace and project: the panel
-never sends a path, and the hub refuses unknown hosts, projects, models,
-modes and fields. Only projects with a directory on the chosen host are
-offered. The collector then runs, in that directory:
+The session starts in the **workspace's directory**, whatever the project:
+that is where the harness (settings, rules, skills, the root CLAUDE.md)
+and direnv live. The project is the session's label (see
+[knowledge](knowledge.md#2-tools)): the hub writes it onto the session
+when it reports, its notes default to it, and the project's other
+sessions are the ones it hears about. The panel never sends a path, and
+the hub refuses unknown hosts, projects, models, modes and fields; the
+project list is the workspace's projects that have notes and a directory
+on the chosen host. The collector then runs, in the workspace's directory:
 
 ```sh
 <launch.command> --bg [--resume <id>] [--model <m>] \
   [--permission-mode <pm>] --channels plugin:ccdash@inline \
-  --settings '{"env":{"CCDASH_LAUNCH":"<launch id>"}}' -- <prompt>
+  --settings $XDG_STATE_HOME/ccdash/launch/<launch id>.json -- <prompt>
 ```
 
 `claude --bg` prints the session's id, and the session's hooks carry the
-launch id (a settings `env`: background sessions run in Claude Code's
-background daemon, which never sees the collector's environment), so the
-hub finds the session either way. `--settings` replaces an earlier one, so
-`launch.command` must not carry its own. Nothing else is passed: never
+launch id (`CCDASH_LAUNCH` in the settings file's `env`: background
+sessions run in Claude Code's background daemon, which never sees the
+collector's environment), so the hub finds the session either way. With
+`launch.direnv` set, the collector first runs it (`direnv export json`) in
+the directory and puts the variables matching the `launch.env` globs into
+the same `env`, so a launched session has what the workspace's `.envrc`
+gives a terminal there; a direnv failure fails the launch. The file is
+owner-only and pruned after a day. `--settings` replaces an earlier one,
+so `launch.command` must not carry its own. Nothing else is passed: never
 `--dangerously-skip-permissions`.
 
 ## 2. Continue

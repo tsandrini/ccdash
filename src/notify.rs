@@ -564,7 +564,7 @@ mod tests {
         };
         st.apply(&stop, &mut fx);
         assert!(composer().notes(&st, &HashMap::new(), 5_000).is_empty());
-        assert!(st.set_launched(SID, &mut fx));
+        assert!(st.set_launched(SID, None, &mut fx));
         let notes = composer().notes(&st, &HashMap::new(), 5_000);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].content.title.starts_with("Finished: "));

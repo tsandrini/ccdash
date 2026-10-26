@@ -48,6 +48,10 @@ export const fetchSession = (id: string, params: { before?: number; limit?: numb
 export const renameSession = (id: string, title: string) =>
 	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/title`, { title });
 
+/** Pins the session's project (its notes' default); null lets its directory decide again. */
+export const setSessionProject = (id: string, project: string | null) =>
+	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/project`, { project });
+
 /** A turn through the session's channel. */
 export const replyTo = (id: string, text: string) =>
 	postJson<{ session: Session }>(`sessions/${encodeURIComponent(id)}/reply`, { text });

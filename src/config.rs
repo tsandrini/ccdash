@@ -233,6 +233,16 @@ pub struct Launch {
     /// fails on it (Claude Code keeps listing blocked jobs); `{id}` as
     /// above. The conversation is kept. Empty never removes.
     pub remove: Vec<String>,
+    /// Prints, as JSON, the environment direnv exports in the launch
+    /// directory (`["direnv", "export", "json"]`); the variables matching
+    /// `env` reach the session through its settings file (a `--bg` session
+    /// never sees the collector's environment). Empty leaves the
+    /// environment alone; a failure (not allowed, an error) fails the
+    /// launch.
+    pub direnv: Vec<String>,
+    /// Globs (`*`, `?`) of the direnv variables to pass on, such as
+    /// `CLAUDE_META_*`. Nothing passes without a match.
+    pub env: Vec<String>,
 }
 
 /// Polls Claude Code's `/usage` report for the per-model weekly limits the
@@ -400,6 +410,8 @@ impl Default for Launch {
             command: vec!["claude".into()],
             stop: ["claude", "stop", "{id}"].map(String::from).to_vec(),
             remove: ["claude", "rm", "{id}"].map(String::from).to_vec(),
+            direnv: Vec::new(),
+            env: Vec::new(),
         }
     }
 }

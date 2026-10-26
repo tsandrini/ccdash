@@ -35,6 +35,7 @@ mod tests {
         crate::push::Outcome::export_all(&cfg).unwrap();
         crate::tokens::Token::export_all(&cfg).unwrap();
         crate::hub::http::Rename::export_all(&cfg).unwrap();
+        crate::hub::http::SetProject::export_all(&cfg).unwrap();
         crate::hub::http::Reply::export_all(&cfg).unwrap();
         crate::hub::http::PutNote::export_all(&cfg).unwrap();
         crate::hub::http::Unsubscribe::export_all(&cfg).unwrap();

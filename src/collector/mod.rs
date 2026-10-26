@@ -473,6 +473,8 @@ impl Actor {
                 command: Vec::new(),
                 stop: Vec::new(),
                 remove: Vec::new(),
+                direnv: Vec::new(),
+                env: Vec::new(),
             },
             attach: Vec::new(),
             dirs: BTreeMap::new(),
@@ -527,7 +529,7 @@ impl Actor {
     /// Starts `spec` in the background and tells the hub what came of it;
     /// a session to continue is synced first (it may have run elsewhere).
     fn launch(&self, launch: String, spec: LaunchSpec) {
-        let (hub, command) = (self.hub.clone(), self.launch.command.clone());
+        let (hub, cfg) = (self.hub.clone(), self.launch.clone());
         let inside = self.workspaces.locate(&spec.cwd).is_some();
         let sync = self.sync.clone().filter(|_| spec.resume.is_some());
         tokio::spawn(async move {
@@ -537,7 +539,7 @@ impl Actor {
                 warn!("launch {launch}: the sync pass did not finish in time");
             }
             let result = if inside {
-                actions::launch(&command, &spec).await
+                actions::launch(&cfg, &spec).await
             } else {
                 Err(format!("{} is outside every ccdash workspace", spec.cwd))
             };

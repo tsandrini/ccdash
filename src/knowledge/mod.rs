@@ -480,6 +480,27 @@ pub struct Query {
     pub limit: Option<usize>,
 }
 
+impl NoteOp {
+    /// The project the call names, when it does.
+    pub fn project(&self) -> Option<&str> {
+        match self {
+            NoteOp::Remember { project, .. }
+            | NoteOp::IssueAdd { project, .. }
+            | NoteOp::Progress { project, .. } => project.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the workspace already has notes under `project`.
+pub fn has_project(conn: &Connection, workspace: &str, project: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM notes WHERE workspace = ?1 AND project = ?2)",
+        params![workspace, project],
+        |r| r.get(0),
+    )?)
+}
+
 /// Lowercase ASCII words joined with `-`, at most `MAX_SLUG` bytes.
 pub fn slugify(text: &str) -> String {
     let mut out = String::new();
@@ -1372,6 +1393,14 @@ pub fn session_start(
             Memory files are frozen: remember through the tool, verify memories you \
             confirm, file issues and log progress as you go.\n"
     );
+    if project.is_none() {
+        out.push_str(
+            "This session runs at the workspace root, so its notes are workspace-wide. When \
+                the work belongs to a project, `claim` it with `project` (a repo directory name) \
+                first: notes then land there and the project's sessions and issues are the ones \
+                you hear about.\n",
+        );
+    }
     let section = |title: &str, items: &[&Card], max: usize, out: &mut String| {
         if items.is_empty() {
             return;

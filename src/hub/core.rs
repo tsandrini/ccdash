@@ -63,6 +63,12 @@ pub enum Cmd {
     Resolve(String, oneshot::Sender<Option<Session>>),
     /// Renames a session; replies with the updated session or why not.
     Rename(String, String, oneshot::Sender<Result<Session, String>>),
+    /// Pins a session's project (None: the directory's again).
+    SetProject {
+        key: String,
+        project: Option<String>,
+        reply: oneshot::Sender<Result<Session, String>>,
+    },
     /// Sends a message to a session through its channel.
     Reply(String, String, oneshot::Sender<Result<Session, String>>),
     /// The owner's message to the session `key` names, for its next prompt.
@@ -363,6 +369,22 @@ impl Hub {
         rx.await.context("hub stopped")
     }
 
+    /// Pins the session's project, or with None lets its directory decide.
+    pub async fn set_project(
+        &self,
+        key: &str,
+        project: Option<String>,
+    ) -> Result<Result<Session, String>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SetProject {
+            key: key.to_owned(),
+            project,
+            reply,
+        })
+        .await?;
+        rx.await.context("hub stopped")
+    }
+
     /// Leaves the owner's message for the session's next prompt.
     pub async fn message(&self, key: &str, text: &str) -> Result<Result<Message, String>> {
         let (reply, rx) = oneshot::channel();
@@ -623,6 +645,13 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
             }
             Cmd::Rename(key, title, reply) => {
                 let _ = reply.send(core.rename(&key, &title));
+            }
+            Cmd::SetProject {
+                key,
+                project,
+                reply,
+            } => {
+                let _ = reply.send(core.set_project(&key, project));
             }
             Cmd::Reply(key, text, reply) => {
                 let _ = reply.send(core.reply(&key, &text, false));
@@ -1132,10 +1161,19 @@ impl Core {
             .or(who.cwd.as_deref())
             .filter(|c| !c.is_empty())
             .ok_or("cannot tell which session is asking")?;
-        let (workspace, project) = self
-            .workspaces
-            .locate(cwd)
-            .ok_or_else(|| format!("{cwd} is outside every ccdash workspace"))?;
+        // NOTE: a session's project may be pinned (launch, claim, panel): never re-derive it
+        let (workspace, project) = match session {
+            Some(s) => (
+                s.workspace
+                    .clone()
+                    .ok_or_else(|| format!("{cwd} is outside every ccdash workspace"))?,
+                s.project.clone(),
+            ),
+            None => self
+                .workspaces
+                .locate(cwd)
+                .ok_or_else(|| format!("{cwd} is outside every ccdash workspace"))?,
+        };
         Ok(Caller {
             host: host.to_owned(),
             workspace,
@@ -1148,11 +1186,12 @@ impl Core {
         })
     }
 
-    /// The project directory holding `cwd`, else its workspace's, else
-    /// `cwd` itself: the base claims are shown and checked against.
-    fn root_of(&self, cwd: &str) -> String {
-        match self.workspaces.locate(cwd) {
-            Some((ws, project)) => {
+    /// The directory of `project` in the workspace holding `cwd`, else the
+    /// workspace's, else `cwd` itself: the base claims resolve against and
+    /// are shown relative to.
+    fn root_of(&self, cwd: &str, project: Option<&str>) -> String {
+        match self.workspaces.of(cwd) {
+            Some(ws) => {
                 let dir = self.workspaces.dir(&ws).unwrap_or(cwd);
                 match project {
                     Some(p) => format!("{dir}/{p}"),
@@ -1161,6 +1200,45 @@ impl Core {
             }
             None => cwd.to_owned(),
         }
+    }
+
+    /// The projects a session of `workspace` may be placed under: the
+    /// directories directly under it on any host that reported them.
+    fn known_projects(&self, workspace: &str) -> BTreeSet<String> {
+        self.dirs
+            .values()
+            .filter_map(|dirs| dirs.get(workspace))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Pins the project of the session `key` names (None: the directory's
+    /// again); the updated session, or why not.
+    fn set_project(&mut self, key: &str, project: Option<String>) -> Result<Session, String> {
+        let (host, s) = self
+            .resolve(key)
+            .ok_or_else(|| format!("no session matches {key:?}"))?;
+        let (host, id) = (host.to_owned(), s.id.clone());
+        let workspace = s
+            .workspace
+            .clone()
+            .ok_or("the session runs outside every ccdash workspace")?;
+        if let Some(p) = &project
+            && !self.known_projects(&workspace).contains(p)
+        {
+            return Err(format!(
+                "{p:?} is not a project of {workspace}: no such directory under it on any host"
+            ));
+        }
+        let mut fx = Effects::default();
+        if let Some(state) = self.states.get_mut(&host) {
+            state.set_project(&id, project, &mut fx);
+        }
+        self.flush(&host, fx);
+        self.resolve(&id)
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| "the session is gone".into())
     }
 
     /// Carries out a knowledge call from `host`; with an `id` the result
@@ -1205,9 +1283,20 @@ impl Core {
             Call::Note { op, .. } => {
                 let c = caller.expect("located above");
                 let by = c.session.clone();
+                let known = self.known_projects(&c.workspace);
                 tokio::spawn(async move {
                     let result = store
                         .exec(move |conn| {
+                            if let Some(p) = op.project()
+                                && !known.contains(p)
+                                && !knowledge::has_project(conn, &c.workspace, p)?
+                            {
+                                bail!(
+                                    "{p:?} is not a project of {}: no such directory under the \
+                                        workspace on any host, and no notes under it",
+                                    c.workspace
+                                );
+                            }
                             let w = knowledge::apply(
                                 conn,
                                 &c.workspace,
@@ -1289,9 +1378,28 @@ impl Core {
                 paths,
                 until,
                 issue,
+                project,
                 ..
             } => {
-                let c = caller.expect("located above");
+                let mut c = caller.expect("located above");
+                if let Some(p) = project {
+                    if !self.known_projects(&c.workspace).contains(&p) {
+                        return answer(Err(format!(
+                            "{p:?} is not a project of {}: no such directory under the workspace \
+                                on any host",
+                            c.workspace
+                        )));
+                    }
+                    let Some(session) = c.session.clone() else {
+                        return answer(Err("cannot tell which session is claiming".into()));
+                    };
+                    let mut fx = Effects::default();
+                    if let Some(state) = self.states.get_mut(&c.host) {
+                        state.set_project(&session, Some(p.clone()), &mut fx);
+                    }
+                    self.flush(&c.host, fx);
+                    c.project = Some(p);
+                }
                 let spec = ClaimSpec {
                     what: &what,
                     paths: &paths,
@@ -1368,8 +1476,7 @@ impl Core {
                 {
                     continue;
                 }
-                let project = self.workspaces.locate(&s.cwd).and_then(|(_, p)| p);
-                if project != c.project {
+                if s.project != c.project {
                     continue;
                 }
                 let doing = match s.activity {
@@ -1396,7 +1503,11 @@ impl Core {
                     .map(|claim| {
                         format!(
                             "; claims {}",
-                            claims::describe(claim, &self.root_of(&s.cwd), now)
+                            claims::describe(
+                                claim,
+                                &self.root_of(&s.cwd, s.project.as_deref()),
+                                now
+                            )
                         )
                     })
                     .unwrap_or_default();
@@ -1428,7 +1539,7 @@ impl Core {
                 lines.push(format!(
                     "{} claims {}, since {since} min ago",
                     session_ref(s, host),
-                    claims::describe(claim, &self.root_of(&s.cwd), now)
+                    claims::describe(claim, &self.root_of(&s.cwd, s.project.as_deref()), now)
                 ));
             }
         }
@@ -1654,9 +1765,10 @@ impl Core {
         }
         let claim = match spec {
             Some(spec) => {
-                let root = self.root_of(&c.cwd);
+                // NOTE: paths are relative to the project (a root session has a pinned one), not to cwd
+                let root = self.root_of(&c.cwd, c.project.as_deref());
                 let claim = claims::new(
-                    spec.what, spec.paths, spec.until, spec.issue, &c.cwd, &root, at,
+                    spec.what, spec.paths, spec.until, spec.issue, &root, &root, at,
                 )?;
                 if claim.until.is_some_and(|u| u <= now_ms()) {
                     return Err("that claim has already lapsed".into());
@@ -1773,11 +1885,15 @@ impl Core {
         if !pending {
             return;
         }
+        let project = self
+            .launches
+            .get(launch)
+            .and_then(|s| s.launch.project.clone());
         let mut fx = Effects::default();
         let known = self
             .states
             .get_mut(host)
-            .is_some_and(|st| st.set_launched(session, &mut fx));
+            .is_some_and(|st| st.set_launched(session, project.as_deref(), &mut fx));
         self.flush(host, fx);
         if known {
             self.settle(
@@ -2675,7 +2791,7 @@ mod tests {
             host: "navi".into(),
             workspace: "w".into(),
             project: Some("p".into()),
-            cwd: "/w/p".into(),
+            cwd: "/w".into(),
             prompt: "go".into(),
             model: None,
             permission_mode: Some("plan".into()),
@@ -2713,7 +2829,7 @@ mod tests {
         let sent = next(&mut rx, |m| matches!(m, ToCollector::Launch { .. })).await;
         assert!(
             matches!(sent, ToCollector::Launch { ref launch, ref cwd, .. }
-            if launch == &first.id && cwd == "/w/p")
+            if launch == &first.id && cwd == "/w")
         );
 
         // the session's hooks carry the launch id
@@ -2721,7 +2837,7 @@ mod tests {
         let start = envelope(
             Source::Hook,
             Some(&first.id),
-            json!({"session_id": sid, "cwd": "/w/p", "hook_event_name": "SessionStart"}),
+            json!({"session_id": sid, "cwd": "/w", "hook_event_name": "SessionStart"}),
         );
         hub.send(Cmd::Input("navi".into(), Input::Envelope(start)))
             .await
@@ -2735,6 +2851,32 @@ mod tests {
         );
         let session = hub.resolve(sid).await.unwrap().unwrap();
         assert!(session.launched);
+        // at the workspace root, under the launch's project
+        assert_eq!(session.cwd, "/w");
+        assert_eq!(session.project.as_deref(), Some("p"));
+        assert!(session.project_pinned);
+        // the panel may move it; an unknown project is refused
+        assert!(
+            hub.set_project(sid, Some("nope".into()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let moved = hub.set_project(sid, None).await.unwrap().unwrap();
+        assert_eq!(
+            (moved.project, moved.project_pinned),
+            (None, false),
+            "the directory's again"
+        );
+        assert_eq!(
+            hub.set_project(sid, Some("p".into()))
+                .await
+                .unwrap()
+                .unwrap()
+                .project
+                .as_deref(),
+            Some("p")
+        );
 
         // a session whose hooks lack the id: linked through the printed one
         let second = hub.launch(req(None)).await.unwrap().unwrap();
@@ -2753,7 +2895,7 @@ mod tests {
         let poll_again = || AgentEntry {
             session_id: "aaaabbbb-0000-4000-8000-000000000000".into(),
             id: Some("aaaabbbb".into()),
-            cwd: Some("/w/p".into()),
+            cwd: Some("/w".into()),
             kind: Some("background".into()),
             pid: Some(std::process::id()),
             branch: Some("feat".into()),
@@ -2855,6 +2997,117 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(forgotten.activity, Activity::Gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn claims_place_a_root_session_under_a_project() {
+        let dir = std::env::temp_dir().join(format!("ccdash-claimproj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("t.db"), 30).unwrap();
+        let reader = store.clone();
+        let hub = Hub::spawn(
+            "hub".into(),
+            "http://hub".into(),
+            Workspaces::new(&["/w".into()], "/home"),
+            store,
+            None,
+            KnowledgeCfg::default(),
+            0,
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        hub.send(Cmd::CollectorOpen {
+            host: "navi".into(),
+            conn: 1,
+            terminals: Vec::new(),
+            tx,
+        })
+        .await
+        .unwrap();
+        hub.send(Cmd::Dirs {
+            host: "navi".into(),
+            dirs: Dirs::from([("w".to_owned(), vec!["p".to_owned()])]),
+        })
+        .await
+        .unwrap();
+        let sid = "7c4719e5-9508-461b-b1f4-e7b5a4c26f9d";
+        let start = envelope(
+            Source::Hook,
+            None,
+            json!({"session_id": sid, "cwd": "/w", "hook_event_name": "SessionStart"}),
+        );
+        hub.send(Cmd::Input("navi".into(), Input::Envelope(start)))
+            .await
+            .unwrap();
+        let who = Who {
+            session: Some(sid.into()),
+            pid: None,
+            cwd: None,
+        };
+        let call = |id: u64, call: Call| Cmd::Call {
+            host: "navi".into(),
+            id,
+            call,
+        };
+        let claim = |project: &str| Call::Claim {
+            who: who.clone(),
+            what: "the hub".into(),
+            paths: vec!["src".into()],
+            until: None,
+            issue: None,
+            project: Some(project.into()),
+        };
+        async fn result(rx: &mut mpsc::Receiver<ToCollector>, want: u64) -> Result<Reply, String> {
+            match next(
+                rx,
+                |m| matches!(m, ToCollector::Result { id, .. } if *id == want),
+            )
+            .await
+            {
+                ToCollector::Result { result, .. } => result,
+                _ => unreachable!(),
+            }
+        }
+
+        // a session at the root has no project until it claims one
+        assert_eq!(hub.resolve(sid).await.unwrap().unwrap().project, None);
+        hub.send(call(1, claim("nope"))).await.unwrap();
+        let refused = result(&mut rx, 1).await.unwrap_err();
+        assert!(refused.contains("not a project of w"), "{refused}");
+        hub.send(call(2, claim("p"))).await.unwrap();
+        match result(&mut rx, 2).await.unwrap() {
+            Reply::Claimed(Some(c)) => {
+                assert_eq!(c.paths, ["/w/p/src"], "relative to the project")
+            }
+            other => panic!("{other:?}"),
+        }
+        let session = hub.resolve(sid).await.unwrap().unwrap();
+        assert_eq!(session.project.as_deref(), Some("p"));
+        assert!(session.project_pinned);
+
+        // notes default to the session's project; a named one must be known
+        let remember = |project: Option<&str>, slug: &str| Call::Note {
+            who: who.clone(),
+            op: knowledge::NoteOp::Remember {
+                title: "T".into(),
+                body: "b".into(),
+                slug: Some(slug.into()),
+                project: project.map(str::to_owned),
+                summary: None,
+                supersedes: None,
+                status: None,
+            },
+        };
+        hub.send(call(3, remember(Some("nope"), "n--x")))
+            .await
+            .unwrap();
+        assert!(result(&mut rx, 3).await.is_err());
+        hub.send(call(4, remember(None, "p--x"))).await.unwrap();
+        assert!(matches!(result(&mut rx, 4).await, Ok(Reply::Written(_))));
+        let conn = reader.reader().unwrap();
+        let note = knowledge::get(&conn, "w", "p--x").unwrap().unwrap();
+        assert_eq!(note.project.as_deref(), Some("p"));
+        assert!(knowledge::get(&conn, "w", "n--x").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

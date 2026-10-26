@@ -254,9 +254,14 @@ pub struct Session {
     pub cwd: String,
     /// Configured workspace holding `cwd`.
     pub workspace: Option<String>,
-    /// The project inside the workspace: the repo directory `cwd` is in.
+    /// The project inside the workspace: set by the launch, a `claim` or
+    /// the panel, else the repo directory `cwd` is in.
     #[serde(default)]
     pub project: Option<String>,
+    /// The project is explicit (the launch, a claim, the panel), not the
+    /// directory's: it is stored and survives a `cwd` change.
+    #[serde(default)]
+    pub project_pinned: bool,
     /// The git branch of `cwd` (a detached `HEAD` as a short hash), read
     /// by the collector.
     #[serde(default)]
@@ -332,6 +337,7 @@ impl Session {
             cwd: cwd.into(),
             workspace: None,
             project: None,
+            project_pinned: false,
             branch: None,
             launched: false,
             name: None,

@@ -177,7 +177,8 @@ pub fn definitions() -> Vec<Value> {
                         "description": "Files or directories the work touches, relative to the project (a directory covers everything under it); at most 20."
                     },
                     "until": { "type": "integer", "minimum": 1, "maximum": 1440, "description": "Minutes until the claim lapses by itself (default: until released or the session ends)." },
-                    "issue": slug("The open issue this work is on (as `recall` lists them); the Projects board shows it in progress with this session.")
+                    "issue": slug("The open issue this work is on (as `recall` lists them); the Projects board shows it in progress with this session."),
+                    "project": string("The project this session works on (a repo directory name under the workspace): a session at the workspace root is placed there, so its notes default to the project and the project's other sessions are the ones it hears about. Unknown names are refused.")
                 }
             }
         }),
@@ -298,6 +299,7 @@ pub fn call(name: &str, args: &Value, who: Who) -> Result<Call> {
                 paths,
                 until: args["until"].as_i64(),
                 issue: text("issue"),
+                project: text("project"),
             });
         }
         "release" => return Ok(Call::Release { who }),
@@ -542,15 +544,15 @@ mod tests {
         ));
         let claim = call(
             "claim",
-            &json!({"what": "the hub", "paths": [" src/hub ", "web/app.js"], "until": 30, "issue": "hub--x"}),
+            &json!({"what": "the hub", "paths": [" src/hub ", "web/app.js"], "until": 30, "issue": "hub--x", "project": " ccdash "}),
             who(),
         )
         .unwrap();
         assert!(is_write(&claim));
         assert!(matches!(
             claim,
-            Call::Claim { ref paths, until: Some(30), issue: Some(ref i), .. }
-                if paths == &["src/hub", "web/app.js"] && i == "hub--x"
+            Call::Claim { ref paths, until: Some(30), issue: Some(ref i), project: Some(ref p), .. }
+                if paths == &["src/hub", "web/app.js"] && i == "hub--x" && p == "ccdash"
         ));
         assert!(call("claim", &json!({"paths": ["x"]}), who()).is_err());
         assert!(call("claim", &json!({"what": "x", "paths": [1]}), who()).is_err());

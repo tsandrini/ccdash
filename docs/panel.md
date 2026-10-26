@@ -33,7 +33,7 @@ links can be shared and the back button works.
 | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Chat    | the exchanges with Claude's text, grouped tool calls, subagents, task notifications, subagent messages, messages between sessions |
 | Shell   | its Bash calls as a terminal transcript with their output                                                                         |
-| Details | the turn, files, tasks, processes, the claim, totals                                                                              |
+| Details | the project (pick one), the turn, files, tasks, processes, the claim, totals                                                      |
 
 **Task notifications** are what Claude Code tells a session when a
 background task reports: a subagent finished, a background command exited,

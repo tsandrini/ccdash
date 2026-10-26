@@ -428,8 +428,9 @@ export type LaunchBody = {
  */
 host: string, workspace: string, 
 /**
- * A project of the workspace (as `/projects` lists them); none starts
- * in the workspace's own directory.
+ * A project of the workspace (as `/projects` lists them) the session
+ * is placed under; none leaves it workspace-wide. The directory is the
+ * workspace's either way.
  */
 project?: string, prompt: string, 
 /**
@@ -779,9 +780,15 @@ parent: string | null, pid: number | null, cwd: string,
  */
 workspace: string | null, 
 /**
- * The project inside the workspace: the repo directory `cwd` is in.
+ * The project inside the workspace: set by the launch, a `claim` or
+ * the panel, else the repo directory `cwd` is in.
  */
 project: string | null, 
+/**
+ * The project is explicit (the launch, a claim, the panel), not the
+ * directory's: it is stored and survives a `cwd` change.
+ */
+project_pinned: boolean, 
 /**
  * The git branch of `cwd` (a detached `HEAD` as a short hash), read
  * by the collector.
@@ -849,6 +856,12 @@ resolved: Resolved | null, resources: Resources | null, turn: Turn | null, tasks
  * it); who opened it first holds it when two hosts have it open.
  */
 opened_at: number, last_event_at: number, };
+
+/**
+ * `POST /sessions/{id}/project`: a project of the session's workspace (a
+ * directory under it on some host), or null for the directory's own.
+ */
+export type SetProject = { project: string | null, };
 
 export type Share = { 
 /**

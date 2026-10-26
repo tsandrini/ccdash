@@ -226,6 +226,9 @@ pub enum Call {
         until: Option<i64>,
         #[serde(default)]
         issue: Option<String>,
+        /// Pins the session's project first (a session at the workspace root).
+        #[serde(default)]
+        project: Option<String>,
     },
     /// Drops the caller's claim.
     Release {
@@ -479,6 +482,7 @@ mod tests {
                 paths: vec!["src".into()],
                 until: None,
                 issue: Some("i".into()),
+                project: None,
             },
             at: 1,
         };

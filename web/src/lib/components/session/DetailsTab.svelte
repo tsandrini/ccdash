@@ -4,6 +4,7 @@
 	// and received, and the session's totals.
 	import type { Session } from '#lib/api/types.js';
 	import { fmtBytes, fmtDuration, fmtStamp, fmtUsd, known } from '#lib/format.js';
+	import ProjectPick from './ProjectPick.svelte';
 	import { live } from '#lib/live/store.svelte.js';
 	import { children, claimPaths, label, shown } from '#lib/session.js';
 	import StateBadge from '#lib/components/app/StateBadge.svelte';
@@ -36,6 +37,10 @@
 			['Started', `${fmtStamp(s.started_at)} (${fmtDuration(live.now - s.started_at)} ago)`],
 			['Directory', s.cwd],
 			['Workspace', s.workspace],
+			[
+				'Project',
+				s.workspace && (shown(s) === 'gone' || !live.connected(s.host)) ? (s.project ?? '—') : null
+			],
 			['Host', s.host],
 			['Session id', s.id]
 		])
@@ -52,6 +57,12 @@
 {/snippet}
 
 <div class="flex flex-col gap-5">
+	{#if s.workspace && shown(s) !== 'gone' && live.connected(s.host)}
+		<section>
+			<h3 class="mb-1 text-sm font-semibold">Project</h3>
+			<ProjectPick session={s} />
+		</section>
+	{/if}
 	{#if s.waiting_for}
 		<section>
 			<h3 class="mb-1 text-sm font-semibold">Waiting for</h3>

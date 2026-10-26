@@ -110,11 +110,13 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("push_subscriptions", "token_id", "INTEGER"),
     ("sessions", "branch", "TEXT"),
     ("sessions", "launched", "INTEGER"),
+    ("sessions", "project", "TEXT"),
 ];
 
 const UPSERT_SESSION: &str = "
-INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at, branch, launched)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at, branch, launched,
+    project)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 ON CONFLICT (id) DO UPDATE SET
     cwd = excluded.cwd,
     name = COALESCE(excluded.name, name),
@@ -122,7 +124,8 @@ ON CONFLICT (id) DO UPDATE SET
     kind = excluded.kind,
     ended_at = excluded.ended_at,
     branch = COALESCE(excluded.branch, branch),
-    launched = MAX(COALESCE(launched, 0), excluded.launched)
+    launched = MAX(COALESCE(launched, 0), excluded.launched),
+    project = excluded.project
 ";
 
 const PRUNE_EVERY_MS: i64 = 3_600_000;
@@ -329,6 +332,7 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                 ended_at,
                 branch,
                 launched,
+                project,
             } => {
                 tx.execute(
                     UPSERT_SESSION,
@@ -342,7 +346,8 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                         started_at,
                         ended_at,
                         branch,
-                        launched
+                        launched,
+                        project
                     ],
                 )?;
             }
@@ -541,9 +546,10 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             })
         }))
     };
-    let (title, started_at, branch, launched) = conn
+    let (title, started_at, branch, launched, project) = conn
         .query_row(
-            "SELECT title, started_at, branch, COALESCE(launched, 0) FROM sessions WHERE id = ?1",
+            "SELECT title, started_at, branch, COALESCE(launched, 0), project
+                FROM sessions WHERE id = ?1",
             [session],
             |r| {
                 Ok((
@@ -551,11 +557,12 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, bool>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?
-        .unwrap_or((None, None, None, false));
+        .unwrap_or((None, None, None, false, None));
     let hooked = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND kind != 'activity')",
         [session],
@@ -586,6 +593,7 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         branch,
         launched,
         resolved: last_resolved(&conn, session)?,
+        project,
     };
     conn.finish()?;
     Ok(restored)
@@ -704,7 +712,8 @@ pub fn ended_session(
         Kind::Interactive
     };
     session.workspace = workspace;
-    session.project = project;
+    session.project_pinned = saved.project.is_some();
+    session.project = saved.project.clone().or(project);
     session.name = name;
     session.title = title.or(saved.title);
     session.activity = Activity::Gone;
@@ -929,6 +938,7 @@ mod tests {
                 ended_at: None,
                 branch: Some("main".into()),
                 launched: true,
+                project: Some("q".into()),
             },
         );
         store.send(
@@ -943,6 +953,7 @@ mod tests {
                 ended_at: Some(t + 9),
                 branch: None,
                 launched: false,
+                project: Some("q".into()),
             },
         );
         for (dt, kind, data) in [
@@ -1039,6 +1050,7 @@ mod tests {
         assert_eq!(saved.tasks[0].subject, "Ship");
         assert_eq!(saved.branch.as_deref(), Some("main"));
         assert!(saved.launched);
+        assert_eq!(saved.project.as_deref(), Some("q"));
 
         let workspaces = Workspaces::new(&["/w".into()], "/home");
         let ended = ended_session(&reader, "s", &workspaces).unwrap().unwrap();
@@ -1048,7 +1060,12 @@ mod tests {
             (Kind::Background, t + 9)
         );
         assert_eq!(ended.title.as_deref(), Some("Fix it"));
-        assert_eq!(ended.project.as_deref(), Some("p"));
+        assert_eq!(
+            ended.project.as_deref(),
+            Some("q"),
+            "the pinned project, not the directory's"
+        );
+        assert!(ended.project_pinned);
         assert_eq!(ended.prompt.unwrap().text, "second");
         assert!(ended.launched);
         assert!(ended_session(&reader, "x", &workspaces).unwrap().is_none());

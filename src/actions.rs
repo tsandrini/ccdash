@@ -1,20 +1,33 @@
 //! What a collector does to sessions on its machine: open (focus or
 //! attach), start or continue one in the background, stop one.
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs::{OpenOptions, Permissions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::process::Command;
+use tracing::info;
 
 use crate::{
     collector::Local,
+    config,
     model::{Kind, Session},
     niri, paths,
+    sync::glob,
 };
 
 /// How long `claude --bg` and `claude stop` may take.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Settings files of launches older than this are pruned at the next launch.
+const SETTINGS_KEEP: Duration = Duration::from_secs(24 * 3600);
 /// What a launch may ask for besides the configured default.
 pub const PERMISSION_MODES: &[&str] = &["plan", "acceptEdits"];
 /// Longest prompt a launch takes, in characters.
@@ -102,8 +115,9 @@ impl LaunchSpec {
         Ok(())
     }
 
-    /// The arguments after the configured command.
-    pub fn args(&self) -> Vec<String> {
+    /// The arguments after the configured command; `settings` is the file
+    /// [`settings`] wrote.
+    pub fn args(&self, settings: &Path) -> Vec<String> {
         let mut args = vec!["--bg".to_owned()];
         if let Some(id) = &self.resume {
             args.extend(["--resume".into(), id.clone()]);
@@ -114,17 +128,91 @@ impl LaunchSpec {
         if let Some(mode) = &self.permission_mode {
             args.extend(["--permission-mode".into(), mode.clone()]);
         }
-        // NOTE: settings `env`, not the process environment: the background daemon spawns the session
-        let settings = json!({ "env": { "CCDASH_LAUNCH": self.nonce } });
         args.extend([
             "--channels".into(),
             "plugin:ccdash@inline".into(),
             "--settings".into(),
-            settings.to_string(),
+            settings.to_string_lossy().into_owned(),
             "--".into(),
             self.prompt.clone(),
         ]);
         args
+    }
+
+    /// The session's settings: the launch id and the direnv variables as
+    /// `env`. Settings, not the process environment: the background daemon
+    /// spawns the session with its own.
+    pub fn settings(&self, env: &BTreeMap<String, String>) -> Value {
+        let mut all = env.clone();
+        all.insert("CCDASH_LAUNCH".into(), self.nonce.clone());
+        json!({ "env": all })
+    }
+}
+
+/// The variables direnv exported (`direnv export json` output) that match
+/// one of `globs`; unset ones (null) and the rest are left out. Empty
+/// output means nothing to export.
+pub fn direnv_vars(output: &str, globs: &[String]) -> Result<BTreeMap<String, String>, String> {
+    if output.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let exported: BTreeMap<String, Value> =
+        serde_json::from_str(output).map_err(|e| format!("direnv printed no JSON object: {e}"))?;
+    Ok(exported
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_str()?.to_owned())))
+        .filter(|(name, _)| globs.iter().any(|g| glob(g, name)))
+        .collect())
+}
+
+/// The direnv environment of `cwd` the session gets, per the config; empty
+/// when direnv is off.
+async fn direnv_env(cfg: &config::Launch, cwd: &str) -> Result<BTreeMap<String, String>, String> {
+    let Some((program, args)) = cfg.direnv.split_first() else {
+        return Ok(BTreeMap::new());
+    };
+    let output = run(Command::new(program).args(args).current_dir(cwd)).await?;
+    if !output.status.success() {
+        return Err(format!("direnv in {cwd}: {}", failure(&output)));
+    }
+    direnv_vars(&String::from_utf8_lossy(&output.stdout), &cfg.env)
+}
+
+/// Writes the launch's settings file (owner-only) under the state dir and
+/// prunes the old ones; its path.
+fn write_settings(nonce: &str, settings: &Value) -> Result<PathBuf, String> {
+    let dir = paths::state_dir().join("launch");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let _ = std::fs::set_permissions(&dir, Permissions::from_mode(0o700));
+    prune_settings(&dir);
+    let path = dir.join(format!("{nonce}.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    file.write_all(settings.to_string().as_bytes())
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn prune_settings(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > SETTINGS_KEEP);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -138,20 +226,34 @@ pub fn valid_model(model: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '[' | ']'))
 }
 
-/// Starts the session with `command` (the Claude Code executable and its
-/// leading arguments) in its directory; the short id `claude --bg`
-/// printed, or why it failed (its stderr).
-pub async fn launch(command: &[String], spec: &LaunchSpec) -> Result<String, String> {
-    let (program, lead) = command
+/// Starts the session with `cfg.command` (the Claude Code executable and
+/// its leading arguments) in its directory, with the directory's direnv
+/// variables when configured; the short id `claude --bg` printed, or why
+/// it failed (its stderr).
+pub async fn launch(cfg: &config::Launch, spec: &LaunchSpec) -> Result<String, String> {
+    let (program, lead) = cfg
+        .command
         .split_first()
         .ok_or("starting sessions is off on this host")?;
     spec.check()?;
-    if !std::path::Path::new(&spec.cwd).is_dir() {
+    if !Path::new(&spec.cwd).is_dir() {
         return Err(format!("{} is not a directory on this host", spec.cwd));
     }
+    let env = direnv_env(cfg, &spec.cwd).await?;
+    if !cfg.direnv.is_empty() {
+        let names: Vec<&str> = env.keys().map(String::as_str).collect();
+        info!(
+            "launch {}: direnv in {} gives {} variable(s): {}",
+            spec.nonce,
+            spec.cwd,
+            names.len(),
+            names.join(", ")
+        );
+    }
+    let settings = write_settings(&spec.nonce, &spec.settings(&env))?;
     let output = run(Command::new(program)
         .args(lead)
-        .args(spec.args())
+        .args(spec.args(&settings))
         .current_dir(&spec.cwd))
     .await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -433,27 +535,114 @@ mod tests {
 
     #[test]
     fn launch_arguments_end_with_the_prompt() {
-        let args = spec().args();
+        let file = Path::new("/state/launch/0123abcd.json");
+        let args = spec().args(file);
         assert_eq!(
             &args[..5],
             ["--bg", "--model", "haiku", "--permission-mode", "plan"]
         );
         assert_eq!(&args[args.len() - 2..], ["--", "-v fix it"]);
         let settings = args.iter().position(|a| a == "--settings").unwrap();
-        let env: serde_json::Value = serde_json::from_str(&args[settings + 1]).unwrap();
+        assert_eq!(args[settings + 1], "/state/launch/0123abcd.json");
+        let env = spec().settings(&BTreeMap::from([(
+            "CLAUDE_META_X".to_owned(),
+            "1".to_owned(),
+        )]));
         assert_eq!(env["env"]["CCDASH_LAUNCH"], "0123abcd");
+        assert_eq!(env["env"]["CLAUDE_META_X"], "1");
         let resumed = LaunchSpec {
             resume: Some("9c4719e5-9508-461b-b1f4-e7b5a4c26f9d".into()),
             model: None,
             permission_mode: None,
             ..spec()
         }
-        .args();
+        .args(file);
         assert_eq!(
             &resumed[..3],
             ["--bg", "--resume", "9c4719e5-9508-461b-b1f4-e7b5a4c26f9d"]
         );
         assert!(spec().check().is_ok());
+    }
+
+    #[test]
+    fn direnv_variables_pass_by_glob() {
+        let out = r#"{"CLAUDE_META_TOKEN":"s3cret","CLAUDE_META_URL":"https://x","PATH":"/nix","DIRENV_DIR":"-/w","GONE":null}"#;
+        let globs = ["CLAUDE_META_*".to_owned()];
+        let env = direnv_vars(out, &globs).unwrap();
+        assert_eq!(
+            env.keys().collect::<Vec<_>>(),
+            ["CLAUDE_META_TOKEN", "CLAUDE_META_URL"]
+        );
+        assert_eq!(env["CLAUDE_META_URL"], "https://x");
+        assert!(
+            direnv_vars("", &globs).unwrap().is_empty(),
+            "nothing to export"
+        );
+        assert!(
+            direnv_vars(out, &[]).unwrap().is_empty(),
+            "no globs, nothing passes"
+        );
+        assert!(direnv_vars("direnv: error", &globs).is_err());
+    }
+
+    #[tokio::test]
+    async fn direnv_runs_in_the_launch_directory_and_its_failure_is_the_launch_failure() {
+        let cfg = |direnv: &[&str]| config::Launch {
+            direnv: direnv.iter().map(|s| (*s).to_owned()).collect(),
+            env: vec!["CLAUDE_META_*".into()],
+            ..config::Launch::default()
+        };
+        assert!(direnv_env(&cfg(&[]), "/").await.unwrap().is_empty(), "off");
+        let env = direnv_env(
+            &cfg(&[
+                "sh",
+                "-c",
+                r#"printf '{"CLAUDE_META_X":"%s","PATH":"p"}' "$PWD""#,
+            ]),
+            "/tmp",
+        )
+        .await
+        .unwrap();
+        assert_eq!(env.get("CLAUDE_META_X").map(String::as_str), Some("/tmp"));
+        assert!(!env.contains_key("PATH"));
+        let refused = direnv_env(
+            &cfg(&[
+                "sh",
+                "-c",
+                "echo 'direnv: error .envrc is blocked' >&2; exit 1",
+            ]),
+            "/tmp",
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("is blocked"), "{refused}");
+        assert!(
+            direnv_env(&cfg(&["/nonexistent/direnv"]), "/tmp")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn settings_files_are_private_and_pruned() {
+        let dir = std::env::temp_dir().join(format!("ccdash-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let launch = dir.join("launch");
+        std::fs::create_dir_all(&launch).unwrap();
+        let old = launch.join("old.json");
+        std::fs::write(&old, "{}").unwrap();
+        let stale = SystemTime::now() - SETTINGS_KEEP - Duration::from_secs(60);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        prune_settings(&launch);
+        assert!(!old.exists(), "a day-old settings file is pruned");
+        let fresh = launch.join("fresh.json");
+        std::fs::write(&fresh, "{}").unwrap();
+        prune_settings(&launch);
+        assert!(fresh.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

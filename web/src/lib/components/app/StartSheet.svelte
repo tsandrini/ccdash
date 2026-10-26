@@ -1,9 +1,10 @@
 <script lang="ts">
-	// Starts a background session (`claude --bg` on a connected host, in a
-	// project with notes and a directory on that host) or continues an
-	// ended one, on the host it ran on or another that syncs it: host,
-	// workspace and project, the model, the permission mode, the prompt.
-	// Waits for the session to report and opens its page.
+	// Starts a background session (`claude --bg` on a connected host, at
+	// the workspace's root, under a project with notes and a directory on
+	// that host) or continues an ended one, on the host it ran on or
+	// another that syncs it: host, workspace and project, the model, the
+	// permission mode, the prompt. Waits for the session to report and
+	// opens its page.
 	import { untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import LoaderCircleIcon from '@lucide/svelte/icons/loader-circle';
@@ -39,7 +40,7 @@
 		['plan', 'Plan'],
 		['acceptEdits', 'Accept edits']
 	];
-	/** The project select's value for the workspace's own directory. */
+	/** The project select's value for no project (workspace-wide). */
 	const ROOT = '/';
 	const POLL_MS = 2000;
 
@@ -202,8 +203,9 @@
 					Continues “{label(resume)}” in the background on {host || resume.host}, in
 					{place(resume.cwd)}.
 				{:else}
-					Runs <code class="font-mono">claude --bg</code> on the host, in the project's directory. Its
-					questions and approvals reach this device.
+					Runs <code class="font-mono">claude --bg</code> on the host at the workspace's root (its harness
+					and direnv), placed under the project: notes default to it. Its questions and approvals reach
+					this device.
 				{/if}
 			</Sheet.Description>
 		</Sheet.Header>
@@ -236,7 +238,7 @@
 								>{names?.length ? 'Pick a project' : 'No project here'}</option
 							>
 							{#each names ?? [] as p (p)}<option value={p}>{p}</option>{/each}
-							<option value={ROOT}>(the workspace itself)</option>
+							<option value={ROOT}>(no project: the workspace itself)</option>
 						</select>
 					</label>
 				</div>

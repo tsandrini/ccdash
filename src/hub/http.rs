@@ -130,6 +130,7 @@ pub async fn serve(
         .route("/snapshot", get(snapshot))
         .route("/sessions/{id}", get(session))
         .route("/sessions/{id}/title", post(rename))
+        .route("/sessions/{id}/project", post(set_project))
         .route("/sessions/{id}/reply", post(reply))
         .route("/sessions/{id}/messages", post(message))
         .route("/sessions/{id}/asks/{ask}", post(answer))
@@ -376,6 +377,33 @@ async fn rename(
     Ok(Json(json!({ "session": session })))
 }
 
+/// `POST /sessions/{id}/project`: a project of the session's workspace (a
+/// directory under it on some host), or null for the directory's own.
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+pub(crate) struct SetProject {
+    project: Option<String>,
+}
+
+/// Pins a session's project: its notes default there and the project's
+/// other sessions are the ones it hears about.
+async fn set_project(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Json(body): Json<SetProject>,
+) -> Result<Json<Value>, ApiError> {
+    let project = body
+        .project
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty());
+    let session = app
+        .hub
+        .set_project(&id, project)
+        .await?
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(Json(json!({ "session": session })))
+}
+
 #[derive(Deserialize, TS)]
 #[ts(export_to = "types.ts")]
 pub(crate) struct Reply {
@@ -442,8 +470,9 @@ pub(crate) struct LaunchBody {
     /// A connected host.
     host: String,
     workspace: String,
-    /// A project of the workspace (as `/projects` lists them); none starts
-    /// in the workspace's own directory.
+    /// A project of the workspace (as `/projects` lists them) the session
+    /// is placed under; none leaves it workspace-wide. The directory is the
+    /// workspace's either way.
     #[serde(default)]
     #[ts(optional)]
     project: Option<String>,
@@ -462,9 +491,11 @@ pub(crate) struct LaunchBody {
     resume: Option<String>,
 }
 
-/// Starts a background session in a known project, or continues an ended
-/// one; `202 { launch }`, followed by `launch` updates on the stream. The
-/// directory comes from the workspace and project, never from the client.
+/// Starts a background session at the workspace's directory under a known
+/// project, or continues an ended one; `202 { launch }`, followed by
+/// `launch` updates on the stream. The directory is the workspace's (the
+/// harness and direnv live there), never the client's; the project is the
+/// session's label.
 async fn launch(
     State(app): State<App>,
     Json(body): Json<LaunchBody>,
@@ -519,8 +550,7 @@ async fn launch(
                     s.host, body.host
                 )));
             }
-            if app.workspaces.locate(&s.cwd) != Some((body.workspace.clone(), body.project.clone()))
-            {
+            if (s.workspace.as_ref(), &s.project) != (Some(&body.workspace), &body.project) {
                 return Err(refuse("the session ran in another project".into()));
             }
             (s.cwd, Some(s.id))
@@ -541,17 +571,15 @@ async fn launch(
                 .iter()
                 .find(|w| w.name == body.workspace)
                 .ok_or_else(|| refuse(format!("{} has no directory {ws_dir}", body.host)))?;
+            // NOTE: always the workspace root; the project is metadata, applied when the session reports
             match &body.project {
-                None => (ws_dir, None),
-                Some(project) if ws.projects.contains(project) => {
-                    (format!("{ws_dir}/{project}"), None)
-                }
-                Some(project) => {
+                Some(project) if !ws.projects.contains(project) => {
                     return Err(refuse(format!(
                         "{project:?} is not a known project of {} on {}",
                         body.workspace, body.host
                     )));
                 }
+                _ => (ws_dir, None),
             }
         }
     };
