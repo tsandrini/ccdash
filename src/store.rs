@@ -214,6 +214,7 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(messages::SCHEMA)?;
     conn.execute_batch(claims::SCHEMA)?;
     conn.execute_batch(crate::sync::hub::SCHEMA)?;
+    conn.execute_batch(crate::workspace::hub::SCHEMA)?;
     migrate(&conn)?;
     rewrite(&conn)?;
     Ok(conn)

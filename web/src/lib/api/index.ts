@@ -1,10 +1,16 @@
 // Typed fetchers over the hub's routes (`src/hub/http.rs`).
 
-import { del, deleteJson, getJson, patchJson, postJson, putJson, query } from './client';
+import { api, del, deleteJson, getJson, patchJson, postJson, putJson, query } from './client';
 import type {
 	Analytics,
 	Answer,
 	Conversation,
+	HeldAction,
+	HistoryEntry,
+	Side,
+	WorkspaceConfig,
+	WorkspaceUnitBody,
+	WorkspaceView,
 	Graph,
 	History,
 	Hit,
@@ -113,6 +119,45 @@ export const resolveConflict = (id: number, keep: Keep) =>
 
 /** Sizes by kind, project and session, and growth per day. */
 export const fetchSyncStats = () => getJson<SyncStats>('sync/stats');
+
+/** A unit id as a path: each segment encoded, the slashes kept. */
+const unitPath = (unit: string) => unit.split('/').map(encodeURIComponent).join('/');
+
+/** The workspace sync: hosts, units × hosts, new directories, conflicts,
+ * held snapshots and the configuration. */
+export const fetchWorkspace = () => getJson<WorkspaceView>('workspace');
+
+/** Replaces the configuration; every collector gets the new setup at once. */
+export const putWorkspaceConfig = (config: WorkspaceConfig) =>
+	putJson<{ version: number }>('workspace/config', { config });
+
+/** Include, exclude, ignore, pause or resume a unit, set its overrides, or
+ * make a host adopt its copy. */
+export const workspaceUnitOp = (unit: string, body: WorkspaceUnitBody) =>
+	postJson<{ ok: boolean }>(`workspace/units/${unitPath(unit)}`, body);
+
+/** The last snapshots of a unit across hosts, newest first. */
+export const fetchUnitHistory = (unit: string) =>
+	getJson<{ history: HistoryEntry[] }>(`workspace/history/${unitPath(unit)}`);
+
+/** Applies or drops the held snapshot `commit` on its host. */
+export const workspaceHeld = (host: string, unit: string, action: HeldAction, commit: string) =>
+	postJson<{ ok: boolean }>(`workspace/held/${encodeURIComponent(host)}/${unitPath(unit)}`, {
+		action,
+		commit
+	});
+
+/** One side of a conflict wins on its host, or the conflict is dismissed. */
+export const workspaceConflict = (id: number, action: 'mine' | 'theirs' | 'dismiss') =>
+	postJson<{ ok: boolean }>(`workspace/conflicts/${id}`, { action });
+
+/** One side of a conflict as text, as the hub's repository has it. */
+export const fetchConflictBlob = async (id: number, side: Side) =>
+	(await api(`workspace/conflicts/${id}/blob?side=${side}`)).text();
+
+/** The host fetches and snapshots everything (or one unit) again. */
+export const workspaceResync = (host: string, unit?: string) =>
+	postJson<{ ok: boolean }>(`workspace/${encodeURIComponent(host)}/resync`, { unit });
 
 export const fetchPrompts = (params: { session?: string; workspace?: string; limit?: number }) =>
 	getJson<{ prompts: Prompt[] }>(`prompts${query(params)}`);

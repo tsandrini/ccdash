@@ -42,7 +42,10 @@ use crate::{
     usage,
     util::{self, now_ms, pid_alive},
     wire::{self, Envelope, Source},
-    workspace::Workspaces,
+    workspace::{
+        Workspaces,
+        collector::{self as workspace, Cmd as WsCmd, Handle as WsHandle},
+    },
 };
 
 /// Everything the local actor reacts to.
@@ -211,6 +214,7 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
     let (hub_tx, hub_rx) = mpsc::unbounded_channel();
     let (local, rx) = Local::spawn();
     let sync = start_sync(&cfg, &host, &hub_tx);
+    let workspace = start_workspace(&cfg, &host, &hub_tx);
     tokio::spawn(run_actor(
         Actor::new(
             host.clone(),
@@ -219,7 +223,8 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
             paths::notes_cache(),
         )
         .with_commands(cfg.launch.clone(), cfg.attach.command.clone())
-        .with_sync(sync.clone()),
+        .with_sync(sync.clone())
+        .with_workspace(workspace.clone()),
         rx,
     ));
     tokio::spawn(link::run(
@@ -257,7 +262,7 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
         tokio::spawn(otlp::serve(listener, sink));
     }
     tokio::spawn(ingest_loop(ingest, local.sender()));
-    tokio::spawn(api::serve(api, local.clone(), cfg.clone(), sync));
+    tokio::spawn(api::serve(api, local.clone(), cfg.clone(), sync, workspace));
     tokio::spawn(agents::run(
         cfg.agents.command.clone(),
         Duration::from_secs(cfg.agents.interval_secs.max(1)),
@@ -326,6 +331,48 @@ fn start_sync(
     );
     sync::spawn(settings, hub.clone())
         .inspect_err(|e| warn!("sync: {e:#}"))
+        .ok()
+}
+
+/// Starts keeping the workspace root in step with the hub (`[workspace]`).
+fn start_workspace(
+    cfg: &CollectorConfig,
+    host: &str,
+    hub: &mpsc::UnboundedSender<ToHub>,
+) -> Option<WsHandle> {
+    if !cfg.workspace.enable {
+        return None;
+    }
+    let Some(token_file) = &cfg.hub.token_file else {
+        warn!("the workspace sync is on but hub.token_file is not set: not syncing");
+        return None;
+    };
+    let Some(root) = cfg.workspace_root() else {
+        warn!("the workspace sync is on but workspace.root is not set: not syncing");
+        return None;
+    };
+    if !root.is_dir() {
+        warn!(
+            "the workspace sync is on but {} is not a directory: not syncing",
+            root.display()
+        );
+        return None;
+    }
+    let settings = workspace::Settings {
+        host: host.to_owned(),
+        root: root.clone(),
+        state: paths::state_dir().join("workspace"),
+        hub_base: format!("{}/git/", sync::base_url(&cfg.hub.url)),
+        token_file: PathBuf::from(util::expand_env(&token_file.to_string_lossy())),
+        starting: cfg.workspace.starting(),
+    };
+    info!(
+        "syncing the workspace {} through the hub at {}",
+        root.display(),
+        settings.hub_base
+    );
+    workspace::spawn(settings, hub.clone())
+        .inspect_err(|e| warn!("workspace: {e:#}"))
         .ok()
 }
 
@@ -429,6 +476,8 @@ struct Actor {
     dirs_at: i64,
     /// The sync thread, when `[sync]` is on.
     sync: Option<SyncHandle>,
+    /// The workspace thread, when `[workspace]` is on.
+    workspace: Option<WsHandle>,
 }
 
 impl Actor {
@@ -480,6 +529,7 @@ impl Actor {
             dirs: BTreeMap::new(),
             dirs_at: 0,
             sync: None,
+            workspace: None,
         }
     }
 
@@ -509,9 +559,48 @@ impl Actor {
         self
     }
 
+    fn with_workspace(mut self, workspace: Option<WsHandle>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     fn kick_sync(&self, cmd: SyncCmd) {
         if let Some(sync) = &self.sync {
             sync.send(cmd);
+        }
+    }
+
+    fn kick_workspace(&self, cmd: WsCmd) {
+        if let Some(ws) = &self.workspace {
+            ws.send(cmd);
+        }
+    }
+
+    /// Notes tool calls in flight (PreToolUse without PostToolUse yet), so
+    /// the workspace sync does not apply under a running tool.
+    fn note_tool(&self, envelope: &Envelope) {
+        let Some(ws) = &self.workspace else {
+            return;
+        };
+        let p = &envelope.payload;
+        let (Some(session), Some(event)) =
+            (p["session_id"].as_str(), p["hook_event_name"].as_str())
+        else {
+            return;
+        };
+        let key = match p["agent_id"].as_str() {
+            Some(agent) => format!("{session}:{agent}"),
+            None => session.to_owned(),
+        };
+        match event {
+            "PreToolUse" => {
+                if let Some(cwd) = p["cwd"].as_str() {
+                    ws.busy.start(&key, cwd, envelope.ts);
+                }
+            }
+            "PostToolUse" | "PostToolUseFailure" => ws.busy.end(&key),
+            "SessionEnd" => ws.busy.end_session(session),
+            _ => {}
         }
     }
 
@@ -848,6 +937,43 @@ impl Actor {
             ToCollector::Open { session } => self.open(&session),
             ToCollector::SyncChanged { .. } => self.kick_sync(SyncCmd::Changed),
             ToCollector::SyncResync => self.kick_sync(SyncCmd::Resync),
+            ToCollector::WorkspaceSetup { setup } => self.kick_workspace(WsCmd::Setup(*setup)),
+            ToCollector::WorkspaceChanged { unit, host, .. } => {
+                self.kick_workspace(WsCmd::Changed { unit, host });
+            }
+            ToCollector::WorkspaceResync { unit } => self.kick_workspace(WsCmd::Resync(unit)),
+            ToCollector::WorkspaceResolve {
+                id,
+                unit,
+                path,
+                blob,
+            } => {
+                if self.workspace.is_some() {
+                    self.kick_workspace(WsCmd::Resolve {
+                        id,
+                        unit,
+                        path,
+                        blob,
+                    });
+                } else {
+                    self.to_hub(ToHub::WorkspaceResolved {
+                        id,
+                        error: Some("this machine does not sync its workspace".into()),
+                    });
+                }
+            }
+            ToCollector::WorkspaceHeld {
+                unit,
+                action,
+                commit,
+            } => {
+                self.kick_workspace(WsCmd::Held {
+                    unit,
+                    action,
+                    commit,
+                });
+            }
+            ToCollector::WorkspaceAdopt { unit } => self.kick_workspace(WsCmd::Adopt(unit)),
             ToCollector::SyncResolve {
                 id,
                 path,
@@ -917,6 +1043,7 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
                 if envelope.payload["hook_event_name"] == "SessionEnd" {
                     a.kick_sync(SyncCmd::Changed);
                 }
+                a.note_tool(&envelope);
                 a.to_hub(ToHub::Envelope { envelope });
             }
             LocalCmd::Agents(mut list, at) => {
@@ -1069,8 +1196,12 @@ async fn run_actor(mut a: Actor, mut rx: mpsc::Receiver<LocalCmd>) {
                 }
                 a.resync();
                 a.kick_sync(SyncCmd::Changed);
+                a.kick_workspace(WsCmd::Connected(true));
             }
-            LocalCmd::LinkDown => a.link_down(),
+            LocalCmd::LinkDown => {
+                a.link_down();
+                a.kick_workspace(WsCmd::Connected(false));
+            }
             LocalCmd::FromHub(msg) => a.take(*msg),
         }
     }

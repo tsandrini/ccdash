@@ -72,6 +72,15 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             tx,
         }
     });
+    let repos = if cfg.workspace.enable {
+        let root = cfg.sync_dir().join("workspace");
+        let repos =
+            Arc::new(crate::workspace::hub::Repos::open(&root).context("workspace repositories")?);
+        info!("keeping the workspace repositories in {}", root.display());
+        Some(repos)
+    } else {
+        None
+    };
     let hub = Hub::spawn(
         host.clone(),
         public_url.clone(),
@@ -80,7 +89,12 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
         notes,
         cfg.knowledge.clone(),
         cfg.store.tool_output_bytes,
+        repos.clone(),
     );
+    let git = repos.map(|repos| crate::workspace::hub::GitState {
+        repos,
+        cmds: hub.sender(),
+    });
     let web_dir = cfg.web_dir();
     if web_dir.join("index.html").is_file() {
         info!("serving the panel from {}", web_dir.display());
@@ -115,6 +129,7 @@ async fn serve(cfg: Arc<HubConfig>) -> Result<()> {
             push.clone(),
             web_dir.clone(),
             sync.clone(),
+            git.clone(),
         ));
     }
     tokio::spawn(ticker(hub.sender()));

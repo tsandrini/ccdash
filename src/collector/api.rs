@@ -19,6 +19,9 @@
 //! `{"cmd":"import","dir":"…","notes":[…]}` loads notes into the hub.
 //! Writes are queued while the hub is unreachable, reads fall back to the
 //! notes cache.
+//!
+//! `{"cmd":"workspace","op":"status"|"resync"|"init"|"adopt","unit":"…"}`
+//! drives the workspace sync (`ccdash workspace …`).
 
 use std::{
     sync::{
@@ -50,6 +53,7 @@ use crate::{
     protocol::{Call, Injection, Reply, Who},
     sync::collector::Handle as SyncHandle,
     wire::Envelope,
+    workspace::collector::{Cmd as WsCmd, Handle as WsHandle},
 };
 
 /// How long a tool waits for the hub before it answers from the cache or
@@ -102,6 +106,11 @@ enum Request {
         dir: String,
         notes: Vec<Upsert>,
     },
+    Workspace {
+        op: String,
+        #[serde(default)]
+        unit: Option<String>,
+    },
 }
 
 pub async fn serve(
@@ -109,13 +118,15 @@ pub async fn serve(
     local: Local,
     cfg: Arc<CollectorConfig>,
     sync: Option<SyncHandle>,
+    workspace: Option<WsHandle>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let (local, cfg, sync) = (local.clone(), cfg.clone(), sync.clone());
+                let (local, cfg, sync, workspace) =
+                    (local.clone(), cfg.clone(), sync.clone(), workspace.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, local, cfg, sync).await {
+                    if let Err(e) = handle(stream, local, cfg, sync, workspace).await {
                         debug!("api client: {e:#}");
                     }
                 });
@@ -130,6 +141,7 @@ async fn handle(
     local: Local,
     cfg: Arc<CollectorConfig>,
     sync: Option<SyncHandle>,
+    workspace: Option<WsHandle>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
@@ -201,6 +213,31 @@ async fn handle(
                     Err(e) => error(e),
                 }
             }
+            Ok(Request::Workspace { op, unit }) => match &workspace {
+                None => {
+                    error("the workspace sync is off on this machine ([workspace] enable)".into())
+                }
+                Some(ws) => match op.as_str() {
+                    "status" => {
+                        let mut status = ws.status().await?;
+                        status["type"] = json!("workspace");
+                        status
+                    }
+                    "resync" => {
+                        ws.send(WsCmd::Resync(unit));
+                        json!({ "type": "ok", "message": "fetching and snapshotting again" })
+                    }
+                    "init" => {
+                        ws.send(WsCmd::Init);
+                        json!({ "type": "ok", "message": "creating every unit the hub has and this machine lacks; `ccdash workspace status` follows it" })
+                    }
+                    "adopt" => {
+                        ws.send(WsCmd::Adopt(unit));
+                        json!({ "type": "ok", "message": "taking the first snapshot of the units that exist here and on the hub; `ccdash workspace status` follows it" })
+                    }
+                    other => error(format!("unknown workspace op {other:?}")),
+                },
+            },
         };
         send(&mut write, &reply).await?;
     }

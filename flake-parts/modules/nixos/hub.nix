@@ -1,9 +1,11 @@
 # The ccdash hub: the one process that keeps every machine's Claude Code
-# history and state (sessions, the prompt history: `sync.directory`), serves
-# the web UI and API, and sends Web Push notifications (the VAPID key pair is
-# generated into the state directory on first start). Collectors (the
-# home-manager module) connect to its `/collect` and `/sync/` endpoints, each
-# with its own token.
+# history and state (sessions, the prompt history: `sync.directory`), the
+# workspace repositories (`workspace.enable`: one bare repository per unit,
+# served over git smart HTTP at `/git/`), serves the web UI and API, and
+# sends Web Push notifications (the VAPID key pair is generated into the
+# state directory on first start). Collectors (the home-manager module)
+# connect to its `/collect`, `/sync/` and `/git/` endpoints, each with its
+# own token.
 { localFlake }:
 {
   config,
@@ -127,6 +129,24 @@ in
       '';
     };
 
+    workspace = {
+      enable = mkEnableOption ''
+        the workspace sync: every collector's workspace root (its
+        repositories and plain directories) kept in step through bare
+        repositories under `sync.directory/workspace/`, pushed and fetched
+        over git smart HTTP at `/git/` with the collector tokens. Adds git to
+        the hub's closure, the nginx location with unlimited bodies, and a
+        nightly `git gc` over the repositories (next to the database copy
+        when {option}`backup.enable` is on)
+      '';
+
+      gcOnCalendar = mkOption {
+        type = types.str;
+        default = "*-*-* 03:30:00";
+        description = "When to run `git gc` over the repositories (`systemd.time(7)`).";
+      };
+    };
+
     backup = {
       enable = mkEnableOption ''
         a nightly copy of the database through SQLite's backup API, checked
@@ -167,6 +187,7 @@ in
         store.path = mkDefault "${stateDir}/ccdash.db";
         push.key_file = mkDefault "${stateDir}/vapid.p8";
         sync.dir = mkDefault cfg.sync.directory;
+        workspace.enable = mkDefault cfg.workspace.enable;
       };
 
       users.users.ccdash = {
@@ -185,6 +206,8 @@ in
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         restartTriggers = [ configFile ];
+        # NOTE: the hub spawns `git http-backend` and the pre-receive guard
+        path = lib.optional cfg.workspace.enable pkgs.git;
         serviceConfig = {
           ExecStart = "${exe} hub --config ${configFile}";
           User = "ccdash";
@@ -237,6 +260,47 @@ in
             proxy_read_timeout 5m;
             proxy_send_timeout 5m;
           '';
+        };
+      }
+      // lib.optionalAttrs cfg.workspace.enable {
+        # NOTE: git pushes stream a pack of any size; a seed takes minutes
+        locations."/git/" = {
+          proxyPass = "http://${proxyEndpoint}";
+          extraConfig = ''
+            client_max_body_size 0;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_read_timeout 30m;
+            proxy_send_timeout 30m;
+          '';
+        };
+      };
+    })
+    (mkIf cfg.workspace.enable {
+      systemd.services.ccdash-hub-gc = {
+        description = "ccdash hub: git gc over the workspace repositories";
+        after = [ "ccdash-hub.service" ];
+        path = [ pkgs.git ];
+        script = "${exe} gc --config ${configFile}";
+        serviceConfig = {
+          Type = "oneshot";
+          User = "ccdash";
+          Group = "ccdash";
+          StateDirectory = "ccdash-hub";
+          StateDirectoryMode = "0700";
+          ReadWritePaths = mkIf (!lib.hasPrefix "${stateDir}/" cfg.sync.directory) [
+            cfg.sync.directory
+          ];
+          Nice = 10;
+          IOSchedulingClass = "idle";
+        };
+      };
+      systemd.timers.ccdash-hub-gc = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = cfg.workspace.gcOnCalendar;
+          Persistent = true;
+          RandomizedDelaySec = "20m";
         };
       };
     })

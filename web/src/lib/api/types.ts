@@ -149,6 +149,11 @@ answers: number, answer_p50_ms: number | null, prompts: number, cost_usd: number
 turns: number, turn_claude_ms: number, turn_tools_ms: number, turn_permission_ms: number, compactions: number, compactions_auto: number, tokens_input: number, tokens_output: number, tokens_cache_read: number, tokens_cache_write: number, api_requests: number, api_errors: number, commits: number, pull_requests: number, active_user_secs: number, active_cli_secs: number, };
 
 /**
+ * What one bundle (a directory directly under the root) overrides.
+ */
+export type BundleOverride = { auto_include_mb: number | null, sync_ignored: Array<Ignored>, always_exclude: Array<string>, };
+
+/**
  * A note in a list: everything but the body, plus its first lines.
  */
 export type Card = { workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
@@ -198,6 +203,28 @@ current_lines: number, copy_lines: number,
  */
 current_mtime: number, copy_mtime: number, };
 
+/**
+ * How a text conflict lands in the working tree.
+ */
+export type ConflictMode = "markers" | "set_aside";
+
+/**
+ * A conflicted path, as the collector that holds it reports it.
+ */
+export type ConflictReport = { path: string, 
+/**
+ * `text` (markers in the file) or `binary` (the local version kept).
+ */
+kind: string, 
+/**
+ * This host's blob, as the unit's repository has it.
+ */
+ours: string, 
+/**
+ * The other host's blob (in the hub's repository).
+ */
+theirs: string, other_host: string, at: number, };
+
 export type ContextHealth = { compactions: number, compactions_auto: number, 
 /**
  * Sessions that compacted at least once.
@@ -221,6 +248,11 @@ export type Conversation = { exchanges: Array<Exchange>,
 more: boolean, };
 
 export type DecisionUse = { source: string, decision: string, count: number, };
+
+/**
+ * A branch that moved on both sides.
+ */
+export type Diverged = { branch: string, local: string, remote: string, host: string, };
 
 export type Doc = { hot: boolean, workspace: string, slug: string, kind: NoteKind, project: string | null, title: string, summary: string | null, status: Status, stale_reason: string | null, version: number, updated_at: number, verified_at: number | null, recalls: number, priority: Priority, 
 /**
@@ -311,6 +343,21 @@ export type GraphEdge = { src: number, dst: number, kind: LinkKind, };
 
 export type GraphNode = { id: number, slug: string, kind: NoteKind, title: string, project: string | null, status: Status, created_at: number, updated_at: number, recalls: number, };
 
+/**
+ * What to do with a held snapshot.
+ */
+export type HeldAction = "apply" | "drop";
+
+/**
+ * A held snapshot, with the numbers that held it.
+ */
+export type HeldReport = { commit: string, added: number, deleted: number, tracked: number, at: number, };
+
+/**
+ * A held snapshot the hub knows about.
+ */
+export type HeldView = { unit: string, host: string, held: HeldReport, };
+
 export type Histogram = { counts: [number, number, number, number, number, number], median_ms: number | null, };
 
 export type History = { since: number, until: number, now: number, bucket_ms: number, lanes: Array<Lane>, usage: Array<UsagePoint>, cost_usd: number, prompts: number, 
@@ -322,6 +369,19 @@ tools: Array<ToolCount>,
  * Per machine, most working time first; one row under a host filter.
  */
 hosts: Array<HostTotals>, };
+
+/**
+ * One snapshot in a unit's history (`GET /api/v1/workspace/units/{unit}/history`).
+ */
+export type HistoryEntry = { commit: string, host: string, at: number, 
+/**
+ * A merge of another host's snapshot.
+ */
+merge: boolean, 
+/**
+ * Files changed against the previous snapshot of the host.
+ */
+files: number, branch: string | null, };
 
 /**
  * A search hit.
@@ -360,6 +420,29 @@ answers: number, answer_p50_ms: number | null, sessions: number, working_ms: num
  * Waits on you; parked time is apart.
  */
 your_turn_ms: number, parked_ms: number, prompts: number, cost_usd: number, lines_added: number, lines_removed: number, tools: number, tool_failures: number, compactions: number, tokens: number, cpu_secs: number, peak_mem_bytes: number, };
+
+/**
+ * A gitignored file or directory that travels anyway.
+ */
+export type Ignored = { 
+/**
+ * Glob relative to the unit (`*` spans directories).
+ */
+pattern: string, 
+/**
+ * Snapshotted and applied only while no local process holds a file
+ * under it open (a dev database, a running server).
+ */
+quiescent: boolean, };
+
+/**
+ * An ignored directory present in a unit, with what carrying it would cost.
+ */
+export type IgnoredDir = { path: string, files: number, bytes: number, 
+/**
+ * Whether `sync_ignored` carries it.
+ */
+carried: boolean, quiescent: boolean, };
 
 export type Issue = { in_progress: boolean, 
 /**
@@ -520,6 +603,16 @@ export type ModelUse = { model: string, requests: number, tokens_input: number, 
  * Time to the first token, median.
  */
 ttft_p50_ms: number | null, };
+
+/**
+ * A directory at unit depth the hub has not included.
+ */
+export type NewDir = { unit: string, kind: UnitKind, size: number, hosts: Array<string>, 
+/**
+ * `waiting` (over the threshold), `excluded` (the globs) or
+ * `ignored` (the owner said so).
+ */
+state: string, at: number, };
 
 /**
  * A note as stored, body included.
@@ -873,6 +966,11 @@ workspace: string | null,
  */
 other: boolean, cost_usd: number, };
 
+/**
+ * Which side a conflict is resolved to.
+ */
+export type Side = "mine" | "theirs";
+
 export type SlowCall = { ts: number, session: string, label: string, host: string, cwd: string, tool: string, summary: string, ms: number, ok: boolean, };
 
 export type Snapshot = { 
@@ -1155,6 +1253,67 @@ export type Turn = { started_at: number, ended_at: number | null, tools: number,
  */
 files: Array<string>, };
 
+/**
+ * A git repository or a plain directory under the workspace root.
+ */
+export type UnitKind = "git" | "plain";
+
+/**
+ * What one unit overrides.
+ */
+export type UnitOverride = { 
+/**
+ * Forces the unit in or out, over the globs.
+ */
+include: boolean | null, 
+/**
+ * Nothing moves in either direction.
+ */
+paused: boolean, always_exclude: Array<string>, sync_ignored: Array<Ignored>, max_file_mb: number | null, conflicts: ConflictMode | null, };
+
+/**
+ * Where a unit stands on one host.
+ */
+export type UnitState = "in_step" | "ahead" | "behind" | "merging" | "conflict" | "held" | "paused" | "skipped" | "waiting" | "failed" | "seeding" | "unadopted" | "creating" | "missing";
+
+/**
+ * One unit on one host, as the collector reports it after each pass.
+ */
+export type UnitStatus = { unit: string, kind: UnitKind, state: UnitState, detail: string | null, 
+/**
+ * This host's snapshot (`refs/sync/<host>`).
+ */
+snapshot: string | null, 
+/**
+ * Files tracked by the last snapshot.
+ */
+files: number, last_pass: number | null, 
+/**
+ * Since when passes have failed, when they do.
+ */
+failing_since: number | null, conflicts: Array<ConflictReport>, held: HeldReport | null, diverged: Array<Diverged>, ignored: Array<IgnoredDir>, };
+
+/**
+ * One unit as the hub knows it, with every host's cell.
+ */
+export type UnitView = { unit: string, workspace: string, kind: UnitKind, 
+/**
+ * `included`, `waiting`, `excluded` or `ignored`.
+ */
+state: string, size: number, 
+/**
+ * Bumped on every accepted push.
+ */
+version: number, at: number, 
+/**
+ * Host → its last report of the unit.
+ */
+hosts: { [key in string]: UnitStatus }, 
+/**
+ * Host → its snapshot on the hub.
+ */
+refs: { [key in string]: string }, paused: boolean, };
+
 export type Unsubscribe = { endpoint: string, };
 
 export type Update = { "type": "session", session: Session, } | { "type": "removed", host: string, id: string, } | { "type": "rate_limits", rate_limits: RateLimits, } | { "type": "hosts", hosts: Array<HostStatus>, } | { "type": "notes", workspace: string, } | { "type": "launch", launch: Launch, };
@@ -1218,6 +1377,68 @@ export type Working = { session: string, host: string, label: string,
  */
 claimed: boolean, };
 
+/**
+ * The unit scope and the rules, owned by the hub and edited in the
+ * panel; collectors cache the last one they got for an offline start.
+ */
+export type WorkspaceConfig = { 
+/**
+ * Units are expected this many levels below the root (`2` means
+ * `<root>/<bundle>/<repo>`); a repository at a shallower level (a
+ * bundle root) is a unit too, a nested one deeper is its own unit.
+ */
+depth: number, 
+/**
+ * Globs on unit ids (`<bundle>/<repo>`); empty includes every unit.
+ */
+include: Array<string>, 
+/**
+ * Globs on unit ids that never travel; wins over `include`.
+ */
+exclude: Array<string>, 
+/**
+ * Directory names (or `/`-containing relative paths) that never
+ * travel, wherever they appear.
+ */
+always_exclude: Array<string>, 
+/**
+ * Gitignored files and directories that travel anyway; wins over
+ * `always_exclude` for the unit.
+ */
+sync_ignored: Array<Ignored>, 
+/**
+ * Untracked files above this are skipped and listed.
+ */
+max_file_mb: number, 
+/**
+ * New directories under this are included by themselves.
+ */
+auto_include_mb: number, conflicts: ConflictMode, bundles: { [key in string]: BundleOverride }, units: { [key in string]: UnitOverride }, };
+
+export type WorkspaceConfigBody = { config: WorkspaceConfig, };
+
+/**
+ * A conflict the hub recorded.
+ */
+export type WorkspaceConflict = { id: number, unit: string, host: string, path: string, kind: string, ours: string, theirs: string, other_host: string, at: number, pending: Side | null, error: string | null, };
+
+export type WorkspaceConflictBody = { 
+/**
+ * `mine`, `theirs` or `dismiss`.
+ */
+action: string, };
+
+export type WorkspaceHeldBody = { action: HeldAction, 
+/**
+ * The held commit the panel showed; the host acts only on that one.
+ */
+commit: string | null, };
+
+/**
+ * One host's column in the panel's grid.
+ */
+export type WorkspaceHost = { host: string, connected: boolean, status: WorkspaceStatus | null, };
+
 export type WorkspaceProjects = { name: string, 
 /**
  * By project name; the workspace-wide notes come first (`project` None).
@@ -1231,6 +1452,48 @@ flagged: Array<Card>,
  * Live notes in the workspace.
  */
 total: number, };
+
+export type WorkspaceResyncBody = { unit: string | null, };
+
+/**
+ * How a host's collector stands as a whole.
+ */
+export type WorkspaceStatus = { root: string, 
+/**
+ * The setup version the collector runs on.
+ */
+setup_version: number, watching: boolean, units: number, in_step: number, pending: number, error: string | null, 
+/**
+ * While every unit is seeded, created or adopted: done and total.
+ */
+progress: [number, number] | null, last_pass: number | null, };
+
+export type WorkspaceUnitBody = { 
+/**
+ * `include`, `exclude`, `ignore`, `pause`, `resume`, `adopt`, `override`.
+ */
+op: string, 
+/**
+ * For `adopt`: the host holding the copy.
+ */
+host: string | null, 
+/**
+ * For `override`: the unit's overrides, whole (the defaults remove it).
+ */
+value: UnitOverride | null, };
+
+/**
+ * `GET /api/v1/workspace`.
+ */
+export type WorkspaceView = { enabled: boolean, hosts: Array<WorkspaceHost>, units: Array<UnitView>, new_dirs: Array<NewDir>, conflicts: Array<WorkspaceConflict>, held: Array<HeldView>, config: WorkspaceConfig, config_version: number, 
+/**
+ * Bytes the repositories take on the hub.
+ */
+bytes: number, 
+/**
+ * Bytes pushed per day (local dates), the last 30 days.
+ */
+growth: Array<[string, number]>, };
 
 /**
  * What a write did.

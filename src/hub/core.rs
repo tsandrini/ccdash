@@ -2,7 +2,10 @@
 //! the collector links, open asks and notifications. Everything else
 //! talks to it through `Cmd`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Workspace name → the directories under it on one host.
 pub type Dirs = BTreeMap<String, Vec<String>>;
@@ -31,9 +34,16 @@ use crate::{
     sync::{SyncHost, SyncStatus},
     util::{self, now_ms},
     wire::Envelope,
-    workspace::Workspaces,
+    workspace::{
+        NewDir, SeenUnit, UnitStatus, WorkspaceConfig, WorkspaceHost, WorkspaceSetup,
+        WorkspaceStatus, Workspaces,
+        hub::{self as wshub, Reported, Repos},
+    },
     wrap_up,
 };
+
+/// A unit failing for this long notifies.
+const FAILING_MS: i64 = 600_000;
 
 const MAX_TITLE: usize = 100;
 const MAX_REPLY: usize = 20_000;
@@ -241,6 +251,66 @@ pub enum Cmd {
         host: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// How the workspace stands on `host`: the changed units, or all.
+    WorkspaceReport {
+        host: String,
+        status: WorkspaceStatus,
+        units: Vec<UnitStatus>,
+        full: bool,
+    },
+    /// What `host` sees at unit depth.
+    WorkspaceSeen {
+        host: String,
+        units: Vec<SeenUnit>,
+    },
+    /// A receive-pack for `unit` from `host` ran; `bytes` came in.
+    WorkspacePushed {
+        unit: String,
+        host: String,
+        bytes: u64,
+    },
+    /// `host`'s snapshot of `unit` moved on the hub: tell the others.
+    WorkspaceMoved {
+        unit: String,
+        host: String,
+        version: i64,
+    },
+    /// The configuration or the unit set changed in the database: reload
+    /// it and hand it to every collector.
+    WorkspaceSetupChanged,
+    /// What `host` made of a conflict resolution.
+    WorkspaceResolved {
+        host: String,
+        id: i64,
+        error: Option<String>,
+    },
+    /// The hosts, their reports and the setup, for the panel.
+    WorkspaceState(oneshot::Sender<Option<WorkspaceState>>),
+    /// A collector's starting configuration, kept when the hub has none.
+    WorkspaceStarting {
+        host: String,
+        config: WorkspaceConfig,
+    },
+}
+
+/// The live part of the Workspace page.
+#[derive(Debug, Clone)]
+pub struct WorkspaceState {
+    pub hosts: Vec<WorkspaceHost>,
+    /// Host → unit → its last report.
+    pub reports: HashMap<String, HashMap<String, UnitStatus>>,
+    pub config: WorkspaceConfig,
+    pub version: i64,
+}
+
+/// The hub's side of the workspace sync, as the core holds it.
+struct WorkspaceCore {
+    repos: Arc<Repos>,
+    setup: WorkspaceSetup,
+    reports: HashMap<String, Reported>,
+    /// New directories over the threshold, for the notifications.
+    waiting: Vec<NewDir>,
+    started: i64,
 }
 
 /// A session to start, with the directory already resolved from a known
@@ -293,6 +363,7 @@ pub struct Hub {
 }
 
 impl Hub {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         host: String,
         public_url: String,
@@ -301,6 +372,7 @@ impl Hub {
         notes: Option<Notes>,
         knowledge: KnowledgeCfg,
         tool_output_bytes: usize,
+        repos: Option<Arc<Repos>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         let (updates, _) = broadcast::channel(256);
@@ -308,6 +380,27 @@ impl Hub {
             .reader()
             .inspect_err(|e| warn!("store reader: {e:#}"))
             .ok();
+        let workspace = repos.map(|repos| {
+            let (setup, waiting) = reader
+                .as_ref()
+                .map(|conn| {
+                    let setup = wshub::setup(conn).unwrap_or_default();
+                    let waiting = wshub::new_dirs(conn, &setup.config)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.state == "waiting")
+                        .collect();
+                    (setup, waiting)
+                })
+                .unwrap_or_default();
+            WorkspaceCore {
+                repos,
+                setup,
+                reports: HashMap::new(),
+                waiting,
+                started: now_ms(),
+            }
+        });
         let core = Core {
             host,
             public_url,
@@ -331,9 +424,18 @@ impl Hub {
             launches: HashMap::new(),
             stops: HashMap::new(),
             dirs: HashMap::new(),
+            workspace,
         };
         tokio::spawn(run(core, rx));
         Self { tx, updates }
+    }
+
+    /// The live part of the Workspace page; None when the workspace sync
+    /// is off on the hub.
+    pub async fn workspace_state(&self) -> Result<Option<WorkspaceState>> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::WorkspaceState(reply)).await?;
+        rx.await.context("hub stopped")
     }
 
     /// Tells collectors and the panel that `notes` changed.
@@ -545,6 +647,8 @@ struct Core {
     stops: HashMap<String, Vec<oneshot::Sender<Result<Session, String>>>>,
     /// The project directories each host reported.
     dirs: HashMap<String, Dirs>,
+    /// The workspace sync, when it is on.
+    workspace: Option<WorkspaceCore>,
 }
 
 /// The session behind a knowledge call, placed in its workspace.
@@ -829,6 +933,81 @@ async fn run(mut core: Core, mut rx: mpsc::Receiver<Cmd>) {
                 hosts.sort();
                 let _ = reply.send(hosts);
             }
+            Cmd::WorkspaceReport {
+                host,
+                status,
+                units,
+                full,
+            } => core.workspace_report(&host, status, units, full),
+            Cmd::WorkspaceSeen { host, units } => core.workspace_seen(&host, units),
+            Cmd::WorkspacePushed { unit, host, bytes } => {
+                core.workspace_pushed(&unit, &host, bytes)
+            }
+            Cmd::WorkspaceMoved {
+                unit,
+                host,
+                version,
+            } => {
+                let others: Vec<String> =
+                    core.links.keys().filter(|h| **h != host).cloned().collect();
+                for other in others {
+                    core.tell(
+                        &other,
+                        ToCollector::WorkspaceChanged {
+                            unit: unit.clone(),
+                            host: host.clone(),
+                            version,
+                        },
+                    );
+                }
+            }
+            Cmd::WorkspaceSetupChanged => core.workspace_setup_changed(),
+            Cmd::WorkspaceResolved { host, id, error } => {
+                let store = core.store.clone();
+                tokio::spawn(async move {
+                    let done = store
+                        .exec(move |conn| {
+                            wshub::conflict_resolved(conn, &host, id, error.as_deref(), now_ms())
+                        })
+                        .await;
+                    if let Err(e) = done.and_then(|r| r) {
+                        warn!("recording a workspace conflict resolution: {e:#}");
+                    }
+                });
+            }
+            Cmd::WorkspaceState(reply) => {
+                let _ = reply.send(core.workspace_state());
+            }
+            Cmd::WorkspaceStarting { host, config } => {
+                if core
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|ws| ws.setup.version == 0)
+                {
+                    info!("workspace: taking {host}'s starting configuration");
+                    let (store, cmds) = (core.store.clone(), core.cmds.clone());
+                    tokio::spawn(async move {
+                        let saved = store
+                            .exec(move |conn| -> Result<bool> {
+                                let (_, version) = wshub::load_config(conn)?;
+                                if version != 0 {
+                                    return Ok(false);
+                                }
+                                wshub::save_config(conn, &config, now_ms())?;
+                                Ok(true)
+                            })
+                            .await;
+                        match saved {
+                            Ok(Ok(true)) => {
+                                let _ = cmds.send(Cmd::WorkspaceSetupChanged).await;
+                            }
+                            Ok(Ok(false)) => {}
+                            Ok(Err(e)) => warn!("keeping the starting configuration: {e:#}"),
+                            Err(_) => {}
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -1046,8 +1225,292 @@ impl Core {
         };
         self.tell(&host, welcome);
         self.tell(&host, snapshot);
+        if let Some(ws) = &self.workspace {
+            let setup = ws.setup.clone();
+            self.tell(
+                &host,
+                ToCollector::WorkspaceSetup {
+                    setup: Box::new(setup),
+                },
+            );
+        }
         self.push_notes(vec![tx], None);
         self.hosts_changed();
+    }
+
+    // ---- the workspace sync ----
+
+    fn workspace_report(
+        &mut self,
+        host: &str,
+        status: WorkspaceStatus,
+        units: Vec<UnitStatus>,
+        full: bool,
+    ) {
+        let Some(ws) = &mut self.workspace else {
+            return;
+        };
+        let report = ws.reports.entry(host.to_owned()).or_default();
+        report.status = status;
+        report.at = now_ms();
+        if full {
+            report.units.clear();
+        }
+        let store = self.store.clone();
+        let host_owned = host.to_owned();
+        let changed: Vec<(String, Vec<crate::workspace::ConflictReport>)> = units
+            .iter()
+            .map(|u| (u.unit.clone(), u.conflicts.clone()))
+            .collect();
+        for u in units {
+            report.units.insert(u.unit.clone(), u);
+        }
+        tokio::spawn(async move {
+            for (unit, conflicts) in changed {
+                let host = host_owned.clone();
+                let done = store
+                    .exec(move |conn| {
+                        wshub::reconcile_conflicts(conn, &host, &unit, &conflicts, now_ms())
+                    })
+                    .await;
+                if let Err(e) = done.and_then(|r| r) {
+                    warn!("recording workspace conflicts: {e:#}");
+                }
+            }
+        });
+        self.refresh_notes();
+    }
+
+    fn workspace_seen(&mut self, host: &str, units: Vec<SeenUnit>) {
+        if self.workspace.is_none() {
+            return;
+        }
+        let (store, cmds, host) = (self.store.clone(), self.cmds.clone(), host.to_owned());
+        tokio::spawn(async move {
+            match store
+                .exec(move |conn| wshub::seen(conn, &host, &units, now_ms()))
+                .await
+            {
+                Ok(Ok(changed)) => {
+                    // NOTE: the waiting list changes with every report; the setup only when something was included
+                    let _ = cmds.send(Cmd::WorkspaceSetupChanged).await;
+                    let _ = changed;
+                }
+                Ok(Err(e)) => warn!("recording what a host sees: {e:#}"),
+                Err(_) => {}
+            }
+        });
+    }
+
+    fn workspace_pushed(&mut self, unit: &str, host: &str, bytes: u64) {
+        let Some(ws) = &self.workspace else {
+            return;
+        };
+        let (repos, store, cmds) = (ws.repos.clone(), self.store.clone(), self.cmds.clone());
+        let (unit, host) = (unit.to_owned(), host.to_owned());
+        let new_unit = !ws.setup.units.contains_key(&unit);
+        tokio::spawn(async move {
+            let (repos2, unit2) = (repos.clone(), unit.clone());
+            let refs = match tokio::task::spawn_blocking(move || repos2.sync_refs(&unit2)).await {
+                Ok(Ok(refs)) => refs,
+                Ok(Err(e)) => {
+                    warn!("reading the refs of {unit}: {e:#}");
+                    return;
+                }
+                Err(_) => return,
+            };
+            let (unit3, host3) = (unit.clone(), host.clone());
+            let result = store
+                .exec(move |conn| wshub::set_refs(conn, &unit3, &refs, &host3, bytes, now_ms()))
+                .await;
+            match result {
+                Ok(Ok((moved, version))) => {
+                    if !moved.is_empty() {
+                        let _ = cmds
+                            .send(Cmd::WorkspaceMoved {
+                                unit,
+                                host,
+                                version,
+                            })
+                            .await;
+                    }
+                    if new_unit {
+                        let _ = cmds.send(Cmd::WorkspaceSetupChanged).await;
+                    }
+                }
+                Ok(Err(e)) => warn!("recording the refs of {unit}: {e:#}"),
+                Err(_) => {}
+            }
+        });
+    }
+
+    fn workspace_setup_changed(&mut self) {
+        let Some(ws) = &mut self.workspace else {
+            return;
+        };
+        let Some(conn) = &self.reader else {
+            return;
+        };
+        let setup = match wshub::setup(conn) {
+            Ok(setup) => setup,
+            Err(e) => {
+                warn!("loading the workspace setup: {e:#}");
+                return;
+            }
+        };
+        ws.waiting = wshub::new_dirs(conn, &setup.config)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n.state == "waiting")
+            .collect();
+        if setup != ws.setup {
+            ws.setup = setup.clone();
+            let hosts: Vec<String> = self.links.keys().cloned().collect();
+            for host in hosts {
+                self.tell(
+                    &host,
+                    ToCollector::WorkspaceSetup {
+                        setup: Box::new(setup.clone()),
+                    },
+                );
+            }
+        }
+        self.refresh_notes();
+    }
+
+    fn workspace_state(&self) -> Option<WorkspaceState> {
+        let ws = self.workspace.as_ref()?;
+        let mut names: BTreeSet<String> = self.hosts.keys().cloned().collect();
+        names.extend(ws.reports.keys().cloned());
+        let hosts = names
+            .into_iter()
+            .map(|name| WorkspaceHost {
+                connected: self.hosts.get(&name).is_some_and(|h| h.connected),
+                status: ws.reports.get(&name).map(|r| r.status.clone()),
+                host: name,
+            })
+            .collect();
+        Some(WorkspaceState {
+            hosts,
+            reports: ws
+                .reports
+                .iter()
+                .map(|(h, r)| (h.clone(), r.units.clone()))
+                .collect(),
+            config: ws.setup.config.clone(),
+            version: ws.setup.version,
+        })
+    }
+
+    /// Notification candidates of the workspace sync: held snapshots,
+    /// conflicts, new directories over the threshold, units failing for a
+    /// while.
+    fn workspace_notes(&self, now: i64) -> Vec<Note> {
+        let Some(ws) = &self.workspace else {
+            return Vec::new();
+        };
+        let page = format!("{}/workspace", self.public_url);
+        let note = |seq: String, at: i64, title: String, body: String, unit: &str| Note {
+            seq,
+            opened_at: at,
+            focused: false,
+            content: crate::notify::Content {
+                title,
+                body,
+                session: String::new(),
+                url: format!("{page}/{unit}"),
+                key: None,
+                buttons: Vec::new(),
+                more: false,
+                urgent: true,
+            },
+        };
+        let mut out = Vec::new();
+        for (host, report) in &ws.reports {
+            for (unit, u) in &report.units {
+                if let Some(h) = &u.held
+                    && h.at >= ws.started
+                {
+                    out.push(note(
+                        format!("ws-held-{host}-{unit}"),
+                        h.at,
+                        format!(
+                            "{unit}: {} files added, {} deleted on {host}",
+                            h.added, h.deleted
+                        ),
+                        "The snapshot is held: apply or drop it on the Workspace page.".into(),
+                        unit,
+                    ));
+                }
+                for c in &u.conflicts {
+                    if c.at >= ws.started {
+                        out.push(note(
+                            format!("ws-conflict-{host}-{unit}-{}", c.path),
+                            c.at,
+                            format!("{unit}: conflict in {}", c.path),
+                            format!(
+                                "Edited on {host} and {} at once: fix the markers or choose a side on the Workspace page.",
+                                c.other_host
+                            ),
+                            unit,
+                        ));
+                    }
+                }
+                if let Some(since) = u.failing_since
+                    && now - since >= FAILING_MS
+                    && since >= ws.started
+                {
+                    out.push(note(
+                        format!("ws-fail-{host}-{unit}"),
+                        since + FAILING_MS,
+                        format!("{unit} keeps failing on {host}"),
+                        u.detail
+                            .clone()
+                            .unwrap_or_else(|| "see the Workspace page".into()),
+                        unit,
+                    ));
+                }
+            }
+        }
+        for n in &ws.waiting {
+            if n.at >= ws.started {
+                out.push(note(
+                    format!("ws-new-{}", n.unit),
+                    n.at,
+                    format!("New directory {} ({} MB)", n.unit, n.size >> 20),
+                    "Larger than the auto-include threshold: include or ignore it on the Workspace page.".into(),
+                    &n.unit,
+                ));
+            }
+        }
+        out
+    }
+
+    /// Recomputes the notification candidates (sessions and the workspace).
+    fn refresh_notes(&self) {
+        let Some(notes) = &self.notes else {
+            return;
+        };
+        let keys: HashMap<&str, &str> = self
+            .pending
+            .iter()
+            .map(|(id, p)| (id.as_str(), p.key.as_str()))
+            .collect();
+        let now = now_ms();
+        let mut next: Vec<Note> = self
+            .states
+            .values()
+            .flat_map(|state| notes.composer.notes(state, &keys, now))
+            .collect();
+        next.extend(self.workspace_notes(now));
+        next.sort_by(|a, b| a.seq.cmp(&b.seq));
+        notes.tx.send_if_modified(|current| {
+            let changed = *current != next;
+            if changed {
+                *current = next;
+            }
+            changed
+        });
     }
 
     /// Sends the live notes of `workspace` (or every workspace) to the
@@ -2422,27 +2885,7 @@ impl Core {
             }
             let _ = self.updates.send(update);
         }
-        if let Some(notes) = &self.notes {
-            let keys: HashMap<&str, &str> = self
-                .pending
-                .iter()
-                .map(|(id, p)| (id.as_str(), p.key.as_str()))
-                .collect();
-            let now = now_ms();
-            let mut next: Vec<Note> = self
-                .states
-                .values()
-                .flat_map(|state| notes.composer.notes(state, &keys, now))
-                .collect();
-            next.sort_by(|a, b| a.seq.cmp(&b.seq));
-            notes.tx.send_if_modified(|current| {
-                let changed = *current != next;
-                if changed {
-                    *current = next;
-                }
-                changed
-            });
-        }
+        self.refresh_notes();
         for id in close {
             self.close_resolved(host, &id);
         }
@@ -2673,6 +3116,7 @@ mod tests {
             None,
             KnowledgeCfg::default(),
             0,
+            None,
         );
         let mut rxs = HashMap::new();
         for (conn, host) in ["navi", "flat"].into_iter().enumerate() {
@@ -2786,6 +3230,7 @@ mod tests {
             None,
             KnowledgeCfg::default(),
             0,
+            None,
         );
         let req = |resume: Option<&str>| LaunchReq {
             host: "navi".into(),
@@ -3014,6 +3459,7 @@ mod tests {
             None,
             KnowledgeCfg::default(),
             0,
+            None,
         );
         let (tx, mut rx) = mpsc::channel(64);
         hub.send(Cmd::CollectorOpen {

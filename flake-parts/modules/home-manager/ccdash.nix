@@ -149,6 +149,92 @@ in
       {option}`settings.sync` (`include`, `exclude`, `root`)
     '';
 
+    workspace = {
+      enable = mkEnableOption ''
+        keeping this machine's workspace root (every git repository and plain
+        directory under it, at {option}`depth`) in step with the other
+        machines through the hub: snapshots of the working tree, the staged
+        state, branches, tags and stashes travel as they change; the other
+        machines fast-forward or merge, conflicts land as git markers plus an
+        entry in the panel. The hub owns the configuration once it has one;
+        the options here are the starting point (handoff's `config.toml`
+        carried over). The collector's unit runs with `CPUWeight=20`,
+        `IOWeight=20` and `Nice=10` so a seed or a big merge never competes
+        with your work
+      '';
+
+      root = mkOption {
+        type = types.str;
+        default = "~/ProjectBundle";
+        description = "The workspace root. `~/` and `$VAR` expand.";
+      };
+
+      depth = mkOption {
+        type = types.ints.positive;
+        default = 2;
+        description = "Units are expected this many levels below the root (`2`: `<root>/<bundle>/<repo>`).";
+      };
+
+      include = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "work/*"
+          "me/*"
+        ];
+        description = "Globs on unit ids (`<bundle>/<repo>`) that travel; empty includes every unit.";
+      };
+
+      exclude = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "me/nixpkgs"
+          "*_bkp"
+        ];
+        description = "Globs on unit ids that never travel; wins over `include`.";
+      };
+
+      alwaysExclude = mkOption {
+        type = types.listOf types.str;
+        default = [
+          "node_modules"
+          ".venv"
+          "venv"
+          ".direnv"
+          ".devenv"
+          "target"
+          "result"
+          "result-*"
+          "__pycache__"
+          ".cache"
+        ];
+        description = "Directory names that never travel, wherever they appear, unless {option}`syncIgnored` names them for a unit.";
+      };
+
+      syncIgnored = mkOption {
+        type = types.listOf types.str;
+        default = [
+          ".env"
+          ".env.*"
+          ".envrc.local"
+        ];
+        description = "Gitignored files and directories (paths relative to the unit, a glob in the last segment) that travel anyway; paths under `.devenv/state` are carried only while no local process holds them open.";
+      };
+
+      maxFileMb = mkOption {
+        type = types.ints.positive;
+        default = 64;
+        description = "Untracked files above this many MB are skipped and listed.";
+      };
+
+      autoIncludeMb = mkOption {
+        type = types.ints.unsigned;
+        default = 500;
+        description = "A new directory at unit depth under this many MB is included by itself; a bigger one waits for a tap in the panel.";
+      };
+    };
+
     launch = {
       direnv = mkOption {
         type = types.bool;
@@ -281,6 +367,17 @@ in
           token_file = mkDefault cfg.hub.tokenFile;
         };
         sync.enable = mkDefault cfg.sync.enable;
+        workspace = {
+          enable = mkDefault cfg.workspace.enable;
+          root = mkDefault cfg.workspace.root;
+          depth = mkDefault cfg.workspace.depth;
+          include = mkDefault cfg.workspace.include;
+          exclude = mkDefault cfg.workspace.exclude;
+          always_exclude = mkDefault cfg.workspace.alwaysExclude;
+          sync_ignored = mkDefault cfg.workspace.syncIgnored;
+          max_file_mb = mkDefault cfg.workspace.maxFileMb;
+          auto_include_mb = mkDefault cfg.workspace.autoIncludeMb;
+        };
         launch = {
           direnv = mkDefault (
             optionals cfg.launch.direnv [
@@ -306,6 +403,14 @@ in
           ExecStart = "${exe} collector";
           Restart = "on-failure";
           RestartSec = 2;
+          # NOTE: the workspace sync spawns git; measured 2026-10-30 under these
+          # limits at < 1 % of a core during real work, a seed at ~40 %
+          Environment = mkIf cfg.workspace.enable [ "PATH=${lib.makeBinPath [ pkgs.git ]}" ];
+        }
+        // optionalAttrs cfg.workspace.enable {
+          CPUWeight = 20;
+          IOWeight = 20;
+          Nice = 10;
         };
         Install.WantedBy = [ cfg.systemdTarget ];
       };

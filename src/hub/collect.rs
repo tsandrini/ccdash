@@ -214,6 +214,19 @@ fn command(host: &str, msg: ToHub) -> Option<Cmd> {
             error,
             copy,
         },
+        ToHub::WorkspaceUnits { units } => Cmd::WorkspaceSeen { host, units },
+        ToHub::Workspace {
+            status,
+            units,
+            full,
+        } => Cmd::WorkspaceReport {
+            host,
+            status,
+            units,
+            full,
+        },
+        ToHub::WorkspaceResolved { id, error } => Cmd::WorkspaceResolved { host, id, error },
+        ToHub::WorkspaceConfig { config } => Cmd::WorkspaceStarting { host, config },
     })
 }
 

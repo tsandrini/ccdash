@@ -10,7 +10,8 @@ links can be shared and the back button works.
 2. [A session's page](#2-a-sessions-page)
 3. [Projects](#3-projects)
 4. [History and Analytics](#4-history-and-analytics)
-5. [Desktop (DankMaterialShell)](#5-desktop-dankmaterialshell)
+5. [State and Workspace](#5-state-and-workspace)
+6. [Desktop (DankMaterialShell)](#6-desktop-dankmaterialshell)
 
 ## 1. Now and Sessions
 
@@ -102,7 +103,27 @@ sets the `OTEL_*` variables and starts a receiver in the collector on
 `127.0.0.1:7839`. It keeps counts and timings only; prompt text stays
 redacted, as Claude Code sends it by default.
 
-## 5. Desktop (DankMaterialShell)
+## 5. State and Workspace
+
+**State** is each machine's copy of `~/.claude` (the [state
+sync](state-sync.md)): machines with Resync, conflicts with their
+resolutions, sizes and growth.
+
+**Workspace** is the workspace root on every machine (the [workspace
+sync](workspace.md)): the machines with their collector (units, in step,
+a seed or adoption as progress) and Resync; the grid of units × machines
+grouped by bundle with a chip per cell and filters (changed today, needs
+you, conflicts, held, paused, a search); new directories with Include and
+Ignore; held snapshots with Apply and Drop; conflicts with both versions
+side by side and Keep mine / Take theirs / Dismiss; the configuration
+(globs, what never travels, what travels although ignored, limits, the
+conflict shape, per-bundle thresholds). A unit's page shows its state on
+every machine with the snapshot id, diverged branches, its conflicts, the
+ignored directories present with a switch each (carry `node_modules`,
+with its size), the overrides (size limit, conflict shape, pause,
+exclude, Adopt here) and the snapshot history.
+
+## 6. Desktop (DankMaterialShell)
 
 `services.ccdash.dms.enable = true` links the [plugin](../dms-plugin/) into
 DankMaterialShell: a bar pill with the sessions that need you, a dash tab

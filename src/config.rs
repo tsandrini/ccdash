@@ -24,6 +24,7 @@ pub struct HubConfig {
     pub push: Push,
     pub knowledge: Knowledge,
     pub sync: HubSync,
+    pub workspace: HubWorkspace,
 }
 
 /// `ccdash collector`: the hub link plus everything read on this machine.
@@ -44,6 +45,7 @@ pub struct CollectorConfig {
     pub queue: Queue,
     pub inject: Inject,
     pub sync: Sync,
+    pub workspace: Workspace,
 }
 
 /// Where the hub keeps Claude Code's state for the collectors.
@@ -52,6 +54,77 @@ pub struct CollectorConfig {
 pub struct HubSync {
     /// Defaults to `claude/` next to the database. `$VAR` expands.
     pub dir: Option<PathBuf>,
+}
+
+/// The workspace sync on the hub: bare repositories under
+/// `sync.dir/workspace/`, the git smart HTTP routes, the configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HubWorkspace {
+    pub enable: bool,
+}
+
+/// Keeping the workspace root (every repository and plain directory
+/// under it) in step with the other machines through the hub.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Workspace {
+    pub enable: bool,
+    /// The workspace root, e.g. `~/ProjectBundle`. `$VAR` and `~/` expand.
+    pub root: Option<PathBuf>,
+    /// The starting configuration (unit globs, excludes, the opted-in
+    /// ignored paths), until the hub's takes over.
+    pub depth: u32,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub always_exclude: Vec<String>,
+    pub sync_ignored: Vec<String>,
+    pub max_file_mb: u64,
+    pub auto_include_mb: u64,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        let defaults = crate::workspace::WorkspaceConfig::default();
+        Self {
+            enable: false,
+            root: None,
+            depth: defaults.depth,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            always_exclude: defaults.always_exclude,
+            sync_ignored: defaults
+                .sync_ignored
+                .into_iter()
+                .map(|i| i.pattern)
+                .collect(),
+            max_file_mb: defaults.max_file_mb,
+            auto_include_mb: defaults.auto_include_mb,
+        }
+    }
+}
+
+impl Workspace {
+    /// The starting configuration for the hub.
+    pub fn starting(&self) -> crate::workspace::WorkspaceConfig {
+        crate::workspace::WorkspaceConfig {
+            depth: self.depth.max(1),
+            include: self.include.clone(),
+            exclude: self.exclude.clone(),
+            always_exclude: self.always_exclude.clone(),
+            sync_ignored: self
+                .sync_ignored
+                .iter()
+                .map(|p| crate::workspace::Ignored {
+                    pattern: p.clone(),
+                    quiescent: p.starts_with(crate::workspace::QUIESCENT_PREFIX),
+                })
+                .collect(),
+            max_file_mb: self.max_file_mb,
+            auto_include_mb: self.auto_include_mb,
+            ..crate::workspace::WorkspaceConfig::default()
+        }
+    }
 }
 
 /// Keeping this machine's Claude Code state (sessions, rewind
@@ -502,6 +575,18 @@ impl CollectorConfig {
         self.host.clone().unwrap_or_else(crate::util::hostname)
     }
 
+    /// The workspace root the workspace sync keeps in step.
+    pub fn workspace_root(&self) -> Option<PathBuf> {
+        let raw = self.workspace.root.as_ref()?.to_string_lossy().into_owned();
+        let expanded = crate::util::expand_env(&raw);
+        let home = std::env::var("HOME").unwrap_or_default();
+        Some(PathBuf::from(match expanded.strip_prefix("~/") {
+            Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
+            None if expanded == "~" => home,
+            None => expanded,
+        }))
+    }
+
     /// The Claude config dir the sync keeps in step.
     pub fn sync_root(&self) -> PathBuf {
         self.sync
@@ -540,6 +625,27 @@ mod tests {
         assert_eq!(sync.sync.exclude, ["projects/-tmp-*"]);
         let hub: HubConfig = toml::from_str("[store]\npath = \"/s/h.db\"\n").unwrap();
         assert_eq!(hub.sync_dir(), PathBuf::from("/s/claude"));
+        let ws: CollectorConfig = toml::from_str(
+            "[workspace]\nenable = true\nroot = \"~/PB\"\ninclude = [\"a/*\"]\nsync_ignored = [\".env\", \".devenv/state/pg\"]\n",
+        )
+        .unwrap();
+        assert!(ws.workspace.enable);
+        assert!(ws.workspace_root().unwrap().ends_with("PB"));
+        let starting = ws.workspace.starting();
+        assert_eq!(starting.include, ["a/*"]);
+        assert!(starting.always_exclude.contains(&"node_modules".to_owned()));
+        assert!(
+            starting
+                .sync_ignored
+                .iter()
+                .any(|i| i.pattern == ".devenv/state/pg" && i.quiescent)
+        );
+        assert!(
+            toml::from_str::<HubConfig>("[workspace]\nenable = true\n")
+                .unwrap()
+                .workspace
+                .enable
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
   flake-root,
   rustPlatform,
   ccdash-web,
+  git,
 }:
 let
   cargoToml = lib.importTOML (flake-root + "/Cargo.toml");
@@ -28,6 +29,9 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = flake-root + "/Cargo.lock";
+
+  # NOTE: the workspace sync's tests drive real repositories
+  nativeCheckInputs = [ git ];
 
   # NOTE: read by `option_env!` in src/config.rs
   env.CCDASH_WEB_DIR_DEFAULT = "${ccdash-web}";

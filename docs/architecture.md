@@ -79,4 +79,7 @@ Collector and hub speak JSON messages over the WebSocket
 (`src/protocol.rs`). The protocol is versioned: a hub and a collector of
 different versions refuse each other and log why, so a hub and its
 collectors are upgraded together. The state sync uses plain HTTP routes
-under `/sync/` with the collector's token.
+under `/sync/` with the collector's token; the workspace sync uses git
+smart HTTP under `/git/` with the same token (`git http-backend` behind
+the hub) and carries its configuration, unit states and conflict
+resolutions over the WebSocket (protocol 8).

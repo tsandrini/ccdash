@@ -135,6 +135,7 @@ ccdash open <id>            # focus its window, or attach a background session
 ccdash rename <id> <name>   # Claude Code adopts it at the next prompt
 ccdash reply <id> <text>    # a message into the session (needs the channel)
 ccdash url                  # the panel's address
+ccdash workspace status     # the workspace sync: where every unit stands here
 ```
 
 In the panel:
@@ -147,6 +148,7 @@ In the panel:
 | History   | sessions over time as lanes, time per project, tools, the 5-hour limit |
 | Analytics | waits, parallel work, limits, turns, context, tokens, permissions      |
 | State     | each machine's copy of `~/.claude`, conflicts, sizes and growth        |
+| Workspace | the workspace root on every machine: units × machines, conflicts, held |
 | Settings  | devices, push, theme, quick replies and templates                      |
 
 The panel in detail: [panel](docs/panel.md).
@@ -192,6 +194,7 @@ the real one): [development](docs/development.md).
 | [prompts and notifications](docs/prompts-and-notifications.md) | answering prompts, Web Push, the channel, renaming            |
 | [sessions](docs/sessions.md)                                   | start, continue, resolve, kill, open, forget                  |
 | [state sync](docs/state-sync.md)                               | `~/.claude` on every machine, the one-machine rule, conflicts |
+| [workspace](docs/workspace.md)                                 | the workspace root on every machine: units, snapshots, merges |
 | [knowledge](docs/knowledge.md)                                 | notes, tools, injections, import and export                   |
 | [security](docs/security.md)                                   | tokens, devices, what can reach the hub                       |
 | [data](docs/data.md)                                           | what is stored where, retention, backups                      |

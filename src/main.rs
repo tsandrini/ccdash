@@ -136,6 +136,21 @@ enum Command {
         /// Where the copy goes (replaced atomically).
         dest: PathBuf,
     },
+    /// Run `git gc` over the hub's workspace repositories (nightly).
+    Gc {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// The workspace sync on this machine: where every unit stands,
+    /// resync, init a new machine, adopt existing copies.
+    Workspace {
+        #[command(subcommand)]
+        what: Workspace,
+    },
+    /// The hub's `pre-receive` hook (run by git, not by hand): a merge
+    /// snapshot must build on the other hosts' current tips.
+    #[command(hide = true)]
+    PreReceive,
     /// Write every note of the hub's database as markdown with frontmatter:
     /// `<dir>/<workspace>/<kind>/<slug>.md`. Reads the database directly,
     /// so it works on a backup copy too.
@@ -147,6 +162,23 @@ enum Command {
         db: Option<PathBuf>,
         dir: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum Workspace {
+    /// Every unit with its state (or one unit).
+    Status {
+        unit: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch and snapshot everything (or one unit) again.
+    Resync { unit: Option<String> },
+    /// A new machine: create every unit the hub has and this one lacks.
+    Init,
+    /// An existing copy of the workspace: take the first snapshot of the
+    /// units that exist here and on the hub, then merge.
+    Adopt { unit: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -215,6 +247,15 @@ fn main() -> ExitCode {
             .and_then(|(notes, file)| client::import(&file, notes)),
         Command::Backup { config, dest } => config::load::<HubConfig>(config)
             .and_then(|cfg| hub::backup::backup(&cfg.store_path(), &dest)),
+        Command::Gc { config } => config::load::<HubConfig>(config)
+            .and_then(|cfg| workspace::hub::gc(&cfg.sync_dir().join("workspace"))),
+        Command::Workspace { what } => match what {
+            Workspace::Status { unit, json } => client::workspace("status", unit.as_deref(), json),
+            Workspace::Resync { unit } => client::workspace("resync", unit.as_deref(), false),
+            Workspace::Init => client::workspace("init", None, false),
+            Workspace::Adopt { unit } => client::workspace("adopt", unit.as_deref(), false),
+        },
+        Command::PreReceive => return exit(workspace::hub::pre_receive()),
         Command::Export { config, db, dir } => export(config, db, &dir),
     };
     match result {

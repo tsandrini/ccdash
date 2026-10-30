@@ -72,6 +72,71 @@ pub fn status(as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `ccdash workspace <op>`: the state of every unit, or a resync, init
+/// or adopt handed to the collector.
+pub fn workspace(op: &str, unit: Option<&str>, as_json: bool) -> Result<()> {
+    let reply = request(&json!({ "cmd": "workspace", "op": op, "unit": unit }))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&reply)?);
+        return Ok(());
+    }
+    if op != "status" {
+        println!("{}", reply["message"].as_str().unwrap_or("ok"));
+        return Ok(());
+    }
+    let units = reply["units"].as_array().cloned().unwrap_or_default();
+    let shown: Vec<&Value> = units
+        .iter()
+        .filter(|u| unit.is_none_or(|w| u["unit"].as_str() == Some(w)))
+        .collect();
+    for u in &shown {
+        let state = u["state"].as_str().unwrap_or("?");
+        let detail = u["detail"].as_str().unwrap_or("");
+        let conflicts = u["conflicts"].as_array().map_or(0, Vec::len);
+        let extra = if conflicts > 0 {
+            format!("{conflicts} conflicts")
+        } else {
+            String::new()
+        };
+        println!(
+            "{:<10} {:<40} {}",
+            state,
+            truncate(u["unit"].as_str().unwrap_or(""), 40),
+            truncate(format!("{extra} {detail}").trim(), 80)
+        );
+    }
+    if shown.is_empty() {
+        println!("no units");
+    }
+    let status = &reply["status"];
+    println!(
+        "{} units, {} in step, {} pending; setup v{}; {}",
+        status["units"],
+        status["in_step"],
+        status["pending"],
+        status["setup_version"],
+        if reply["connected"].as_bool().unwrap_or(false) {
+            "hub connected"
+        } else {
+            "hub not connected"
+        }
+    );
+    if let Some(new) = reply["new"].as_array().filter(|n| !n.is_empty()) {
+        println!("not included ({}):", new.len());
+        for n in new {
+            println!(
+                "  {:<40} {} {}",
+                truncate(n["unit"].as_str().unwrap_or(""), 40),
+                n["kind"].as_str().unwrap_or(""),
+                n["size"]
+                    .as_u64()
+                    .map_or(String::new(), |b| format!("{} MB", b >> 20))
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn open(id: &str) -> Result<()> {
     let reply = request(&json!({ "cmd": "open", "id": id }))?;
     println!("{}", reply["message"].as_str().unwrap_or("ok"));

@@ -17,8 +17,15 @@ use crate::{
     state::{AgentEntry, NiriEvent, ProcPoll},
     sync::{Keep, SyncStatus},
     wire::Envelope,
+    workspace::{
+        HeldAction, SeenUnit, UnitStatus, WorkspaceConfig, WorkspaceSetup, WorkspaceStatus,
+    },
 };
 
+/// 8: the workspace on the hub (`WorkspaceUnits`, `Workspace`,
+/// `WorkspaceResolved` up; `WorkspaceSetup`, `WorkspaceChanged`,
+/// `WorkspaceResync`, `WorkspaceResolve`, `WorkspaceHeld`,
+/// `WorkspaceAdopt` down).
 /// 7: conflicts resolved from the panel (`SyncResolve` down,
 /// `SyncResolved` up).
 /// 6: Claude Code's state on the hub (`Sync` up, `SyncChanged` and
@@ -29,7 +36,7 @@ use crate::{
 /// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
 /// on sessions, `branch` on agents entries and envelopes, `launch` on
 /// envelopes.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +139,29 @@ pub enum ToHub {
         error: Option<String>,
         #[serde(default)]
         copy: Option<String>,
+    },
+    /// The directories at unit depth (and nested repositories) on this
+    /// host, with their size: the hub's list of what exists where.
+    WorkspaceUnits {
+        units: Vec<SeenUnit>,
+    },
+    /// How the workspace stands here: the units that changed since the
+    /// last report, or every unit (`full`).
+    Workspace {
+        status: WorkspaceStatus,
+        units: Vec<UnitStatus>,
+        full: bool,
+    },
+    /// What came of `WorkspaceResolve` for conflict `id`.
+    WorkspaceResolved {
+        id: i64,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// The collector's starting configuration, offered when the hub sent
+    /// a setup without one (version 0); the hub keeps the first it gets.
+    WorkspaceConfig {
+        config: WorkspaceConfig,
     },
 }
 
@@ -376,6 +406,46 @@ pub enum ToCollector {
         copy: String,
         keep: Keep,
     },
+    /// The workspace configuration and the units that travel, after the
+    /// welcome and on every change.
+    WorkspaceSetup {
+        setup: Box<WorkspaceSetup>,
+    },
+    /// `host` pushed a snapshot of `unit`; `version` counts the unit's
+    /// accepted pushes.
+    WorkspaceChanged {
+        unit: String,
+        host: String,
+        version: i64,
+    },
+    /// Fetch and snapshot everything (or one unit) again.
+    WorkspaceResync {
+        #[serde(default)]
+        unit: Option<String>,
+    },
+    /// Write `blob` over `path` of `unit` (the owner chose a side of
+    /// conflict `id`); an empty blob deletes the file. Answered by
+    /// `WorkspaceResolved`.
+    WorkspaceResolve {
+        id: i64,
+        unit: String,
+        path: String,
+        blob: String,
+    },
+    /// Apply or drop the held snapshot of `unit`; with `commit`, only
+    /// that one (the owner chose it in the panel).
+    WorkspaceHeld {
+        unit: String,
+        action: HeldAction,
+        #[serde(default)]
+        commit: Option<String>,
+    },
+    /// Take the first snapshot of units that exist here and on the hub
+    /// (all of them, or one).
+    WorkspaceAdopt {
+        #[serde(default)]
+        unit: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -537,6 +607,43 @@ mod tests {
         let changed: ToCollector =
             serde_json::from_str(r#"{"type":"sync_changed","seq":3}"#).unwrap();
         assert!(matches!(changed, ToCollector::SyncChanged { seq: 3 }));
+        let setup: ToCollector = serde_json::from_str(
+            r#"{"type":"workspace_setup","setup":{"version":3,"config":{"include":["a/*"]},"units":{"a/b":"git"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(setup, ToCollector::WorkspaceSetup { ref setup } if setup.version == 3 && setup.config.depth == 2)
+        );
+        let changed: ToCollector = serde_json::from_str(
+            r#"{"type":"workspace_changed","unit":"a/b","host":"navi","version":7}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            changed,
+            ToCollector::WorkspaceChanged { version: 7, .. }
+        ));
+        let held: ToCollector =
+            serde_json::from_str(r#"{"type":"workspace_held","unit":"a/b","action":"drop"}"#)
+                .unwrap();
+        assert!(matches!(
+            held,
+            ToCollector::WorkspaceHeld {
+                action: HeldAction::Drop,
+                commit: None,
+                ..
+            }
+        ));
+        let ws = ToHub::Workspace {
+            status: WorkspaceStatus::default(),
+            units: Vec::new(),
+            full: true,
+        };
+        assert!(!ws.durable());
+        assert!(
+            serde_json::to_string(&ws)
+                .unwrap()
+                .starts_with(r#"{"type":"workspace""#)
+        );
         let injected: ToHub = serde_json::from_str(r#"{"type":"injected","session":"s"}"#).unwrap();
         assert!(matches!(injected, ToHub::Injected { ref session } if session == "s"));
         assert!(!injected.durable());

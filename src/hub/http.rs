@@ -30,7 +30,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -63,7 +63,10 @@ use crate::{
     sync::{self, SyncView},
     tokens,
     util::{self, now_ms},
-    workspace::{Scope, Workspaces},
+    workspace::{
+        self as ws, HeldAction, HeldView, Scope, Side, UnitView, WorkspaceView, Workspaces,
+        hub::{self as wshub, GitState, UnitOp},
+    },
 };
 
 const DAY_MS: i64 = 86_400_000;
@@ -86,6 +89,8 @@ pub struct App {
     pub web_dir: Arc<PathBuf>,
     /// Ids of tokens revoked since the start; open streams on them end.
     revoked: broadcast::Sender<i64>,
+    /// The workspace repositories, when the workspace sync is on.
+    git: Option<GitState>,
 }
 
 /// What `auth` checks a bearer against.
@@ -125,6 +130,7 @@ pub async fn serve(
     push: Option<Arc<Push>>,
     web_dir: PathBuf,
     sync: sync::hub::Mirror,
+    git: Option<GitState>,
 ) {
     let api = Router::new()
         .route("/snapshot", get(snapshot))
@@ -163,6 +169,14 @@ pub async fn serve(
         .route("/sync/conflicts/{id}", delete(sync_dismiss))
         .route("/sync/conflicts/{id}/resolve", post(sync_resolve))
         .route("/sync/stats", get(sync_stats))
+        .route("/workspace", get(workspace_view))
+        .route("/workspace/config", put(workspace_config))
+        .route("/workspace/units/{*unit}", post(workspace_unit))
+        .route("/workspace/history/{*unit}", get(workspace_history))
+        .route("/workspace/held/{host}/{*unit}", post(workspace_held))
+        .route("/workspace/conflicts/{id}", post(workspace_conflict))
+        .route("/workspace/conflicts/{id}/blob", get(workspace_blob))
+        .route("/workspace/{host}/resync", post(workspace_resync))
         .layer(middleware::from_fn_with_state(
             Guard {
                 bootstrap: token,
@@ -170,7 +184,7 @@ pub async fn serve(
             },
             auth,
         ));
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/act/{key}/{action}", post(button))
         .route(
             "/collect",
@@ -180,7 +194,11 @@ pub async fn serve(
                 sync.changed.subscribe(),
             )),
         )
-        .nest("/sync", sync::hub::routes(sync, tokens))
+        .nest("/sync", sync::hub::routes(sync, tokens.clone()));
+    if let Some(git) = git.clone() {
+        app = app.nest("/git", wshub::routes(git, tokens));
+    }
+    let app = app
         .nest("/api/v1", api)
         .fallback(get(web::serve))
         .with_state(App {
@@ -191,6 +209,7 @@ pub async fn serve(
             push,
             web_dir: Arc::new(web_dir),
             revoked: broadcast::channel(16).0,
+            git,
         });
     if let Err(e) = axum::serve(listener, app).await {
         warn!("http: {e}");
@@ -1497,6 +1516,380 @@ async fn sync_dismiss(
             format!("no open conflict {id}"),
         ));
     }
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---- the workspace sync ----
+
+impl App {
+    fn git(&self) -> Result<&GitState, ApiError> {
+        self.git.as_ref().ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "the workspace sync is off on this hub (workspace.enable)".into(),
+            )
+        })
+    }
+}
+
+/// The Workspace page: hosts, units × hosts, new directories, conflicts,
+/// held snapshots, the configuration.
+async fn workspace_view(State(app): State<App>) -> Result<Json<WorkspaceView>, ApiError> {
+    let git = app.git()?.clone();
+    let Some(state) = app.hub.workspace_state().await? else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "the workspace sync is off".into(),
+        ));
+    };
+    let store = app.store.clone();
+    let (rows, refs, conflicts, new_dirs, bytes, known_hosts, growth) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let conn = store.reader()?;
+            Ok((
+                wshub::units(&conn)?,
+                wshub::refs(&conn)?,
+                wshub::conflicts(&conn)?,
+                wshub::new_dirs(&conn, &state.config)?,
+                git.repos.bytes(),
+                wshub::hosts(&conn)?,
+                wshub::growth(&conn, 30)?,
+            ))
+        })
+        .await
+        .context("workspace view")??;
+    let Some(mut state) = app.hub.workspace_state().await? else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "the workspace sync is off".into(),
+        ));
+    };
+    // NOTE: a host that pushed before the hub restarted has no report yet
+    for host in known_hosts {
+        if !state.hosts.iter().any(|h| h.host == host) {
+            state.hosts.push(ws::WorkspaceHost {
+                host,
+                connected: false,
+                status: None,
+            });
+        }
+    }
+    state.hosts.sort_by(|a, b| a.host.cmp(&b.host));
+    let mut held = Vec::new();
+    let mut units: Vec<UnitView> = rows
+        .into_iter()
+        .filter(|u| u.state == "included")
+        .map(|u| {
+            let hosts: std::collections::BTreeMap<String, ws::UnitStatus> = state
+                .reports
+                .iter()
+                .filter_map(|(h, units)| units.get(&u.unit).map(|s| (h.clone(), s.clone())))
+                .collect();
+            for (h, s) in &hosts {
+                if let Some(hd) = &s.held {
+                    held.push(HeldView {
+                        unit: u.unit.clone(),
+                        host: h.clone(),
+                        held: hd.clone(),
+                    });
+                }
+            }
+            UnitView {
+                paused: state.config.units.get(&u.unit).is_some_and(|o| o.paused),
+                refs: refs.get(&u.unit).cloned().unwrap_or_default(),
+                hosts,
+                unit: u.unit,
+                workspace: u.workspace,
+                kind: u.kind,
+                state: u.state,
+                size: u.size,
+                version: u.version,
+                at: u.at,
+            }
+        })
+        .collect();
+    units.sort_by(|a, b| a.unit.cmp(&b.unit));
+    Ok(Json(WorkspaceView {
+        enabled: true,
+        hosts: state.hosts,
+        units,
+        new_dirs,
+        conflicts,
+        held,
+        config: state.config,
+        config_version: state.version,
+        bytes,
+        growth,
+    }))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceConfigBody {
+    config: ws::WorkspaceConfig,
+}
+
+/// Replaces the configuration; collectors get the new setup at once.
+async fn workspace_config(
+    State(app): State<App>,
+    Json(body): Json<WorkspaceConfigBody>,
+) -> Result<Json<Value>, ApiError> {
+    app.git()?;
+    if body.config.depth == 0 || body.config.depth > 6 {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "depth must be 1 to 6".into(),
+        ));
+    }
+    let version = app
+        .store
+        .exec(move |conn| wshub::save_config(conn, &body.config, now_ms()))
+        .await??;
+    app.hub.send(Cmd::WorkspaceSetupChanged).await?;
+    Ok(Json(json!({ "version": version })))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceUnitBody {
+    /// `include`, `exclude`, `ignore`, `pause`, `resume`, `adopt`, `override`.
+    op: String,
+    /// For `adopt`: the host holding the copy.
+    #[serde(default)]
+    host: Option<String>,
+    /// For `override`: the unit's overrides, whole (the defaults remove it).
+    #[serde(default)]
+    value: Option<ws::UnitOverride>,
+}
+
+/// Include, exclude, ignore, pause or resume a unit, set its overrides,
+/// or make a host adopt its copy.
+async fn workspace_unit(
+    State(app): State<App>,
+    Path(unit): Path<String>,
+    Json(body): Json<WorkspaceUnitBody>,
+) -> Result<Json<Value>, ApiError> {
+    app.git()?;
+    if !ws::valid_unit(&unit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("bad unit {unit:?}"),
+        ));
+    }
+    if body.op == "adopt" {
+        let host = body.host.clone().ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "adopt needs a host".into(),
+            )
+        })?;
+        app.hub
+            .send_to(
+                &host,
+                crate::protocol::ToCollector::WorkspaceAdopt { unit: Some(unit) },
+            )
+            .await?
+            .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+        return Ok(Json(json!({ "ok": true })));
+    }
+    let op = UnitOp {
+        op: body.op,
+        value: body.value,
+    };
+    let unit2 = unit.clone();
+    let changed = app
+        .store
+        .exec(move |conn| wshub::unit_op(conn, &unit2, &op, now_ms()))
+        .await??
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if changed {
+        app.hub.send(Cmd::WorkspaceSetupChanged).await?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The last snapshots of a unit across hosts.
+async fn workspace_history(
+    State(app): State<App>,
+    Path(unit): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let git = app.git()?.clone();
+    if !ws::valid_unit(&unit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("bad unit {unit:?}"),
+        ));
+    }
+    let entries = tokio::task::spawn_blocking(move || git.repos.history(&unit))
+        .await
+        .context("history")??;
+    Ok(Json(json!({ "history": entries })))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceHeldBody {
+    action: HeldAction,
+    /// The held commit the panel showed; the host acts only on that one.
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+/// Applies or drops a held snapshot on its host.
+async fn workspace_held(
+    State(app): State<App>,
+    Path((host, unit)): Path<(String, String)>,
+    Json(body): Json<WorkspaceHeldBody>,
+) -> Result<Json<Value>, ApiError> {
+    app.git()?;
+    if !ws::valid_unit(&unit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("bad unit {unit:?}"),
+        ));
+    }
+    app.hub
+        .send_to(
+            &host,
+            crate::protocol::ToCollector::WorkspaceHeld {
+                unit,
+                action: body.action,
+                commit: body.commit,
+            },
+        )
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceConflictBody {
+    /// `mine`, `theirs` or `dismiss`.
+    action: String,
+}
+
+/// Resolves a conflict on its host (one side wins) or dismisses it.
+async fn workspace_conflict(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Json(body): Json<WorkspaceConflictBody>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    app.git()?;
+    let side = match body.action.as_str() {
+        "mine" => Side::Mine,
+        "theirs" => Side::Theirs,
+        "dismiss" => {
+            let found = app
+                .store
+                .exec(move |conn| wshub::dismiss_conflict(conn, id, now_ms()))
+                .await??;
+            if !found {
+                return Err(ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("no open conflict {id}"),
+                ));
+            }
+            return Ok((StatusCode::OK, Json(json!({ "ok": true }))));
+        }
+        other => {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("unknown action {other:?}"),
+            ));
+        }
+    };
+    let conflict = app
+        .store
+        .exec(move |conn| wshub::request_conflict(conn, id, side))
+        .await??
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let blob = match side {
+        Side::Mine => conflict.ours.clone(),
+        Side::Theirs => conflict.theirs.clone(),
+    };
+    let sent = app
+        .hub
+        .send_to(
+            &conflict.host,
+            crate::protocol::ToCollector::WorkspaceResolve {
+                id,
+                unit: conflict.unit.clone(),
+                path: conflict.path.clone(),
+                blob,
+            },
+        )
+        .await?;
+    if let Err(e) = sent {
+        let (error, host) = (e.clone(), conflict.host.clone());
+        app.store
+            .exec(move |conn| wshub::conflict_resolved(conn, &host, id, Some(&error), now_ms()))
+            .await??;
+        return Err(ApiError(StatusCode::CONFLICT, e));
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({ "ok": true }))))
+}
+
+#[derive(Deserialize)]
+struct BlobQuery {
+    side: Side,
+}
+
+/// One side of a conflict, as the hub's repository has it.
+async fn workspace_blob(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Query(q): Query<BlobQuery>,
+) -> Result<Response, ApiError> {
+    let git = app.git()?.clone();
+    let store = app.store.clone();
+    let conflict = tokio::task::spawn_blocking(move || wshub::conflict(&store.reader()?, id))
+        .await
+        .context("conflict")??
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no open conflict {id}")))?;
+    let oid = match q.side {
+        Side::Mine => conflict.ours,
+        Side::Theirs => conflict.theirs,
+    };
+    if oid.is_empty() {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "that side has no file".into(),
+        ));
+    }
+    let unit = conflict.unit;
+    let data = tokio::task::spawn_blocking(move || git.repos.blob(&unit, &oid))
+        .await
+        .context("blob")?
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
+}
+
+#[derive(Deserialize, TS, Default)]
+#[ts(export_to = "types.ts")]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct WorkspaceResyncBody {
+    unit: Option<String>,
+}
+
+/// Asks a host to fetch and snapshot everything (or one unit) again.
+async fn workspace_resync(
+    State(app): State<App>,
+    Path(host): Path<String>,
+    Json(body): Json<WorkspaceResyncBody>,
+) -> Result<Json<Value>, ApiError> {
+    app.git()?;
+    app.hub
+        .send_to(
+            &host,
+            crate::protocol::ToCollector::WorkspaceResync { unit: body.unit },
+        )
+        .await?
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     Ok(Json(json!({ "ok": true })))
 }
 

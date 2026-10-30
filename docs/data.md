@@ -8,25 +8,27 @@
 
 On the hub:
 
-| What       | Where (NixOS module)                                         |
-| ---------- | ------------------------------------------------------------ |
-| Live state | hub memory, one reducer per host                             |
-| History    | `/var/lib/ccdash-hub/ccdash.db` (SQLite, WAL), `ccdash` user |
-| Backups    | `/var/lib/ccdash-hub/backups/`, nightly, checked             |
-| State sync | `/var/lib/ccdash-hub/claude/`, plain files (not in backups)  |
-| Config     | `/etc/ccdash/hub.toml`                                       |
+| What       | Where (NixOS module)                                          |
+| ---------- | ------------------------------------------------------------- |
+| Live state | hub memory, one reducer per host                              |
+| History    | `/var/lib/ccdash-hub/ccdash.db` (SQLite, WAL), `ccdash` user  |
+| Backups    | `/var/lib/ccdash-hub/backups/`, nightly, checked              |
+| State sync | `/var/lib/ccdash-hub/claude/`, plain files (not in backups)   |
+| Workspace  | `/var/lib/ccdash-hub/claude/workspace/<unit>.git`, bare repos |
+| Config     | `/etc/ccdash/hub.toml`                                        |
 
 On each workstation the collector keeps only what it cannot deliver yet:
 
-| What      | Where                                                           |
-| --------- | --------------------------------------------------------------- |
-| Mirror    | collector memory (this machine's sessions, for DMS and the CLI) |
-| Outbox    | `~/.local/state/ccdash/outbox.ndjson`, bounded                  |
-| Notes     | `~/.local/state/ccdash/notes-cache.json`                        |
-| Sync      | `~/.local/state/ccdash/sync.db` (what is in step)               |
-| Config    | `~/.config/ccdash/config.toml`                                  |
-| Sockets   | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)          |
-| Telemetry | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled                 |
+| What      | Where                                                                                                                   |
+| --------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Mirror    | collector memory (this machine's sessions, for DMS and the CLI)                                                         |
+| Outbox    | `~/.local/state/ccdash/outbox.ndjson`, bounded                                                                          |
+| Notes     | `~/.local/state/ccdash/notes-cache.json`                                                                                |
+| Sync      | `~/.local/state/ccdash/sync.db` (what is in step)                                                                       |
+| Workspace | `~/.local/state/ccdash/workspace/` (hidden gitdirs of plain units, temporary indexes, `workspace.db`, the cached setup) |
+| Config    | `~/.config/ccdash/config.toml`                                                                                          |
+| Sockets   | `$XDG_RUNTIME_DIR/ccdash/` (`ingest.sock`, `api.sock`)                                                                  |
+| Telemetry | `127.0.0.1:7839` (OTLP/HTTP JSON), when enabled                                                                         |
 
 ## 2. What the database keeps
 
@@ -46,7 +48,10 @@ Every row carries the host it came from. Kept for `store.retention_days`
 Claims end with their session or their deadline; revoked device tokens go
 after a while. Not pruned: `notes`, `links`, `notes_fts` (knowledge), live
 device tokens and their push subscriptions, `sync_files`,
-`sync_history`, `sync_conflicts`, `sync_growth` (state sync).
+`sync_history`, `sync_conflicts`, `sync_growth` (state sync),
+`workspace_units`, `workspace_refs`, `workspace_conflicts`,
+`workspace_config`, `workspace_seen` (workspace sync; `workspace_events`
+keeps 90 days).
 
 ## 3. Backups and imports
 
