@@ -265,6 +265,11 @@ pub fn take(t: &Take) -> Result<Report> {
             report.oversize.push(path);
         }
     }
+    // NOTE: `git add` refuses an `:(exclude)` pathspec that names an ignored
+    // path ("The following paths are ignored"); a bundle root ignoring its
+    // repositories (`/*/`) hit this. Ignored children need no exclusion.
+    let ignored = t.git.ignored(t.repo, t.excludes, &excluded)?;
+    excluded.retain(|p| !ignored.contains(p));
     let mut add: Vec<String> = vec![
         "add".into(),
         "-A".into(),
@@ -567,6 +572,54 @@ pub(crate) mod tests {
             busy,
         })
         .unwrap()
+    }
+
+    /// A bundle root that ignores its repositories (`/*/`) snapshots its
+    /// own files; the ignored children are neither added nor named.
+    #[test]
+    fn root_ignoring_its_children_snapshots() {
+        let (dir, git, repo) = fixture("rootignore");
+        fs::write(repo.work_tree.join(".gitignore"), "/*/\n!/meta/\n").unwrap();
+        fs::create_dir_all(repo.work_tree.join("child")).unwrap();
+        git.ok(
+            Some(&Repo {
+                git_dir: repo.work_tree.join("child/.git"),
+                work_tree: repo.work_tree.join("child"),
+            }),
+            &["init", "-q"],
+            &Opts::default(),
+        )
+        .unwrap();
+        fs::write(repo.work_tree.join("child/c.txt"), "c").unwrap();
+        fs::create_dir_all(repo.work_tree.join("meta")).unwrap();
+        fs::write(repo.work_tree.join("meta/plan.md"), "plan").unwrap();
+        let children = vec!["child".to_owned()];
+        let report = take(&Take {
+            git: &git,
+            repo: &repo,
+            scratch: &dir.join("scratch"),
+            excludes: None,
+            rules: &rules(),
+            host: &git.host,
+            children: &children,
+            previous: None,
+            busy: &|_| None,
+        })
+        .unwrap();
+        let Outcome::Taken(local) = report.outcome else {
+            panic!("{report:?}");
+        };
+        let files = git
+            .ok(
+                Some(&repo),
+                &["ls-tree", "-r", "--name-only", &local.work],
+                &Opts::default(),
+            )
+            .unwrap()
+            .text();
+        assert!(files.contains("meta/plan.md"), "{files}");
+        assert!(!files.contains("child/"), "{files}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

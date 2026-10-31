@@ -482,6 +482,11 @@ mod tests {
         s
     }
 
+    /// `ETXTBSY` on Linux.
+    const fn libc_etxtbsy() -> i32 {
+        26
+    }
+
     #[tokio::test]
     async fn stop_ends_a_claude_waiting_for_its_editor() {
         // a shell defers its TERM trap until its foreground child (the
@@ -495,7 +500,17 @@ mod tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
         )
         .unwrap();
-        let mut child = std::process::Command::new(&script).spawn().unwrap();
+        // NOTE: a parallel test forking between the write and the exec holds the
+        // script open ("text file busy"); spawning is retried
+        let mut child = loop {
+            match std::process::Command::new(&script).spawn() {
+                Ok(child) => break child,
+                Err(e) if e.raw_os_error() == Some(libc_etxtbsy()) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("spawning the editor script: {e}"),
+            }
+        };
         tokio::time::sleep(Duration::from_millis(300)).await;
         let session = session_of(Kind::Interactive, Some(child.id()));
         let how = stop(&[], &[], &session).await.unwrap();

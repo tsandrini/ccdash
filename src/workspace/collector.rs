@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::{debug, info, warn};
@@ -866,6 +866,10 @@ impl Scheduler {
                     if unit.as_ref().is_none_or(|u| u == id) && e.state == UnitState::Unadopted {
                         e.adopt = true;
                         e.adopt_prefer = prefer;
+                        // NOTE: a restart in the middle (a deploy) must not lose the request
+                        if let Err(err) = self.db.save(id, e) {
+                            warn!("workspace db: {err:#}");
+                        }
                         e.due_fetch = true;
                         e.due_apply = true;
                         e.retry = None;
@@ -1051,6 +1055,10 @@ impl Scheduler {
                     e.held = saved.held;
                     e.files = saved.tracked;
                     e.lagging = saved.lagging;
+                    if let Some(prefer) = saved.adopt {
+                        e.adopt = true;
+                        e.adopt_prefer = prefer;
+                    }
                 }
                 e.present = is_here;
                 if e.rules.paused {
@@ -2324,6 +2332,8 @@ struct Saved {
     conflicts: Vec<ConflictReport>,
     held: Option<HeldReport>,
     lagging: BTreeSet<String>,
+    /// The owner's pending adopt request, with its preference.
+    adopt: Option<Option<Side>>,
 }
 
 /// `$XDG_STATE_HOME/ccdash/workspace/workspace.db`.
@@ -2367,6 +2377,10 @@ CREATE TABLE IF NOT EXISTS lagging (
     unit TEXT NOT NULL,
     path TEXT NOT NULL,
     PRIMARY KEY (unit, path)
+);
+CREATE TABLE IF NOT EXISTS adopt (
+    unit TEXT PRIMARY KEY,
+    prefer TEXT
 );
 ";
 
@@ -2430,6 +2444,17 @@ impl Db {
             .prepare("SELECT path FROM lagging WHERE unit = ?1")?
             .query_map([unit], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
+        let adopt = self
+            .conn
+            .query_row("SELECT prefer FROM adopt WHERE unit = ?1", [unit], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .map(|p| match p.as_deref() {
+                Some("mine") => Some(Side::Mine),
+                Some("theirs") => Some(Side::Theirs),
+                _ => None,
+            });
         Ok(Saved {
             adopted,
             tracked: tracked.try_into().unwrap_or(0),
@@ -2438,6 +2463,7 @@ impl Db {
             conflicts,
             held,
             lagging,
+            adopt,
         })
     }
 
@@ -2470,6 +2496,17 @@ impl Db {
                 "INSERT INTO conflicts (unit, path, kind, ours, theirs, other_host, at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![unit, c.path, c.kind, c.ours, c.theirs, c.other_host, c.at],
+            )?;
+        }
+        tx.execute("DELETE FROM adopt WHERE unit = ?1", [unit])?;
+        if e.adopt {
+            let prefer = e.adopt_prefer.map(|s| match s {
+                Side::Mine => "mine",
+                Side::Theirs => "theirs",
+            });
+            tx.execute(
+                "INSERT INTO adopt (unit, prefer) VALUES (?1, ?2)",
+                params![unit, prefer],
             )?;
         }
         tx.execute("DELETE FROM lagging WHERE unit = ?1", [unit])?;
