@@ -74,8 +74,8 @@ pub fn status(as_json: bool) -> Result<()> {
 
 /// `ccdash workspace <op>`: the state of every unit, or a resync, init
 /// or adopt handed to the collector.
-pub fn workspace(op: &str, unit: Option<&str>, as_json: bool) -> Result<()> {
-    let reply = request(&json!({ "cmd": "workspace", "op": op, "unit": unit }))?;
+pub fn workspace(op: &str, unit: Option<&str>, prefer: Option<&str>, as_json: bool) -> Result<()> {
+    let reply = request(&json!({ "cmd": "workspace", "op": op, "unit": unit, "prefer": prefer }))?;
     if as_json {
         println!("{}", serde_json::to_string_pretty(&reply)?);
         return Ok(());

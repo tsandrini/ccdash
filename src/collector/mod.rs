@@ -973,7 +973,9 @@ impl Actor {
                     commit,
                 });
             }
-            ToCollector::WorkspaceAdopt { unit } => self.kick_workspace(WsCmd::Adopt(unit)),
+            ToCollector::WorkspaceAdopt { unit } => {
+                self.kick_workspace(WsCmd::Adopt { unit, prefer: None })
+            }
             ToCollector::SyncResolve {
                 id,
                 path,

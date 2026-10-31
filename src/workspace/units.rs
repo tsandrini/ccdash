@@ -75,7 +75,18 @@ impl Layout {
                     self.unit_dir(id).join(target)
                 };
                 if target.components().any(|c| c.as_os_str() == "worktrees") {
-                    bail!("a linked worktree shares its refs with another repository");
+                    // NOTE: its refs live in the main repository; it cannot be a unit
+                    bail!(
+                        "a linked worktree of {}: exclude it",
+                        target
+                            .ancestors()
+                            .find(|p| p.file_name().is_some_and(|n| n == ".git"))
+                            .and_then(Path::parent)
+                            .map_or_else(
+                                || target.display().to_string(),
+                                |p| p.display().to_string()
+                            )
+                    );
                 }
                 Ok(target)
             }

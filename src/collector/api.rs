@@ -20,7 +20,7 @@
 //! Writes are queued while the hub is unreachable, reads fall back to the
 //! notes cache.
 //!
-//! `{"cmd":"workspace","op":"status"|"resync"|"init"|"adopt","unit":"…"}`
+//! `{"cmd":"workspace","op":"status"|"resync"|"init"|"adopt","unit":"…","prefer":"mine"|"hub"}`
 //! drives the workspace sync (`ccdash workspace …`).
 
 use std::{
@@ -53,7 +53,10 @@ use crate::{
     protocol::{Call, Injection, Reply, Who},
     sync::collector::Handle as SyncHandle,
     wire::Envelope,
-    workspace::collector::{Cmd as WsCmd, Handle as WsHandle},
+    workspace::{
+        Side,
+        collector::{Cmd as WsCmd, Handle as WsHandle},
+    },
 };
 
 /// How long a tool waits for the hub before it answers from the cache or
@@ -110,6 +113,9 @@ enum Request {
         op: String,
         #[serde(default)]
         unit: Option<String>,
+        /// `adopt`: `mine` or `hub`, the side that wins outright.
+        #[serde(default)]
+        prefer: Option<String>,
     },
 }
 
@@ -213,7 +219,7 @@ async fn handle(
                     Err(e) => error(e),
                 }
             }
-            Ok(Request::Workspace { op, unit }) => match &workspace {
+            Ok(Request::Workspace { op, unit, prefer }) => match &workspace {
                 None => {
                     error("the workspace sync is off on this machine ([workspace] enable)".into())
                 }
@@ -231,10 +237,24 @@ async fn handle(
                         ws.send(WsCmd::Init);
                         json!({ "type": "ok", "message": "creating every unit the hub has and this machine lacks; `ccdash workspace status` follows it" })
                     }
-                    "adopt" => {
-                        ws.send(WsCmd::Adopt(unit));
-                        json!({ "type": "ok", "message": "taking the first snapshot of the units that exist here and on the hub; `ccdash workspace status` follows it" })
-                    }
+                    "adopt" => match prefer.as_deref() {
+                        Some(other) if !matches!(other, "mine" | "hub") => {
+                            error(format!("prefer must be mine or hub, not {other:?}"))
+                        }
+                        p => {
+                            let prefer = match p {
+                                Some("mine") => Some(Side::Mine),
+                                Some("hub") => Some(Side::Theirs),
+                                _ => None,
+                            };
+                            ws.send(WsCmd::Adopt { unit, prefer });
+                            json!({ "type": "ok", "message": match prefer {
+                                None => "taking the first snapshot of the units that exist here and on the hub, merged with the hub's; `ccdash workspace status` follows it",
+                                Some(Side::Mine) => "adopting with this machine's content winning; `ccdash workspace status` follows it",
+                                Some(Side::Theirs) => "adopting with the hub's content winning; `ccdash workspace status` follows it",
+                            } })
+                        }
+                    },
                     other => error(format!("unknown workspace op {other:?}")),
                 },
             },

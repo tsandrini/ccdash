@@ -355,6 +355,7 @@ pub fn gc(root: &Path) -> Result<()> {
                 if let Err(e) = git_ok(&["gc", "--quiet"], Some(&path)) {
                     failed.push(format!("{}: {e:#}", path.display()));
                 }
+                prune_incoming(&path.join("objects"));
             } else {
                 stack.push(path);
             }
@@ -365,6 +366,24 @@ pub fn gc(root: &Path) -> Result<()> {
         bail!("{} failed:\n{}", failed.len(), failed.join("\n"));
     }
     Ok(())
+}
+
+/// Quarantine directories of pushes that never finished (`incoming-*`,
+/// a day old) are removed; `git gc` leaves them alone.
+fn prune_incoming(objects: &Path) {
+    let day = std::time::Duration::from_secs(86_400);
+    for entry in fs::read_dir(objects).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if name.starts_with("incoming-") && old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// The pre-receive guard: on `refs/sync/<host>`, a commit with more than
@@ -631,6 +650,12 @@ async fn git_route(
         text
     });
 
+    // NOTE: http-backend prints its headers before the service reads the
+    // request; a proxy that sees response headers while it is still sending
+    // the body (nginx, HTTP/2) resets the stream. The whole body goes in
+    // first; receive-pack and upload-pack write nothing before they have it.
+    let bytes = feeder.await.unwrap_or(0);
+
     // the CGI headers, then the body as it comes
     let Some(stdout) = stdout else {
         return text(StatusCode::INTERNAL_SERVER_ERROR, "no stdout");
@@ -696,7 +721,6 @@ async fn git_route(
             }
         }
         drop(tx);
-        let bytes = feeder.await.unwrap_or(0);
         let exit = child.wait().await;
         let err_text = errors.await.unwrap_or_default();
         let ok = exit.as_ref().is_ok_and(|s| s.success());

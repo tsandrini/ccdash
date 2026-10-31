@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     ConflictReport, Diverged, HELD_REFS, HeldAction, HeldReport, IgnoredDir, Rules, SYNC_REFS,
-    SeenUnit, TIPS_REFS, UnitKind, UnitState, UnitStatus, WorkspaceConfig, WorkspaceSetup,
+    SeenUnit, Side, TIPS_REFS, UnitKind, UnitState, UnitStatus, WorkspaceConfig, WorkspaceSetup,
     WorkspaceStatus, apply,
     git::{Git, Opts, Repo},
     snapshot::{self, Local, Outcome as Snap},
@@ -82,8 +82,13 @@ pub enum Cmd {
         action: HeldAction,
         commit: Option<String>,
     },
-    /// Take the first snapshot of units that exist here and on the hub.
-    Adopt(Option<String>),
+    /// Take the first snapshot of units that exist here and on the hub
+    /// (one unit, or every one "to adopt"); `prefer` makes one side win
+    /// outright instead of merging.
+    Adopt {
+        unit: Option<String>,
+        prefer: Option<Side>,
+    },
     /// Create every unit the hub has and this host lacks, now.
     Init,
     /// The state of every unit, for the CLI.
@@ -377,7 +382,10 @@ struct PassJob {
     fetch: bool,
     apply: bool,
     /// May take the first snapshot although the hub holds others'.
-    adopt: bool,
+    /// The owner said adopt (not merely: a snapshot was taken before).
+    adopt_said: bool,
+    /// An adoption where one side wins outright.
+    prefer: Option<Side>,
     /// Why applies wait this time (a live tool call).
     defer_apply: Option<String>,
     /// Quiescent directories to write once free.
@@ -475,6 +483,8 @@ struct Entry {
     adopted: bool,
     /// The owner said adopt (the first snapshot although the hub holds others').
     adopt: bool,
+    /// … and which side wins outright, if any.
+    adopt_prefer: Option<Side>,
     local: Option<Local>,
     merged: BTreeMap<String, String>,
     remotes: BTreeMap<String, String>,
@@ -495,6 +505,10 @@ struct Entry {
     due_apply: bool,
     running: bool,
     retry: Option<(Instant, Duration)>,
+    /// The current failure's wait, doubling up to `MAX_BACKOFF`.
+    backoff: Option<Duration>,
+    /// The current failure was logged at warn level already.
+    warned: bool,
     watched: bool,
     creating: bool,
     /// New directories waiting for the watch job.
@@ -516,6 +530,9 @@ impl Entry {
             included: true,
             adopted: false,
             adopt: false,
+            adopt_prefer: None,
+            backoff: None,
+            warned: false,
             local: None,
             merged: BTreeMap::new(),
             remotes: BTreeMap::new(),
@@ -753,7 +770,8 @@ impl Scheduler {
                 children,
                 fetch: e.due_fetch || e.due_apply,
                 apply: true,
-                adopt: e.adopted || e.adopt,
+                adopt_said: e.adopt,
+                prefer: if e.adopt { e.adopt_prefer } else { None },
                 defer_apply,
                 lagging: e.lagging.iter().cloned().collect(),
             };
@@ -843,10 +861,11 @@ impl Scheduler {
                 Some(_) => warn!("workspace {unit}: nothing is held here"),
                 None => warn!("workspace {unit}: not a unit here"),
             },
-            Cmd::Adopt(unit) => {
+            Cmd::Adopt { unit, prefer } => {
                 for (id, e) in &mut self.units {
                     if unit.as_ref().is_none_or(|u| u == id) && e.state == UnitState::Unadopted {
                         e.adopt = true;
+                        e.adopt_prefer = prefer;
                         e.due_fetch = true;
                         e.due_apply = true;
                         e.retry = None;
@@ -1105,6 +1124,10 @@ impl Scheduler {
                     e.files = local.tracked;
                     e.local = Some(local);
                     e.adopted = true;
+                    if result.error.is_none() {
+                        e.adopt = false;
+                        e.adopt_prefer = None;
+                    }
                 }
                 if let Some(pushed) = result.pushed {
                     e.pushed = Some(pushed);
@@ -1135,21 +1158,28 @@ impl Scheduler {
                 if let Some(e2) = self.units.get_mut(&unit) {
                     match &result.error {
                         Some(error) => {
+                            let changed = e2.detail.as_deref() != Some(error.as_str());
                             e2.state = UnitState::Failed;
                             e2.detail = Some(error.clone());
                             e2.failing_since.get_or_insert(now_ms());
+                            // NOTE: `retry` is taken at dispatch; the wait lives here
                             let backoff = e2
-                                .retry
-                                .map_or(Duration::from_secs(2), |(_, b)| (b * 2).min(MAX_BACKOFF));
+                                .backoff
+                                .map_or(Duration::from_secs(2), |b| (b * 2).min(MAX_BACKOFF));
+                            e2.backoff = Some(backoff);
                             e2.retry = Some((Instant::now() + backoff, backoff));
-                            if e2.failing_since.is_some_and(|s| now_ms() - s > 60_000) {
+                            let lasting = e2.failing_since.is_some_and(|s| now_ms() - s > 60_000);
+                            if lasting && (changed || !e2.warned) {
                                 warn!("workspace {unit}: {error}");
+                                e2.warned = true;
                             } else {
                                 debug!("workspace {unit}: {error}");
                             }
                         }
                         None => {
                             e2.failing_since = None;
+                            e2.backoff = None;
+                            e2.warned = false;
                             e2.state = result.state.unwrap_or(UnitState::InStep);
                             e2.detail = result.detail.clone();
                             e2.retry = result.retry.map(|d| (Instant::now() + d, d));
@@ -1699,21 +1729,30 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
         }
     }
     let mut remotes_now = remotes(shared, &repo)?;
-    if local.is_none() && !job.adopt && !remotes_now.is_empty() {
-        if !shared.layout.has_files(&job.unit) {
-            // NOTE: an empty directory has nothing to adopt: it is created from the hub
-            res.missing = true;
-            res.state = Some(UnitState::Creating);
-            res.detail = None;
+    let mut from_hub = false;
+    if !job.adopt_said && !remotes_now.is_empty() {
+        // a copy the hub never saw: no snapshot yet, or a first snapshot
+        // (one not built on another snapshot) whose push never landed
+        let unseen = match &local {
+            None => true,
+            Some(l) => job.pushed.is_none() && first_snapshot(&shared.git, &repo, &l.commit)?,
+        };
+        if !unseen {
+            // the hub knows this copy
+        } else if local.is_none() && !shared.layout.has_files(&job.unit) {
+            // NOTE: nothing here to adopt (an empty directory or repository):
+            // the hub's snapshot becomes the first content, as on a new machine
+            from_hub = true;
+        } else {
+            res.unadopted = true;
+            res.local = local.clone();
+            res.remotes = remotes_now;
+            res.detail = Some(format!(
+                "exists here and on the hub ({}): run `ccdash workspace adopt`",
+                res.remotes.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
             return Ok(());
         }
-        res.unadopted = true;
-        res.remotes = remotes_now;
-        res.detail = Some(format!(
-            "exists here and on the hub ({}): run `ccdash workspace adopt`",
-            res.remotes.keys().cloned().collect::<Vec<_>>().join(", ")
-        ));
-        return Ok(());
     }
 
     if !job.lagging.is_empty()
@@ -1731,45 +1770,52 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
     }
     let mut children = job.children.clone();
     let mut pushed = res.pushed.clone();
+    // NOTE: an adoption with a preference pushes its merge first, never the
+    // raw first snapshot: another host would merge that one its own way
+    let mut hold_push = job.prefer.is_some() && !remotes_now.is_empty();
     for round in 0..6 {
-        let report = snapshot::take(&snapshot::Take {
-            git: &shared.git,
-            repo: &repo,
-            scratch: &scratch,
-            excludes: excludes.as_deref(),
-            rules: &job.rules,
-            host: &shared.host,
-            children: &children,
-            previous: local.as_ref(),
-            busy: &busy,
-        })?;
-        res.waiting = report.waiting.clone();
-        res.oversize = report.oversize.clone();
-        for n in &report.nested {
-            if !children.contains(n) {
-                children.push(n.clone());
-                res.nested.push(n.clone());
+        if from_hub && local.is_none() {
+            // straight to the apply: the hub's snapshot is written as the first content
+        } else {
+            let report = snapshot::take(&snapshot::Take {
+                git: &shared.git,
+                repo: &repo,
+                scratch: &scratch,
+                excludes: excludes.as_deref(),
+                rules: &job.rules,
+                host: &shared.host,
+                children: &children,
+                previous: local.as_ref(),
+                busy: &busy,
+            })?;
+            res.waiting = report.waiting.clone();
+            res.oversize = report.oversize.clone();
+            for n in &report.nested {
+                if !children.contains(n) {
+                    children.push(n.clone());
+                    res.nested.push(n.clone());
+                }
+            }
+            match report.outcome {
+                Snap::Skipped(reason) => {
+                    res.state = Some(UnitState::Skipped);
+                    res.detail = Some(reason);
+                    res.retry = Some(SOON);
+                    break;
+                }
+                Snap::Held(h) => {
+                    res.held = Some(h);
+                    res.state = Some(UnitState::Held);
+                    break;
+                }
+                Snap::Taken(l) => local = Some(l),
+                Snap::Unchanged => {}
             }
         }
-        match report.outcome {
-            Snap::Skipped(reason) => {
-                res.state = Some(UnitState::Skipped);
-                res.detail = Some(reason);
-                res.retry = Some(SOON);
-                break;
-            }
-            Snap::Held(h) => {
-                res.held = Some(h);
-                res.state = Some(UnitState::Held);
-                break;
-            }
-            Snap::Taken(l) => local = Some(l),
-            Snap::Unchanged => {}
-        }
-        let Some(l) = local.as_ref() else {
-            break;
-        };
-        if pushed.as_deref() != Some(l.commit.as_str()) {
+        if let Some(l) = local.as_ref()
+            && pushed.as_deref() != Some(l.commit.as_str())
+            && !hold_push
+        {
             let mut attempt = shared
                 .git
                 .push(&repo, &url, &push_refspecs(shared, l), true);
@@ -1802,6 +1848,23 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
                         {
                             debug!("workspace {}: {host} is at {tip} now", job.unit);
                         }
+                    }
+                    // NOTE: a merge commit naming a tip that moved on is refused for
+                    // ever; when it added nothing to our side, our side alone goes
+                    if let Some(first) = merge_of_moved_tips(&shared.git, &repo, l, &remotes_now)? {
+                        debug!(
+                            "workspace {}: dropping the merge {}, back to {}",
+                            job.unit,
+                            &l.commit[..8],
+                            &first[..8]
+                        );
+                        shared.git.update_ref(
+                            &repo,
+                            &format!("{SYNC_REFS}/{}", shared.host),
+                            &first,
+                        )?;
+                        local = apply::own_snapshot(&shared.git, &repo, &shared.host)?;
+                        pushed = None;
                     }
                 }
                 Err(e) => {
@@ -1837,8 +1900,10 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
                 other: host,
                 remote: sha,
                 busy: &busy,
+                prefer: job.prefer,
             })?;
             res.waiting = report.waiting.clone();
+            hold_push = false;
             match report.outcome {
                 apply::Outcome::Ahead => {
                     res.merged.insert(host.clone(), sha.clone());
@@ -1923,9 +1988,68 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
         });
         if res.seeding {
             res.detail = Some("the hub has no repository for it yet".into());
+            res.retry = Some(Duration::from_secs(60));
         }
     }
     Ok(())
+}
+
+/// For a merge commit whose extra parents are no host's current tip and
+/// whose tree is its first parent's (the merge added nothing of ours):
+/// that first parent, to fall back to.
+fn merge_of_moved_tips(
+    git: &Git,
+    repo: &Repo,
+    local: &Local,
+    remotes: &BTreeMap<String, String>,
+) -> Result<Option<String>> {
+    let line = git
+        .ok(
+            Some(repo),
+            &["rev-list", "--parents", "-n", "1", &local.commit],
+            &Opts::default(),
+        )?
+        .text();
+    let parents: Vec<&str> = line.split_whitespace().skip(1).collect();
+    if parents.len() < 2 {
+        return Ok(None);
+    }
+    let moved = parents[1..]
+        .iter()
+        .any(|p| !remotes.values().any(|tip| tip == p));
+    if !moved {
+        return Ok(None);
+    }
+    let first = parents[0];
+    if git.tree_of(repo, first)? != local.tree {
+        return Ok(None);
+    }
+    Ok(Some(first.to_owned()))
+}
+
+/// Whether `commit` is a first snapshot: none of its parents is a
+/// snapshot commit (the hub has seen nothing of this chain).
+fn first_snapshot(git: &Git, repo: &Repo, commit: &str) -> Result<bool> {
+    let parents = git
+        .ok(
+            Some(repo),
+            &["rev-list", "--parents", "-n", "1", commit],
+            &Opts::default(),
+        )?
+        .text();
+    for parent in parents.split_whitespace().skip(1) {
+        let raw = git.ok(
+            Some(repo),
+            &["cat-file", "commit", parent],
+            &Opts::default(),
+        )?;
+        let text = String::from_utf8_lossy(&raw.stdout);
+        let message = text.split_once("\n\n").map_or("", |(_, m)| m);
+        if snapshot::Meta::host_of(message).is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Registers the unit's watches: every directory `ls-files` knows, the

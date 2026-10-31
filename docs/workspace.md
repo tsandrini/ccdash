@@ -179,12 +179,19 @@ refs/sync/<me>` … `>>>>>>> refs/sync/<other>`), every other file merges
   tunnel.
 - **Adopt** (a machine with its own copy of the workspace): a unit that
   exists here and already has snapshots on the hub from another machine is
-  not touched until you say so — it shows as "to adopt" with the hint.
+  not touched until you say so — it shows as "to adopt" with the hint; so
+  does a copy whose first snapshot never reached the hub.
   `ccdash workspace adopt [unit]` (or **Adopt here** on the unit view)
-  takes the first snapshot (off the real HEAD both copies share, so the
-  merge base is a commit both sides know) and merges against the hub's
-  latest. Measured on a 219-unit copy: 2.5–4 minutes, 33–42 real merges,
-  one genuine conflict.
+  takes the first snapshot and merges it with the hub's latest: a
+  repository merges on the commit both copies share (edits since then from
+  both sides, a deletion stays deleted, the same lines changed on both
+  sides end as markers), a plain directory has no common base and merges
+  as a union. When one copy is simply older than the other, merge nothing:
+  `--prefer hub` makes this copy exactly the hub's content (its own branch
+  tips are kept under `refs/sync/diverged/<this machine>/…` when they are
+  not behind), `--prefer mine` makes the hub's content exactly this copy's
+  and the other machines fast-forward to it. Measured on a 219-unit copy:
+  2.5–4 minutes, 33–42 real merges, one genuine conflict.
 - A unit that exists only here with nothing on the hub is seeded without a
   question.
 
@@ -192,7 +199,7 @@ refs/sync/<me>` … `>>>>>>> refs/sync/<other>`), every other file merges
 ccdash workspace status [unit] [--json]   # every unit's state on this machine
 ccdash workspace resync [unit]            # fetch and snapshot again
 ccdash workspace init                     # create what the hub has and this machine lacks
-ccdash workspace adopt [unit]             # first snapshot of copies that exist on both sides
+ccdash workspace adopt [unit] [--prefer mine|hub]   # copies that exist on both sides: merge, or one side wins
 ```
 
 ## 7. The Workspace page

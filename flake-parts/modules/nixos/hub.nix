@@ -266,6 +266,7 @@ in
           proxyPass = "http://${proxyEndpoint}";
           extraConfig = ''
             client_max_body_size 0;
+            proxy_http_version 1.1;
             proxy_request_buffering off;
             proxy_buffering off;
             proxy_read_timeout 30m;

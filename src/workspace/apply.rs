@@ -19,7 +19,7 @@ use anyhow::{Context, Result, bail};
 use tracing::debug;
 
 use super::{
-    ConflictMode, ConflictReport, DIVERGED_REFS, Diverged, EMPTY_TREE, Rules, SYNC_REFS,
+    ConflictMode, ConflictReport, DIVERGED_REFS, Diverged, EMPTY_TREE, Rules, SYNC_REFS, Side,
     git::{Conflicted, Git, Opts, Repo},
     snapshot::{Local, Meta, expand, work_index},
     units::blocker,
@@ -68,6 +68,9 @@ pub struct Apply<'a> {
     /// The other host's snapshot commit.
     pub remote: &'a str,
     pub busy: &'a dyn Fn(&Path) -> Option<String>,
+    /// An adoption where one side wins outright instead of merging: the
+    /// result is that side's content (set only for the adopting pass).
+    pub prefer: Option<Side>,
 }
 
 /// A snapshot commit read back.
@@ -175,6 +178,11 @@ pub fn apply(a: &Apply) -> Result<Report> {
             remote.index.clone(),
             remote.meta.clone(),
         )
+    } else if let Some(side) = a.prefer {
+        // NOTE: an adoption; the first snapshots of a repository share the
+        // HEAD commit as a base, a plain directory has none, either way one
+        // side's content is the result
+        preferred(a, side, local, &remote, &mut report)?
     } else {
         let (base_snap, base_known) = match &base {
             Some(c) => {
@@ -477,8 +485,12 @@ pub fn apply(a: &Apply) -> Result<Report> {
             report.outcome = Outcome::FastForward {
                 commit: a.remote.to_owned(),
             };
-        } else if same_as_ours && same_as_theirs {
-            // identical content, our commit sorts first: theirs is merged as is
+        } else if same_as_ours && report.conflicts.is_empty() && a.prefer.is_none() {
+            // NOTE: theirs added nothing: no merge commit, ours stands. The
+            // other host sees the same and takes ours over; a merge commit
+            // here would name a tip that has moved on and be refused for ever.
+            // A conflict kept local, or an adoption that prefers ours, does mint
+            // one: the other host must fast-forward to it, not merge by itself
             report.outcome = Outcome::Ahead;
         } else {
             let commit = a.git.commit_tree(
@@ -516,6 +528,72 @@ fn commit_message(git: &Git, repo: &Repo, commit: &str) -> Result<String> {
 /// The arguments naming the two sides: the sync refs when they still
 /// point at the commits (so conflict markers carry the host names), else
 /// the commits.
+/// An adoption where one side wins outright: that side's working tree,
+/// staged state and HEAD; the branches and tags of both sides, the
+/// winning tip where they disagree (the other tip is set aside under
+/// `refs/sync/diverged/<host>/<branch>` unless it is an ancestor); the
+/// stashes and empty directories of both.
+fn preferred(
+    a: &Apply,
+    side: Side,
+    local: &Local,
+    remote: &Snap,
+    report: &mut Report,
+) -> Result<(String, String, Meta)> {
+    let (win, lose, lose_host) = match side {
+        Side::Mine => (&local.meta, &remote.meta, a.other),
+        Side::Theirs => (&remote.meta, &local.meta, a.host),
+    };
+    let mut refs = win.refs.clone();
+    for (name, sha) in &lose.refs {
+        match win.refs.get(name) {
+            None => {
+                refs.insert(name.clone(), sha.clone());
+            }
+            Some(kept) if kept != sha => {
+                let behind = a.git.merge_base(a.repo, sha, kept)?.as_deref() == Some(sha.as_str());
+                if !behind {
+                    report.diverged.push(Diverged {
+                        branch: name.clone(),
+                        local: kept.clone(),
+                        remote: sha.clone(),
+                        host: lose_host.to_owned(),
+                    });
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    let mut stash = win.stash.clone();
+    for (_, sha) in &lose.stash {
+        if !stash.iter().any(|(_, s)| s == sha) {
+            stash.push((0, sha.clone()));
+        }
+    }
+    let stash = stash
+        .into_iter()
+        .enumerate()
+        .map(|(n, (_, sha))| (u32::try_from(n).unwrap_or(u32::MAX), sha))
+        .collect();
+    let dirs: BTreeSet<String> = win.dirs.iter().chain(&lose.dirs).cloned().collect();
+    let (work, index) = match side {
+        Side::Mine => (local.work.clone(), local.index.clone()),
+        Side::Theirs => (remote.work.clone(), remote.index.clone()),
+    };
+    Ok((
+        work,
+        index.clone(),
+        Meta {
+            head: win.head.clone(),
+            branch: win.branch.clone(),
+            index,
+            refs,
+            stash,
+            dirs: dirs.into_iter().collect(),
+        },
+    ))
+}
+
 fn labels(a: &Apply, local: &Local, remote: &str) -> Result<(String, String)> {
     let own = format!("{SYNC_REFS}/{}", a.host);
     let theirs = format!("{SYNC_REFS}/{}", a.other);
@@ -837,6 +915,7 @@ pub fn create(
         other,
         remote,
         busy: &|_| None,
+        prefer: None,
     })
 }
 
@@ -971,6 +1050,7 @@ pub fn roll_back(
         other: "",
         remote: "",
         busy: &|_| None,
+        prefer: None,
     };
     set_staged(&a, &previous.work, &previous.index)
 }
@@ -1126,6 +1206,18 @@ mod tests {
         other: &str,
         remote: &str,
     ) -> Report {
+        apply_pref(git, repo, scratch, local, other, remote, None)
+    }
+
+    fn apply_pref(
+        git: &Git,
+        repo: &Repo,
+        scratch: &Path,
+        local: &Local,
+        other: &str,
+        remote: &str,
+        prefer: Option<Side>,
+    ) -> Report {
         apply(&Apply {
             git,
             repo,
@@ -1137,8 +1229,107 @@ mod tests {
             other,
             remote,
             busy: &|_| None,
+            prefer,
         })
         .unwrap()
+    }
+
+    /// A snapshot that holds everything of the other's mints no merge
+    /// commit; the other host takes it over. Both end on one commit.
+    #[test]
+    fn a_merge_adding_nothing_mints_no_commit() {
+        let (dir, navi_git, navi) = fixture("superset");
+        let (flat_git, flat) = clone_as(&navi_git, &navi, &dir, "flat");
+        let (ns, fsx) = (dir.join("scratch-navi"), dir.join("scratch-flat"));
+        let f0 = snapshot(&flat_git, &flat, &fsx, None);
+        let n0 = snapshot(&navi_git, &navi, &ns, None);
+        carry(&navi, &flat, &flat_git, "navi");
+        apply_from(&flat_git, &flat, &fsx, &f0, "navi", &n0.commit);
+        let f1 = fresh(&flat_git, &flat, &fsx);
+        carry(&flat, &navi, &navi_git, "flat");
+        apply_from(&navi_git, &navi, &ns, &n0, "flat", &f1.commit);
+        let n1 = fresh(&navi_git, &navi, &ns);
+        assert_eq!(n1.commit, f1.commit);
+
+        // navi adds a file; flat changes nothing: flat's snapshot is a subset
+        fs::write(navi.work_tree.join("more.txt"), "more\n").unwrap();
+        let n2 = snapshot(&navi_git, &navi, &ns, Some(&n1));
+        fs::write(flat.work_tree.join("touch.tmp"), "x").unwrap();
+        fs::remove_file(flat.work_tree.join("touch.tmp")).unwrap();
+        let f2 = snapshot(&flat_git, &flat, &fsx, Some(&f1));
+        assert_eq!(f2.commit, f1.commit, "flat is unchanged");
+        carry(&flat, &navi, &navi_git, "flat");
+        let r = apply_from(&navi_git, &navi, &ns, &n2, "flat", &f2.commit);
+        assert!(matches!(r.outcome, Outcome::Ahead), "{r:?}");
+        assert_eq!(
+            fresh(&navi_git, &navi, &ns).commit,
+            n2.commit,
+            "no commit minted"
+        );
+        carry(&navi, &flat, &flat_git, "navi");
+        let r = apply_from(&flat_git, &flat, &fsx, &f2, "navi", &n2.commit);
+        assert!(matches!(r.outcome, Outcome::FastForward { .. }), "{r:?}");
+        assert_eq!(fresh(&flat_git, &flat, &fsx).commit, n2.commit);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stale copy adopts with the hub winning; the freshest copy adopts
+    /// with itself winning: no union, no markers, deletions respected.
+    #[test]
+    fn adoption_prefers_one_side() {
+        for side in [Side::Theirs, Side::Mine] {
+            let (dir, navi_git, navi) = fixture(&format!("prefer-{side:?}"));
+            let (flat_git, flat) = clone_as(&navi_git, &navi, &dir, "flat");
+            let (ns, fsx) = (dir.join("scratch-navi"), dir.join("scratch-flat"));
+            // flat is the stale copy: the old line, a file navi deleted since
+            fs::write(flat.work_tree.join("old.txt"), "gone on navi\n").unwrap();
+            fs::write(navi.work_tree.join("a.txt"), "one\nnew\n").unwrap();
+            fs::write(navi.work_tree.join("fresh.txt"), "fresh\n").unwrap();
+            let f0 = snapshot(&flat_git, &flat, &fsx, None);
+            let n0 = snapshot(&navi_git, &navi, &ns, None);
+            match side {
+                Side::Theirs => {
+                    // flat adopts, the hub (navi) wins
+                    carry(&navi, &flat, &flat_git, "navi");
+                    let r = apply_pref(&flat_git, &flat, &fsx, &f0, "navi", &n0.commit, Some(side));
+                    assert!(matches!(r.outcome, Outcome::FastForward { .. }), "{r:?}");
+                    assert!(r.conflicts.is_empty(), "{r:?}");
+                    assert_eq!(
+                        fs::read_to_string(flat.work_tree.join("a.txt")).unwrap(),
+                        "one\nnew\n"
+                    );
+                    assert!(flat.work_tree.join("fresh.txt").is_file());
+                    assert!(
+                        !flat.work_tree.join("old.txt").exists(),
+                        "the stale file is gone"
+                    );
+                    assert_eq!(fresh(&flat_git, &flat, &fsx).commit, n0.commit);
+                }
+                Side::Mine => {
+                    // navi adopts against flat's stale seed, navi wins; flat fast-forwards
+                    carry(&flat, &navi, &navi_git, "flat");
+                    let r = apply_pref(&navi_git, &navi, &ns, &n0, "flat", &f0.commit, Some(side));
+                    assert!(matches!(r.outcome, Outcome::Merged { .. }), "{r:?}");
+                    assert!(r.conflicts.is_empty(), "{r:?}");
+                    assert_eq!(
+                        fs::read_to_string(navi.work_tree.join("a.txt")).unwrap(),
+                        "one\nnew\n"
+                    );
+                    assert!(
+                        !navi.work_tree.join("old.txt").exists(),
+                        "nothing came back"
+                    );
+                    let n1 = fresh(&navi_git, &navi, &ns);
+                    assert_eq!(n1.work, n0.work, "navi's tree is untouched");
+                    carry(&navi, &flat, &flat_git, "navi");
+                    let r = apply_from(&flat_git, &flat, &fsx, &f0, "navi", &n1.commit);
+                    assert!(matches!(r.outcome, Outcome::FastForward { .. }), "{r:?}");
+                    assert!(!flat.work_tree.join("old.txt").exists());
+                    assert!(flat.work_tree.join("fresh.txt").is_file());
+                }
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Three hosts merging each other's snapshots at once settle on one
@@ -1588,6 +1779,7 @@ mod tests {
             other: "navi",
             remote: &n1.commit,
             busy: &busy,
+            prefer: None,
         })
         .unwrap();
         assert!(matches!(r.outcome, Outcome::FastForward { .. }), "{r:?}");

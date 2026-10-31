@@ -178,7 +178,15 @@ enum Workspace {
     Init,
     /// An existing copy of the workspace: take the first snapshot of the
     /// units that exist here and on the hub, then merge.
-    Adopt { unit: Option<String> },
+    Adopt {
+        unit: Option<String>,
+        /// Which side wins outright instead of merging: `mine` (this
+        /// machine's content replaces the hub's) or `hub` (the hub's
+        /// content replaces this copy). A stale copy adopts with `hub`,
+        /// the freshest one with `mine`.
+        #[arg(long, value_parser = ["mine", "hub"])]
+        prefer: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -250,10 +258,14 @@ fn main() -> ExitCode {
         Command::Gc { config } => config::load::<HubConfig>(config)
             .and_then(|cfg| workspace::hub::gc(&cfg.sync_dir().join("workspace"))),
         Command::Workspace { what } => match what {
-            Workspace::Status { unit, json } => client::workspace("status", unit.as_deref(), json),
-            Workspace::Resync { unit } => client::workspace("resync", unit.as_deref(), false),
-            Workspace::Init => client::workspace("init", None, false),
-            Workspace::Adopt { unit } => client::workspace("adopt", unit.as_deref(), false),
+            Workspace::Status { unit, json } => {
+                client::workspace("status", unit.as_deref(), None, json)
+            }
+            Workspace::Resync { unit } => client::workspace("resync", unit.as_deref(), None, false),
+            Workspace::Init => client::workspace("init", None, None, false),
+            Workspace::Adopt { unit, prefer } => {
+                client::workspace("adopt", unit.as_deref(), prefer.as_deref(), false)
+            }
         },
         Command::PreReceive => return exit(workspace::hub::pre_receive()),
         Command::Export { config, db, dir } => export(config, db, &dir),
