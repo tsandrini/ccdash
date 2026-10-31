@@ -123,6 +123,9 @@ const EVENTS_KEEP_MS: i64 = 90 * 86_400_000;
 pub struct Repos {
     pub root: PathBuf,
     hooks: PathBuf,
+    /// Two hosts seeding one unit at the same instant both ran `git init`;
+    /// one failed with "cannot mkdir". Creation is serialised.
+    creating: Arc<std::sync::Mutex<()>>,
 }
 
 impl Repos {
@@ -150,6 +153,7 @@ impl Repos {
         Ok(Self {
             root: root.to_owned(),
             hooks,
+            creating: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -169,6 +173,13 @@ impl Repos {
     /// git fails.
     pub fn ensure(&self, unit: &str) -> Result<PathBuf> {
         let path = self.path(unit);
+        if self.exists(unit) {
+            return Ok(path);
+        }
+        let _one_at_a_time = self
+            .creating
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.exists(unit) {
             return Ok(path);
         }

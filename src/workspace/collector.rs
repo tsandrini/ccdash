@@ -718,6 +718,12 @@ impl Scheduler {
     }
 
     fn dispatch(&mut self) {
+        // NOTE: every pass talks to the hub; while the link is down 226 units
+        // retrying made 2,000 DNS lookups a minute and pihole refused the host.
+        // Due units wait, the reconnect marks them all due again.
+        if !self.connected {
+            return;
+        }
         let now = Instant::now();
         let busy_now = now_ms();
         let due: Vec<String> = self
@@ -1743,7 +1749,24 @@ fn run_pass(shared: &Shared, job: &PassJob, res: &mut PassResult) -> Result<()> 
         // (one not built on another snapshot) whose push never landed
         let unseen = match &local {
             None => true,
-            Some(l) => job.pushed.is_none() && first_snapshot(&shared.git, &repo, &l.commit)?,
+            // NOTE: a unit created from the hub holds the hub's own commit before
+            // its first push: that one is known there, not an unseen copy
+            Some(l) => {
+                let mut unseen = job.pushed.is_none();
+                if unseen {
+                    // known there when it is a tip or behind one
+                    for sha in remotes_now.values() {
+                        if sha == &l.commit
+                            || shared.git.merge_base(&repo, &l.commit, sha)?.as_deref()
+                                == Some(l.commit.as_str())
+                        {
+                            unseen = false;
+                            break;
+                        }
+                    }
+                }
+                unseen && first_snapshot(&shared.git, &repo, &l.commit)?
+            }
         };
         if !unseen {
             // the hub knows this copy

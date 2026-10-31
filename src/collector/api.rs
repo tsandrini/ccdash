@@ -247,12 +247,29 @@ async fn handle(
                                 Some("hub") => Some(Side::Theirs),
                                 _ => None,
                             };
-                            ws.send(WsCmd::Adopt { unit, prefer });
-                            json!({ "type": "ok", "message": match prefer {
-                                None => "taking the first snapshot of the units that exist here and on the hub, merged with the hub's; `ccdash workspace status` follows it",
-                                Some(Side::Mine) => "adopting with this machine's content winning; `ccdash workspace status` follows it",
-                                Some(Side::Theirs) => "adopting with the hub's content winning; `ccdash workspace status` follows it",
-                            } })
+                            // NOTE: a request matching nothing is reported, not swallowed:
+                            // a collector that just started lists its units a minute later
+                            let status = ws.status().await?;
+                            let count = status["units"].as_array().map_or(0, |units| {
+                                units
+                                    .iter()
+                                    .filter(|u| {
+                                        u["state"] == "unadopted"
+                                            && unit.as_deref().is_none_or(|w| u["unit"] == w)
+                                    })
+                                    .count()
+                            });
+                            if count == 0 {
+                                error("nothing is \"to adopt\" right now: `ccdash workspace status` lists the units; a collector that just started needs a minute to see them".into())
+                            } else {
+                                ws.send(WsCmd::Adopt { unit, prefer });
+                                let how = match prefer {
+                                    None => "merged with the hub's",
+                                    Some(Side::Mine) => "this machine's content winning",
+                                    Some(Side::Theirs) => "the hub's content winning",
+                                };
+                                json!({ "type": "ok", "message": format!("adopting {count} unit(s), {how}; `ccdash workspace status` follows it") })
+                            }
                         }
                     },
                     other => error(format!("unknown workspace op {other:?}")),
