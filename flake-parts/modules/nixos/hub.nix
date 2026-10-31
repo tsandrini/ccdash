@@ -240,8 +240,8 @@ in
     }
     (mkIf cfg.nginx.enable {
       services.nginx.enable = true;
-      services.nginx.virtualHosts.${cfg.nginx.domain} = {
-        locations."/" = {
+      services.nginx.virtualHosts.${cfg.nginx.domain}.locations = {
+        "/" = {
           proxyPass = "http://${proxyEndpoint}";
           proxyWebsockets = true;
           # NOTE: SSE streams and collector links stay open for hours
@@ -252,7 +252,7 @@ in
           '';
         };
         # NOTE: collectors move files in pieces of up to 8 MiB
-        locations."/sync/" = {
+        "/sync/" = {
           proxyPass = "http://${proxyEndpoint}";
           extraConfig = ''
             client_max_body_size 16m;
@@ -261,10 +261,8 @@ in
             proxy_send_timeout 5m;
           '';
         };
-      }
-      // lib.optionalAttrs cfg.workspace.enable {
         # NOTE: git pushes stream a pack of any size; a seed takes minutes
-        locations."/git/" = {
+        "/git/" = mkIf cfg.workspace.enable {
           proxyPass = "http://${proxyEndpoint}";
           extraConfig = ''
             client_max_body_size 0;
