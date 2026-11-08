@@ -9,6 +9,10 @@
 
 pub mod collector;
 pub mod hub;
+#[cfg(unix)]
+mod watch;
+#[cfg(windows)]
+#[path = "watch_windows.rs"]
 mod watch;
 
 use std::{

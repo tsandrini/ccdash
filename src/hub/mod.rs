@@ -19,7 +19,6 @@ use std::{
 use anyhow::{Context, Result};
 use tokio::{
     net::TcpListener,
-    signal::unix::{SignalKind, signal},
     sync::{mpsc, watch},
 };
 use tracing::{info, warn};
@@ -176,11 +175,7 @@ pub async fn serve(cfg: Arc<HubConfig>, demo: Option<Demo>) -> Result<()> {
     }
     info!("ccdash hub up on {host}, web UI at {public_url}");
 
-    let mut term = signal(SignalKind::terminate())?;
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    crate::util::shutdown().await?;
     info!("shutting down");
     Ok(())
 }

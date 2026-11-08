@@ -54,6 +54,7 @@ pub fn import(source: &Path, dest: &Path) -> Result<Vec<(String, usize)>> {
         [],
     )?;
     added.push(("sessions".to_owned(), sessions));
+    store::fill_cwd_keys(&tx)?;
     for (table, columns) in TABLES {
         let on = columns
             .split(", ")
@@ -116,6 +117,11 @@ mod tests {
             )
             .unwrap();
             conn.execute(
+                r"INSERT INTO sessions (id, host, cwd, kind, started_at) VALUES ('s2', 'win', 'C:\Users\U\w', 'interactive', 10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
                 "INSERT INTO events (ts, host, session, kind, data) VALUES (11, 'navi', 's1', 'prompt', '{}')",
                 [],
             )
@@ -128,10 +134,18 @@ mod tests {
         }
         check(&src).unwrap();
         let first = import(&src, &dst).unwrap();
+        // NOTE: the copied sessions get their keys, so scoped queries find them
+        let key: String = rusqlite::Connection::open(&dst)
+            .unwrap()
+            .query_row("SELECT cwd_key FROM sessions WHERE id = 's2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, "c:/users/u/w");
         assert_eq!(
             first,
             [
-                ("sessions".to_owned(), 1),
+                ("sessions".to_owned(), 2),
                 ("events".to_owned(), 1),
                 ("samples".to_owned(), 1),
                 ("proc_samples".to_owned(), 0),
@@ -156,7 +170,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -280,16 +294,20 @@ fn memory_tree(
 /// The directory of `workspace_dir` named like `scope`, case-insensitively
 /// (`radar-bite` → `radar-BITE`), as the note's project.
 fn project_dir(workspace_dir: &Path, scope: &str) -> Option<String> {
-    if workspace_dir.join(scope).is_dir() {
-        return Some(scope.to_owned());
-    }
-    let wanted = scope.to_lowercase();
-    std::fs::read_dir(workspace_dir)
+    // NOTE: listed, not `join(scope).is_dir()`: a case-insensitive file
+    // system (Windows) finds `radar-bite` and the real name is lost
+    let names: Vec<String> = std::fs::read_dir(workspace_dir)
         .ok()?
         .filter_map(Result::ok)
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|name| name.to_lowercase() == wanted)
+        .collect();
+    let wanted = scope.to_lowercase();
+    names
+        .iter()
+        .find(|name| *name == scope)
+        .or_else(|| names.iter().find(|name| name.to_lowercase() == wanted))
+        .cloned()
 }
 
 /// One `- [Title](file.md) — hook` line of an index.

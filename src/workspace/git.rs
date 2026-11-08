@@ -16,7 +16,6 @@ use std::{
     fs,
     io::{Read, Write},
     net::{IpAddr, ToSocketAddrs},
-    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -318,6 +317,8 @@ impl Git {
                 self.hooks_dir.to_string_lossy().into_owned(),
             ),
             ("gc.auto".into(), "0".into()),
+            // NOTE: working trees travel byte for byte, whatever the user's git converts
+            ("core.autocrlf".into(), "false".into()),
             ("credential.helper".into(), String::new()),
             ("protocol.version".into(), "2".into()),
             ("advice.detachedHead".into(), "false".into()),
@@ -398,11 +399,18 @@ impl Git {
             .timeout
             .unwrap_or(if opts.net { NET_TIMEOUT } else { LOCAL_TIMEOUT });
         let started = Instant::now();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // NOTE: suspended until it is in its job (Tree::of)
+            cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        }
         let child = cmd
             .spawn()
             .with_context(|| format!("starting git {}", args.first().unwrap_or(&"")))?;
-        let out =
-            wait(child, opts.stdin, timeout).with_context(|| format!("git {}", args.join(" ")))?;
+        let tree = Tree::of(&child);
+        let out = wait(child, tree, opts.stdin, timeout)
+            .with_context(|| format!("git {}", args.join(" ")))?;
         self.cost.add(&out.usage, started.elapsed());
         if !out.ok {
             debug!(
@@ -826,9 +834,64 @@ impl Git {
     }
 }
 
-/// Reaps `pid` with `wait4`, so the child's resource usage comes with its
+/// What a timeout ends and whose resources count: the git process (its
+/// children's come with `wait4`).
+#[cfg(unix)]
+struct Tree(u32);
+
+#[cfg(unix)]
+impl Tree {
+    fn of(child: &Child) -> Self {
+        Self(child.id())
+    }
+
+    /// Kills the git process, a child of this process not reaped yet.
+    fn kill(&self) {
+        // SAFETY: the pid is this process's unreaped child
+        unsafe {
+            libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// What a timeout ends and whose resources count: the job git runs in,
+/// with the `mingw64\bin\git.exe` that `cmd\git.exe` (on PATH) starts.
+#[cfg(windows)]
+struct Tree {
+    pid: u32,
+    /// None when the job could not be made: the process alone then.
+    job: Option<crate::win::Job>,
+}
+
+#[cfg(windows)]
+impl Tree {
+    /// Puts `child`, started suspended, in a job of its own and lets it run.
+    fn of(child: &Child) -> Self {
+        let job = crate::win::Job::adopt(std::os::windows::io::AsRawHandle::as_raw_handle(child))
+            .inspect_err(|e| debug!("git outside a job: {e}"))
+            .ok();
+        Self {
+            pid: child.id(),
+            job,
+        }
+    }
+
+    fn kill(&self) {
+        match &self.job {
+            Some(job) => job.terminate(),
+            None => {
+                let _ = crate::win::terminate(self.pid);
+            }
+        }
+    }
+}
+
+/// Reaps `child` with `wait4`, so its resource usage comes with its
 /// status.
-fn reap(pid: u32) -> std::io::Result<(ExitStatus, Usage)> {
+#[cfg(unix)]
+fn reap(child: &mut Child, _tree: &Tree) -> std::io::Result<(ExitStatus, Usage)> {
+    use std::os::unix::process::ExitStatusExt;
+    let pid = child.id();
     let mut status: libc::c_int = 0;
     // SAFETY: a zeroed rusage is a valid value; wait4 fills it in.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -857,10 +920,30 @@ fn reap(pid: u32) -> std::io::Result<(ExitStatus, Usage)> {
     ))
 }
 
+/// Waits for `child`, then reads the CPU time, I/O and peak memory of its
+/// job (every process git ran), else of `child`'s handle.
+#[cfg(windows)]
+fn reap(child: &mut Child, tree: &Tree) -> std::io::Result<(ExitStatus, Usage)> {
+    let status = child.wait()?;
+    let used = tree
+        .job
+        .as_ref()
+        .map_or_else(|| crate::win::usage_of(child), crate::win::Job::usage);
+    Ok((
+        status,
+        Usage {
+            cpu_ms: used.cpu_ms,
+            io_read: used.read_bytes,
+            io_write: used.write_bytes,
+            max_rss_kb: used.peak_kb,
+        },
+    ))
+}
+
 /// Reads stdout and stderr of `child` to the end (stderr on a thread), feeds
 /// `stdin`, kills it after `timeout`, and reaps it with its resource usage.
-fn wait(mut child: Child, stdin: Option<&[u8]>, timeout: Duration) -> Result<Output> {
-    let pid = child.id();
+fn wait(mut child: Child, tree: Tree, stdin: Option<&[u8]>, timeout: Duration) -> Result<Output> {
+    let tree = Arc::new(tree);
     let (mut out_pipe, err_pipe, in_pipe) =
         (child.stdout.take(), child.stderr.take(), child.stdin.take());
     if let (Some(mut pipe), Some(data)) = (in_pipe, stdin) {
@@ -872,13 +955,11 @@ fn wait(mut child: Child, stdin: Option<&[u8]>, timeout: Duration) -> Result<Out
     let reaped = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let watchdog = {
-        let reaped = reaped.clone();
+        let (reaped, tree) = (reaped.clone(), tree.clone());
         thread::spawn(move || {
             if done_rx.recv_timeout(timeout).is_err() && !reaped.load(Ordering::SeqCst) {
-                // SAFETY: the pid is this process's unreaped child (checked just above).
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
+                // NOTE: unreaped (checked just above), so the pid is still the child's
+                tree.kill();
                 return true;
             }
             false
@@ -896,7 +977,7 @@ fn wait(mut child: Child, stdin: Option<&[u8]>, timeout: Duration) -> Result<Out
         let _ = pipe.read_to_end(&mut stdout);
     }
     let stderr = err_reader.join().unwrap_or_default();
-    let (status, usage) = reap(pid).context("waiting for git")?;
+    let (status, usage) = reap(&mut child, &tree).context("waiting for git")?;
     reaped.store(true, Ordering::SeqCst);
     // NOTE: reaped here; dropping a std Child neither waits nor kills
     drop(child);

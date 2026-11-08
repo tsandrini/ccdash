@@ -76,13 +76,14 @@ pub struct Power {
     pub suspend: bool,
     /// Suspends the machine; it must return once the sleep is on its way
     /// (`systemctl suspend` does). logind allows it to the user of an
-    /// active seat session.
+    /// active seat session. Windows: see `WINDOWS_SUSPEND`.
     pub suspend_command: Vec<String>,
     /// Lock the user's graphical session when the panel asks.
     pub lock: bool,
     /// Locks it; `{session}` is replaced with the session's id (logind's
-    /// `Display`). `loginctl lock-session` reaches any locker that listens
-    /// to logind, DankMaterialShell's included.
+    /// `Display`; on Windows the Remote Desktop session's). `loginctl
+    /// lock-session` reaches any locker that listens to logind,
+    /// DankMaterialShell's included; Windows: `LockWorkStation`.
     pub lock_command: Vec<String>,
 }
 
@@ -485,8 +486,27 @@ impl Default for Http {
     }
 }
 
+/// Windows: a hidden PowerShell calls `SetSuspendState` (sleep, not
+/// hibernation), so the command returns before the machine sleeps.
+const WINDOWS_SUSPEND: &str = "Start-Process -WindowStyle Hidden powershell.exe -ArgumentList \
+    '-NoProfile -Command Add-Type -AssemblyName System.Windows.Forms; \
+    [void][System.Windows.Forms.Application]::SetSuspendState(\
+    [System.Windows.Forms.PowerState]::Suspend, $false, $false)'";
+
 impl Default for Power {
     fn default() -> Self {
+        if cfg!(windows) {
+            return Self {
+                suspend: false,
+                suspend_command: ["powershell.exe", "-NoProfile", "-Command", WINDOWS_SUSPEND]
+                    .map(String::from)
+                    .to_vec(),
+                lock: false,
+                lock_command: ["rundll32.exe", "user32.dll,LockWorkStation"]
+                    .map(String::from)
+                    .to_vec(),
+            };
+        }
         Self {
             suspend: false,
             suspend_command: vec!["systemctl".into(), "suspend".into()],
@@ -553,7 +573,7 @@ impl Default for Push {
 impl Default for Niri {
     fn default() -> Self {
         Self {
-            enable: true,
+            enable: cfg!(unix),
             terminals: [
                 "com.mitchellh.ghostty",
                 "foot",
@@ -698,7 +718,9 @@ impl CollectorConfig {
     pub fn workspace_root(&self) -> Option<PathBuf> {
         let raw = self.workspace.root.as_ref()?.to_string_lossy().into_owned();
         let expanded = crate::util::expand_env(&raw);
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = paths::home()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Some(PathBuf::from(match expanded.strip_prefix("~/") {
             Some(rest) => format!("{}/{rest}", home.trim_end_matches('/')),
             None if expanded == "~" => home,
@@ -731,7 +753,7 @@ mod tests {
                 .unwrap();
         assert_eq!(collector.hub.url, "wss://h/collect");
         assert_eq!(collector.agents.interval_secs, 9);
-        assert!(collector.niri.enable);
+        assert_eq!(collector.niri.enable, cfg!(unix));
         assert_eq!(collector.launch.command, ["claude"]);
         // NOTE: no terminal or editor is assumed: Open and Edit stay off until set
         assert!(collector.attach.command.is_empty());
@@ -770,13 +792,22 @@ mod tests {
                 .enable
         );
         assert!(!off.power.suspend);
+        #[cfg(unix)]
         assert_eq!(off.power.suspend_command, ["systemctl", "suspend"]);
+        #[cfg(windows)]
+        assert_eq!(off.power.suspend_command[3], WINDOWS_SUSPEND);
         let power: CollectorConfig = toml::from_str("[power]\nsuspend = true\n").unwrap();
         assert!(power.power.suspend);
         assert!(!power.power.lock);
+        #[cfg(unix)]
         assert_eq!(
             power.power.lock_command,
             ["loginctl", "lock-session", "{session}"]
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            power.power.lock_command,
+            ["rundll32.exe", "user32.dll,LockWorkStation"]
         );
         let wake: HubConfig =
             toml::from_str("[wake.via]\nkrupikbundle = \"192.168.31.136\"\n").unwrap();

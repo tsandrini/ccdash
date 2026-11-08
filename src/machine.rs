@@ -1,17 +1,17 @@
 //! What a machine says about itself (uptime and sleep, CPU, memory, disks,
 //! battery, its wired network cards) and waking one over the LAN. Read
-//! from `/proc`, `/sys` and `getifaddrs` without privileges: collectors
-//! report it every half minute, the hub reads its own.
+//! from `/proc`, `/sys` and `getifaddrs` without privileges (on Windows
+//! from Win32 calls and `powercfg`): collectors report it every half
+//! minute, the hub reads its own.
 
 use std::{
     collections::HashSet,
-    ffi::CStr,
-    fs,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{ffi::CStr, fs, os::unix::fs::MetadataExt, path::Path};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -173,7 +173,9 @@ pub enum Wake {
 
 /// Reads reports; keeps what a reading needs from the one before.
 pub struct Sampler {
+    #[cfg(unix)]
     sys: PathBuf,
+    #[cfg(unix)]
     proc: PathBuf,
     /// Measured with `statvfs`; one per file system.
     disks: Vec<PathBuf>,
@@ -182,7 +184,8 @@ pub struct Sampler {
     /// Read the user's graphical session (a collector; the hub has none).
     session: bool,
     cpu: Option<(u64, u64)>,
-    /// `CLOCK_BOOTTIME - CLOCK_MONOTONIC` at the last look: time asleep.
+    /// `CLOCK_BOOTTIME - CLOCK_MONOTONIC` at the last look: time asleep
+    /// (on Windows the tick count minus the unbiased interrupt time).
     slept_ms: i64,
     resumed_at: Option<i64>,
 }
@@ -190,7 +193,9 @@ pub struct Sampler {
 impl Sampler {
     pub fn new(disks: Vec<PathBuf>) -> Self {
         Self {
+            #[cfg(unix)]
             sys: "/sys".into(),
+            #[cfg(unix)]
             proc: "/proc".into(),
             disks,
             can_suspend: false,
@@ -222,11 +227,9 @@ impl Sampler {
         })
     }
 
-    pub fn read(&mut self) -> MachineReport {
-        self.woke();
-        let now = now_ms();
-        let stat = fs::read_to_string(self.proc.join("stat")).unwrap_or_default();
-        let ticks = cpu_ticks(&stat);
+    /// The busy share of the CPUs since the previous reading; keeps
+    /// `ticks` (busy and total) for the next.
+    fn usage(&mut self, ticks: Option<(u64, u64)>) -> Option<f64> {
         let usage_pct = match (self.cpu, ticks) {
             (Some((busy0, total0)), Some((busy, total))) if total > total0 => {
                 Some(busy.saturating_sub(busy0) as f64 * 100.0 / (total - total0) as f64)
@@ -236,6 +239,15 @@ impl Sampler {
         if ticks.is_some() {
             self.cpu = ticks;
         }
+        usage_pct
+    }
+
+    #[cfg(unix)]
+    pub fn read(&mut self) -> MachineReport {
+        self.woke();
+        let now = now_ms();
+        let stat = fs::read_to_string(self.proc.join("stat")).unwrap_or_default();
+        let usage_pct = self.usage(cpu_ticks(&stat));
         let booted = boottime_ms();
         MachineReport {
             at: now,
@@ -270,9 +282,57 @@ impl Sampler {
                 .and_then(|s| s.locked),
         }
     }
+
+    /// A report from Win32: no load average or CPU temperature there.
+    #[cfg(windows)]
+    pub fn read(&mut self) -> MachineReport {
+        self.woke();
+        let now = now_ms();
+        let usage_pct = self.usage(crate::win::cpu_times());
+        let (os, kernel) = crate::win::os_version();
+        let adapters = crate::win::adapters().unwrap_or_default();
+        MachineReport {
+            at: now,
+            boot_at: now - boottime_ms(),
+            slept_ms: self.slept_ms,
+            resumed_at: self.resumed_at,
+            os,
+            kernel,
+            reboot_pending: None,
+            cpu: Cpu {
+                cores: cores(),
+                usage_pct,
+                load: [0.0; 3],
+                temp_c: None,
+            },
+            memory: memory_status(),
+            disks: disks(&self.disks),
+            battery: battery(),
+            nics: nics(&adapters),
+            can_suspend: self.can_suspend,
+            can_lock: self.can_lock,
+            locked: self
+                .session
+                .then(display_session)
+                .flatten()
+                .and_then(|s| s.locked),
+        }
+    }
 }
 
-/// The user's graphical session, as logind knows it.
+/// The file system the OS runs from: `/`; on Windows the system drive.
+pub fn root_disk() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(drive) = std::env::var_os("SystemDrive") {
+        let mut root = PathBuf::from(drive);
+        root.push("\\");
+        return root;
+    }
+    PathBuf::from("/")
+}
+
+/// The user's graphical session, as logind knows it (on Windows, this
+/// process's Remote Desktop session).
 pub struct DisplaySession {
     pub id: String,
     pub locked: Option<bool>,
@@ -280,6 +340,7 @@ pub struct DisplaySession {
 
 /// The calling user's graphical session (logind's `Display`), asked of
 /// `loginctl`; None without one.
+#[cfg(unix)]
 pub fn display_session() -> Option<DisplaySession> {
     // SAFETY: getuid takes nothing and cannot fail
     let uid = unsafe { libc::getuid() };
@@ -297,6 +358,17 @@ pub fn display_session() -> Option<DisplaySession> {
     Some(DisplaySession { id, locked })
 }
 
+/// This process's session and whether it is locked.
+#[cfg(windows)]
+pub fn display_session() -> Option<DisplaySession> {
+    let (id, locked) = crate::win::session()?;
+    Some(DisplaySession {
+        id: id.to_string(),
+        locked,
+    })
+}
+
+#[cfg(unix)]
 fn loginctl(args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("loginctl")
         .args(args)
@@ -309,6 +381,7 @@ fn loginctl(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+#[cfg(unix)]
 fn clock_ms(clock: libc::clockid_t) -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -320,22 +393,41 @@ fn clock_ms(clock: libc::clockid_t) -> i64 {
 }
 
 /// Time since boot, sleep included.
+#[cfg(unix)]
 fn boottime_ms() -> i64 {
     clock_ms(libc::CLOCK_BOOTTIME)
 }
 
+#[cfg(windows)]
+fn boottime_ms() -> i64 {
+    crate::win::uptime_ms()
+}
+
 /// Time spent asleep since boot: `CLOCK_MONOTONIC` stops while suspended,
 /// `CLOCK_BOOTTIME` does not.
+#[cfg(unix)]
 fn slept_ms() -> i64 {
     (boottime_ms() - clock_ms(libc::CLOCK_MONOTONIC)).max(0)
 }
 
+#[cfg(windows)]
+fn slept_ms() -> i64 {
+    crate::win::slept_ms()
+}
+
+#[cfg(unix)]
 fn cores() -> u32 {
     // SAFETY: sysconf takes and returns plain integers
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     u32::try_from(n).unwrap_or(1).max(1)
 }
 
+#[cfg(windows)]
+fn cores() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| u32::try_from(n.get()).unwrap_or(1))
+}
+
+#[cfg(unix)]
 fn kernel_release() -> String {
     // SAFETY: a zeroed utsname is valid; uname fills it with NUL-terminated fields
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
@@ -348,6 +440,7 @@ fn kernel_release() -> String {
         .into_owned()
 }
 
+#[cfg(unix)]
 /// Busy and total jiffies of all CPUs from `/proc/stat`; iowait counts as idle.
 fn cpu_ticks(stat: &str) -> Option<(u64, u64)> {
     let line = stat.lines().find(|l| l.starts_with("cpu "))?;
@@ -365,6 +458,7 @@ fn cpu_ticks(stat: &str) -> Option<(u64, u64)> {
     Some((total - idle, total))
 }
 
+#[cfg(unix)]
 fn load(loadavg: &str) -> [f64; 3] {
     let mut it = loadavg.split_whitespace().map(|n| n.parse().unwrap_or(0.0));
     [
@@ -374,6 +468,7 @@ fn load(loadavg: &str) -> [f64; 3] {
     ]
 }
 
+#[cfg(unix)]
 fn memory(meminfo: &str) -> Memory {
     let kb = |key: &str| {
         meminfo
@@ -393,6 +488,7 @@ fn memory(meminfo: &str) -> Memory {
     }
 }
 
+#[cfg(unix)]
 fn os_name(os_release: &str) -> Option<String> {
     let value = os_release
         .lines()
@@ -401,6 +497,7 @@ fn os_name(os_release: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+#[cfg(unix)]
 /// NixOS keeps the booted and the current system under `run`.
 fn reboot_pending(run: &Path) -> Option<bool> {
     let (booted, current) = (run.join("booted-system"), run.join("current-system"));
@@ -412,6 +509,7 @@ fn reboot_pending(run: &Path) -> Option<bool> {
     }))
 }
 
+#[cfg(unix)]
 /// Known CPU package sensors, best first: the hwmon name and, when it has
 /// several, the label of the one to read.
 const SENSORS: &[(&str, Option<&str>)] = &[
@@ -421,6 +519,7 @@ const SENSORS: &[(&str, Option<&str>)] = &[
     ("cpu_thermal", None),
 ];
 
+#[cfg(unix)]
 fn cpu_temp(sys: &Path) -> Option<f64> {
     let hwmons: Vec<(String, PathBuf)> = fs::read_dir(sys.join("class/hwmon"))
         .ok()?
@@ -438,6 +537,7 @@ fn cpu_temp(sys: &Path) -> Option<f64> {
     })
 }
 
+#[cfg(unix)]
 fn sensor(dir: &Path, label: Option<&str>) -> Option<f64> {
     let input = match label {
         None => dir.join("temp1_input"),
@@ -450,6 +550,7 @@ fn sensor(dir: &Path, label: Option<&str>) -> Option<f64> {
     Some(milli / 1000.0)
 }
 
+#[cfg(unix)]
 fn battery(sys: &Path) -> Option<Battery> {
     let mut supplies: Vec<PathBuf> = fs::read_dir(sys.join("class/power_supply"))
         .ok()?
@@ -474,6 +575,7 @@ fn battery(sys: &Path) -> Option<Battery> {
     })
 }
 
+#[cfg(unix)]
 /// One entry per file system: `/` and `/home` on the same one count once.
 fn disks(paths: &[PathBuf]) -> Vec<Disk> {
     let mut seen = HashSet::new();
@@ -493,6 +595,7 @@ fn disks(paths: &[PathBuf]) -> Vec<Disk> {
         .collect()
 }
 
+#[cfg(unix)]
 fn statvfs(path: &Path) -> Option<libc::statvfs> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: a zeroed statvfs is valid; statvfs fills it for a NUL-terminated path
@@ -500,6 +603,7 @@ fn statvfs(path: &Path) -> Option<libc::statvfs> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then_some(st)
 }
 
+#[cfg(unix)]
 /// Physical wired cards: Ethernet (`type` 1) with a device behind them and
 /// no wireless side. Bridges, VPNs, containers and Wi-Fi are left out.
 fn nics(sys: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Vec<Nic> {
@@ -541,6 +645,7 @@ fn nics(sys: &Path, addresses: &[(String, Ipv4Addr, u8)]) -> Vec<Nic> {
 ///
 /// `getifaddrs` failed: it needs a netlink socket, which a sandbox
 /// without `AF_NETLINK` refuses.
+#[cfg(unix)]
 pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr, u8)>> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -576,8 +681,159 @@ pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr, u8)>> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn read_trim(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+}
+
+/// Physical memory; swap is the commit charge beyond physical memory,
+/// against the page files' size.
+#[cfg(windows)]
+fn memory_status() -> Memory {
+    let Some(m) = crate::win::memory_status() else {
+        return Memory::default();
+    };
+    let used = m.total.saturating_sub(m.avail);
+    let swap_total = m.commit_limit.saturating_sub(m.total);
+    let committed = m.commit_limit.saturating_sub(m.commit_avail);
+    Memory {
+        total: m.total,
+        used,
+        swap_total,
+        swap_used: committed.saturating_sub(used).min(swap_total),
+    }
+}
+
+/// The system battery, in the words sysfs uses.
+#[cfg(windows)]
+fn battery() -> Option<Battery> {
+    let s = crate::win::power_status()?;
+    let pct = s.battery_pct?;
+    let status = if s.charging {
+        "Charging"
+    } else if s.ac == Some(false) {
+        "Discharging"
+    } else if pct >= 100 {
+        "Full"
+    } else {
+        "Not charging"
+    };
+    Some(Battery {
+        pct: f64::from(pct),
+        status: status.into(),
+        ac: s.ac,
+    })
+}
+
+/// One entry per volume: `C:\` and the profile on it count once.
+#[cfg(windows)]
+fn disks(paths: &[PathBuf]) -> Vec<Disk> {
+    let mut seen = HashSet::new();
+    paths
+        .iter()
+        .filter(|p| crate::win::volume_of(p).is_some_and(|v| seen.insert(v.to_ascii_lowercase())))
+        .filter_map(|p| {
+            let space = crate::win::disk_space(p)?;
+            Some(Disk {
+                path: p.to_string_lossy().into_owned(),
+                total: space.total,
+                used: space.total.saturating_sub(space.free),
+                avail: space.avail,
+            })
+        })
+        .collect()
+}
+
+/// Physical wired cards: hardware Ethernet with a connector; virtual
+/// switches, VPNs and Wi-Fi are left out. `wake` is the device being armed
+/// to wake the machine.
+#[cfg(windows)]
+fn nics(adapters: &[crate::win::Adapter]) -> Vec<Nic> {
+    let armed = wake_armed();
+    let mut out: Vec<Nic> = adapters
+        .iter()
+        .filter(|a| a.wired)
+        .filter_map(|a| {
+            let mac = a.mac?;
+            Some(Nic {
+                name: a.name.clone(),
+                mac: mac
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+                ipv4: a
+                    .ipv4
+                    .iter()
+                    .map(|(ip, prefix)| format!("{ip}/{prefix}"))
+                    .collect(),
+                wake: armed.contains(&a.description),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// How long `powercfg`'s answer is kept: arming a card is rare, the query
+/// a process.
+#[cfg(windows)]
+const WAKE_ARMED_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The devices armed to wake the machine, by name.
+#[cfg(windows)]
+fn wake_armed() -> HashSet<String> {
+    type Cached = Option<(std::time::Instant, HashSet<String>)>;
+    static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, armed)) = cache.as_ref()
+        && at.elapsed() < WAKE_ARMED_TTL
+    {
+        return armed.clone();
+    }
+    let armed = query_wake_armed();
+    *cache = Some((std::time::Instant::now(), armed.clone()));
+    armed
+}
+
+#[cfg(windows)]
+fn query_wake_armed() -> HashSet<String> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("powercfg")
+        .args(["/devicequery", "wake_armed"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every adapter's IPv4 addresses with their prefix length.
+///
+/// # Errors
+///
+/// `GetAdaptersAddresses` failed.
+#[cfg(windows)]
+pub fn ipv4_addresses() -> std::io::Result<Vec<(String, Ipv4Addr, u8)>> {
+    Ok(crate::win::adapters()?
+        .into_iter()
+        .flat_map(|a| {
+            a.ipv4
+                .into_iter()
+                .map(move |(ip, prefix)| (a.name.clone(), ip, prefix))
+        })
+        .collect())
 }
 
 /// `aa:bb:cc:dd:ee:ff` (or with `-`).
@@ -886,6 +1142,7 @@ mod tests {
         assert_eq!(parse_net("10.10.0.204/33"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn proc_files_parse() {
         let stat = "cpu  100 5 50 1000 20 3 2 0 0 0\ncpu0 1 2 3 4 5 6 7 8\n";
@@ -906,6 +1163,7 @@ mod tests {
         assert_eq!(os_name("NAME=x\n"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sysfs_reads_sensors_batteries_and_wired_cards() {
         let root = std::env::temp_dir().join(format!("ccdash-machine-{}", std::process::id()));
@@ -973,7 +1231,7 @@ mod tests {
 
     #[test]
     fn this_machine_reads() {
-        let mut s = Sampler::new(vec!["/".into(), "/".into()]).collector(true, false);
+        let mut s = Sampler::new(vec![root_disk(), root_disk()]).collector(true, false);
         let first = s.read();
         assert!(first.boot_at > 0 && first.boot_at <= first.at);
         assert!(first.cpu.cores >= 1);
@@ -985,6 +1243,7 @@ mod tests {
         assert_eq!(s.woke(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reboot_pending_compares_the_systems() {
         let run = std::env::temp_dir().join(format!("ccdash-run-{}", std::process::id()));

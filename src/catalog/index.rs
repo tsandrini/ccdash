@@ -60,6 +60,7 @@ pub fn spawn(catalog: Catalog, tree: PathBuf, mut changed: watch::Receiver<u64>)
 
 fn run(catalog: &Catalog, tree: &Path, rx: &mpsc::Receiver<()>) {
     // SAFETY: setpriority on this thread's own id, no memory involved
+    #[cfg(unix)]
     unsafe {
         let tid = libc::gettid();
         libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 10);

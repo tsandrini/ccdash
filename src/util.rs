@@ -16,12 +16,44 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The kernel's host name; on Windows the DNS host name, lowercased.
 pub fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|h| h.trim().to_owned())
-        .ok()
+    #[cfg(windows)]
+    let name = crate::win::hostname().map(|h| h.to_ascii_lowercase());
+    #[cfg(not(windows))]
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
+    name.map(|h| h.trim().to_owned())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "localhost".to_owned())
+}
+
+/// Resolves when the process is asked to end: SIGTERM or Ctrl-C; on
+/// Windows Ctrl-C, Ctrl-Break or its console closing.
+///
+/// # Errors
+///
+/// A signal handler cannot be installed.
+pub async fn shutdown() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close};
+        let (mut brk, mut close) = (ctrl_break()?, ctrl_close()?);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+        }
+    }
+    Ok(())
 }
 
 /// A duration as `42s`, `7m` or `3h05m`.
@@ -34,7 +66,60 @@ pub fn age(ms: i64) -> String {
     }
 }
 
+/// Runs `command` to the end within `limit`, its output collected, stdin
+/// closed; none when the time ran out. It is ended then, on Windows with
+/// everything it started: in a job, since npm's `claude.cmd` is `cmd.exe`
+/// starting `node.exe`, and ending `cmd.exe` alone leaves `node.exe`.
+pub async fn output_within(
+    command: &mut tokio::process::Command,
+    limit: std::time::Duration,
+) -> Option<std::io::Result<std::process::Output>> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // NOTE: suspended until it is in its job; any creation flags set before are replaced
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(Err(e)),
+    };
+    #[cfg(windows)]
+    let job = child.raw_handle().and_then(|handle| {
+        crate::win::Job::adopt(handle)
+            .inspect_err(|e| tracing::debug!("a command outside a job: {e}"))
+            .ok()
+    });
+    let output = tokio::time::timeout(limit, child.wait_with_output())
+        .await
+        .ok();
+    #[cfg(windows)]
+    if output.is_none()
+        && let Some(job) = job
+    {
+        job.terminate();
+    }
+    output
+}
+
+/// `name` as a `Command` can start it: on Windows the full path when PATH
+/// holds it as `.exe`, `.com`, `.cmd` or `.bat`, since `Command` looks for
+/// `.exe` alone (npm installs `claude.cmd`); `name` itself otherwise.
+pub fn program(name: &str) -> std::ffi::OsString {
+    #[cfg(windows)]
+    if let Some(path) = crate::win::find_program(name) {
+        return path.into();
+    }
+    name.into()
+}
+
 pub fn pid_alive(pid: Option<u32>) -> bool {
+    #[cfg(windows)]
+    return pid.is_some_and(crate::win::pid_alive);
+    #[cfg(not(windows))]
     pid.is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
 }
 
@@ -73,11 +158,14 @@ fn expand_with(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     out
 }
 
-/// `bytes` random bytes from the kernel, hex-encoded.
+/// `bytes` random bytes from the OS (`getrandom`; `BCryptGenRandom` on
+/// Windows), hex-encoded.
 pub fn random_hex(bytes: usize) -> std::io::Result<String> {
-    use std::io::Read;
+    use ring::rand::{SecureRandom, SystemRandom};
     let mut buf = vec![0u8; bytes];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| std::io::Error::other("the system's random source failed"))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -201,6 +289,34 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_timed_out_batch_file_ends_with_what_it_started() {
+        let dir = std::env::temp_dir().join(format!("ccdash-within-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("slow.cmd");
+        // NOTE: cmd.exe runs the shim and waits for ping, as for npm's claude.cmd and node
+        std::fs::write(&shim, "@ping -n 33 127.0.0.3 >NUL\r\n").unwrap();
+        let mut command = tokio::process::Command::new(&shim);
+        let out = output_within(&mut command, std::time::Duration::from_millis(500)).await;
+        assert!(out.is_none(), "timed out");
+        let pinging = || {
+            crate::win::processes().into_iter().any(|p| {
+                crate::win::command_line(p.pid).is_some_and(|line| line.contains("127.0.0.3"))
+            })
+        };
+        let mut gone = false;
+        for _ in 0..50 {
+            if !pinging() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(gone, "ping outlived the timeout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rfc3339_timestamps() {

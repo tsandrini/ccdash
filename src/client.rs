@@ -2,7 +2,6 @@
 
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
     time::Duration,
 };
 
@@ -10,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
+    ipc,
     knowledge::Upsert,
     model::{Activity, Session, Snapshot},
     paths,
@@ -18,7 +18,7 @@ use crate::{
 
 fn request(request: &Value) -> Result<Value> {
     let path = paths::api_socket();
-    let mut stream = UnixStream::connect(&path)
+    let mut stream = ipc::Stream::connect(&path)
         .with_context(|| format!("connecting to {} (is the daemon running?)", path.display()))?;
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     writeln!(stream, "{request}")?;

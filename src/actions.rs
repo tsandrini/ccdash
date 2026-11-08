@@ -3,11 +3,9 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{OpenOptions, Permissions},
+    fs::OpenOptions,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, SystemTime},
 };
 
@@ -19,9 +17,11 @@ use tracing::{info, warn};
 use crate::{
     collector::Local,
     config,
+    fsx::{self, ModeExt},
     model::{Kind, Session},
-    niri, paths,
+    niri, paths, procs,
     sync::glob,
+    util,
 };
 
 /// How long `claude --bg` and `claude stop` may take.
@@ -65,7 +65,7 @@ async fn edit_in(
         return Err(format!("{id:?} is not an edit id"));
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let _ = std::fs::set_permissions(dir, Permissions::from_mode(0o700));
+    let _ = fsx::set_mode(dir, 0o700);
     let file = dir.join(format!("{id}.md"));
     let write = || -> std::io::Result<()> {
         let mut f = OpenOptions::new()
@@ -79,14 +79,7 @@ async fn edit_in(
     write().map_err(|e| format!("writing {}: {e}", file.display()))?;
     let path = file.to_string_lossy();
     let args: Vec<String> = args.iter().map(|a| a.replace("{file}", &path)).collect();
-    let spawned = Command::new(program)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
-    let mut child = match spawned {
+    let child = match Interactive::spawn(program, &args) {
         Ok(child) => child,
         Err(e) => {
             let _ = std::fs::remove_file(&file);
@@ -96,28 +89,88 @@ async fn edit_in(
     if let Some(pid) = child.id() {
         opened(pid);
     }
-    let status = child.wait().await;
+    let code = child.wait().await;
     let content = std::fs::read_to_string(&file);
     let _ = std::fs::remove_file(&file);
-    let status = status.map_err(|e| format!("waiting for {program}: {e}"))?;
-    if !status.success() {
-        return Err(match status.code() {
-            Some(code) => format!("cancelled: the editor exited with status {code}"),
-            None => "cancelled: the editor was ended by a signal".into(),
-        });
+    match code.map_err(|e| format!("waiting for {program}: {e}"))? {
+        Some(0) => {}
+        Some(code) => return Err(format!("cancelled: the editor exited with status {code}")),
+        None => return Err("cancelled: the editor was ended by a signal".into()),
     }
     content.map_err(|e| format!("reading {} back: {e}", file.display()))
 }
 
 /// Sends SIGTERM to the process group of `pid` (a process started with its
-/// own group), as a cancel of its editor.
+/// own group), as a cancel of its editor; on Windows ends its tree, on a
+/// blocking thread: the walk takes snapshots and a query per process.
 pub fn end_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: kill(2) with a negative pid signals a process group; no memory is touched.
-        unsafe {
-            libc::kill(-pid, libc::SIGTERM);
+    #[cfg(unix)]
+    procs::end_group(pid, false);
+    #[cfg(windows)]
+    tokio::task::spawn_blocking(move || procs::end_group(pid, false));
+}
+
+/// A program the user works in (an editor, an attach), apart from the
+/// collector: on Unix in a process group of its own, so a cancel ends its
+/// children too; on Windows in a console of its own (the collector's may be
+/// hidden), which it gets for its standard handles.
+#[cfg(unix)]
+struct Interactive(tokio::process::Child);
+
+#[cfg(unix)]
+impl Interactive {
+    fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
+        Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map(Self)
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.0.id()
+    }
+
+    /// Waits for it to end: its exit code, none when a signal ended it.
+    async fn wait(mut self) -> std::io::Result<Option<i32>> {
+        self.0.wait().await.map(|status| status.code())
+    }
+
+    /// Leaves it running, reaped when it ends.
+    fn detach(mut self) {
+        tokio::spawn(async move { self.0.wait().await });
+    }
+}
+
+#[cfg(windows)]
+struct Interactive(crate::win::ConsoleChild);
+
+#[cfg(windows)]
+impl Interactive {
+    fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
+        crate::win::ConsoleChild::spawn(program, args).map(Self)
+    }
+
+    fn id(&self) -> Option<u32> {
+        Some(self.0.pid)
+    }
+
+    /// Waits for it to end: its exit code. Polled: a blocking wait would
+    /// hold the runtime's shutdown (Ctrl-C) until the editor closes.
+    async fn wait(self) -> std::io::Result<Option<i32>> {
+        loop {
+            if let Some(code) = self.0.try_wait()? {
+                return Ok(Some(code.cast_signed()));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+
+    /// Leaves it running.
+    fn detach(self) {}
 }
 
 /// Focuses the session's window, or attaches to a background session in a new
@@ -144,18 +197,14 @@ pub async fn open_session(session: &Session, attach_command: &[String]) -> Resul
         .iter()
         .map(|arg| arg.replace("{id}", &short_id))
         .collect();
-    let (program, args) = argv.split_first().context(
-        "no terminal to attach in: set `[attach] command` (Home Manager: `services.ccdash.terminal`)",
-    )?;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("running {program}"))?;
-    tokio::spawn(async move { child.wait().await });
+    let (program, args) = argv.split_first().context(if cfg!(windows) {
+        "no terminal to attach in: set `[attach] command` (`windows\\install.ps1 -Terminal`)"
+    } else {
+        "no terminal to attach in: set `[attach] command` (Home Manager: `services.ccdash.terminal`)"
+    })?;
+    Interactive::spawn(program, args)
+        .with_context(|| format!("running {program}"))?
+        .detach();
     Ok(format!("attaching to {short_id}"))
 }
 
@@ -276,7 +325,10 @@ async fn direnv_env(cfg: &config::Launch, cwd: &str) -> Result<BTreeMap<String, 
     let Some((program, args)) = cfg.direnv.split_first() else {
         return Ok(BTreeMap::new());
     };
-    let output = run(Command::new(program).args(args).current_dir(cwd)).await?;
+    let output = run(Command::new(util::program(program))
+        .args(args)
+        .current_dir(cwd))
+    .await?;
     if !output.status.success() {
         return Err(format!("direnv in {cwd}: {}", failure(&output)));
     }
@@ -296,7 +348,7 @@ fn write_settings(
 ) -> Result<PathBuf, String> {
     let dir = launch_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let _ = std::fs::set_permissions(&dir, Permissions::from_mode(0o700));
+    let _ = fsx::set_mode(&dir, 0o700);
     prune_settings(&dir, jobs);
     let path = dir.join(format!("{nonce}.json"));
     let mut file = OpenOptions::new()
@@ -400,7 +452,12 @@ pub async fn launch(
         return Err(format!("{} is not a directory on this host", spec.cwd));
     }
     if let Some(args) = spec.saved_args() {
-        return started(run(Command::new(program).args(args).current_dir(&spec.cwd)).await?);
+        return started(
+            run(Command::new(util::program(program))
+                .args(args)
+                .current_dir(&spec.cwd))
+            .await?,
+        );
     }
     let env = direnv_env(cfg, &spec.cwd).await?;
     if !cfg.direnv.is_empty() {
@@ -415,7 +472,7 @@ pub async fn launch(
     }
     let settings = write_settings(&spec.nonce, &spec.settings(&env), jobs)?;
     let short = started(
-        run(Command::new(program)
+        run(Command::new(util::program(program))
             .args(lead)
             .args(spec.args(&settings, cfg.channel))
             .current_dir(&spec.cwd))
@@ -467,7 +524,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 /// - interactive: SIGTERM to its Claude process, then, if it is still
 ///   there after `EXIT_GRACE`, to its child processes as well: Claude Code
 ///   acts on the signal only once an editor it opened for the prompt, or a
-///   running command, has finished.
+///   running command, has finished. On Windows its process tree ends at
+///   once.
 ///
 /// # Errors
 ///
@@ -505,43 +563,141 @@ pub async fn stop(
             let pid = session
                 .pid
                 .ok_or("the session's process is unknown; forget it instead")?;
-            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-                .map_err(|_| format!("process {pid} is not running"))?;
+            let cmdline =
+                procs::cmdline(pid).ok_or_else(|| format!("process {pid} is not running"))?;
             // NOTE: a reused pid must not be signalled
-            if !String::from_utf8_lossy(&cmdline).contains("claude") {
+            if !cmdline.contains("claude") {
                 return Err(format!("process {pid} is no longer Claude Code"));
             }
-            terminate(pid).await?;
-            if exited(pid).await {
-                return Ok("stopped".into());
-            }
-            let kids = children(pid);
-            for (child, _) in &kids {
-                let _ = terminate(*child).await;
-            }
-            let waited: Vec<&str> = kids.iter().map(|(_, name)| name.as_str()).collect();
-            if exited(pid).await {
-                return Ok(format!(
-                    "stopped once its child processes ended too ({})",
-                    waited.join(", ")
-                ));
-            }
-            let holding = children(pid)
-                .into_iter()
-                .map(|(child, name)| format!("{name} ({child})"))
-                .collect::<Vec<_>>();
-            Err(if holding.is_empty() {
-                format!(
-                    "Claude Code (pid {pid}) did not exit after SIGTERM; close it in its terminal"
-                )
-            } else {
-                format!(
-                    "Claude Code (pid {pid}) did not exit: it waits for {}; close that in its \
-                    terminal, or stop again",
-                    holding.join(", ")
-                )
-            })
+            end_interactive(pid).await
         }
+    }
+}
+
+#[cfg(unix)]
+async fn end_interactive(pid: u32) -> Result<String, String> {
+    terminate(pid).await?;
+    if exited(pid).await {
+        return Ok("stopped".into());
+    }
+    let kids = procs::children(pid);
+    for (child, _) in &kids {
+        let _ = terminate(*child).await;
+    }
+    let waited: Vec<&str> = kids.iter().map(|(_, name)| name.as_str()).collect();
+    if exited(pid).await {
+        return Ok(format!(
+            "stopped once its child processes ended too ({})",
+            waited.join(", ")
+        ));
+    }
+    let holding = procs::children(pid)
+        .into_iter()
+        .map(|(child, name)| format!("{name} ({child})"))
+        .collect::<Vec<_>>();
+    Err(if holding.is_empty() {
+        format!("Claude Code (pid {pid}) did not exit after SIGTERM; close it in its terminal")
+    } else {
+        format!(
+            "Claude Code (pid {pid}) did not exit: it waits for {}; close that in its \
+            terminal, or stop again",
+            holding.join(", ")
+        )
+    })
+}
+
+/// Windows has no SIGTERM: Claude Code and every process under it end at
+/// once, without its SessionEnd hook; the collector reports the pid gone.
+/// `ccdash end-tree` ends them from inside Claude's console, to undo what
+/// Claude Code would have on its way out (see [`end_tree_in_console`]); if
+/// that fails, they end from here and the console stays as Claude left it.
+#[cfg(windows)]
+async fn end_interactive(pid: u32) -> Result<String, String> {
+    // NOTE: off the runtime's thread: the tree is walked with snapshots and queries
+    let kids: Vec<String> = tokio::task::spawn_blocking(move || {
+        procs::children(pid)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    if let Err(e) = end_in_console(pid).await {
+        warn!("ending Claude Code (pid {pid}) inside its console: {e}");
+    }
+    if running(Some(pid)) {
+        let _ = tokio::task::spawn_blocking(move || procs::end_group(pid, true)).await;
+    }
+    if !exited(pid).await {
+        return Err(format!(
+            "Claude Code (pid {pid}) did not end; close it in its terminal"
+        ));
+    }
+    Ok(if kids.is_empty() {
+        "ended at once (Windows has no SIGTERM)".into()
+    } else {
+        format!(
+            "ended at once with its child processes ({}); Windows has no SIGTERM",
+            kids.join(", ")
+        )
+    })
+}
+
+/// Runs `ccdash end-tree PID` with no console of its own, so that it can
+/// attach to Claude's: the collector keeps its own (hidden) one, and a
+/// process it starts while attached to Claude's would print in the user's
+/// terminal.
+#[cfg(windows)]
+async fn end_in_console(pid: u32) -> Result<(), String> {
+    use std::process::Stdio;
+    let exe = std::env::current_exe().map_err(|e| format!("locating ccdash: {e}"))?;
+    let mut command = Command::new(exe);
+    command
+        .args(["end-tree", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .creation_flags(windows_sys::Win32::System::Threading::DETACHED_PROCESS);
+    match tokio::time::timeout(EXIT_GRACE, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(failure(&output)),
+        Ok(Err(e)) => Err(format!("starting ccdash end-tree: {e}")),
+        Err(_) => Err("ccdash end-tree did not finish in time".into()),
+    }
+}
+
+/// `ccdash end-tree PID`, which the collector runs to stop an interactive
+/// session on Windows: attaches to the console of `pid` (Claude Code), ends
+/// it and every process under it at once, and as soon as Claude Code is
+/// gone, before its shell prompts again, turns off the terminal modes it
+/// had turned on and gives the console line input back. Claude Code does
+/// that itself as it exits, but a process ended at once does nothing; its
+/// shell would then read every mouse move as typed text.
+///
+/// # Errors
+///
+/// When the console could not be attached to or restored; the tree is
+/// ended all the same.
+#[cfg(windows)]
+pub fn end_tree_in_console(pid: u32) -> Result<()> {
+    let console = crate::win::ForeignConsole::attach(pid);
+    let mut restored = None;
+    procs::end_tree(
+        pid,
+        Some(|| {
+            restored = console
+                .as_ref()
+                .ok()
+                .map(crate::win::ForeignConsole::restore)
+        }),
+    );
+    let attached = console.map(drop);
+    match (attached, restored) {
+        (Err(e), _) => Err(e).context("attaching to Claude Code's console to restore it"),
+        (Ok(()), Some(result)) => result.context("restoring Claude Code's console"),
+        // NOTE: Claude Code did not end; the caller says so
+        (Ok(()), None) => Ok(()),
     }
 }
 
@@ -575,7 +731,11 @@ async fn run_power(command: &[String], what: &str) -> Result<(), String> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| format!("no {what} command is configured"))?;
-    let output = run_within(Command::new(program).args(args), POWER_TIMEOUT).await?;
+    let output = run_within(
+        Command::new(util::program(program)).args(args),
+        POWER_TIMEOUT,
+    )
+    .await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -586,7 +746,11 @@ async fn run_power(command: &[String], what: &str) -> Result<(), String> {
 async fn run_with(command: &[String], id: &str) -> Result<(), String> {
     let argv: Vec<String> = command.iter().map(|a| a.replace("{id}", id)).collect();
     let (program, args) = argv.split_first().ok_or("no command configured")?;
-    let output = run_within(Command::new(program).args(args), STOP_TIMEOUT).await?;
+    let output = run_within(
+        Command::new(util::program(program)).args(args),
+        STOP_TIMEOUT,
+    )
+    .await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -594,6 +758,7 @@ async fn run_with(command: &[String], id: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 async fn terminate(pid: u32) -> Result<(), String> {
     let output = run(Command::new("kill").args(["-s", "TERM", "--", &pid.to_string()])).await?;
     if output.status.success() {
@@ -616,6 +781,13 @@ async fn exited(pid: u32) -> bool {
 }
 
 /// Whether `pid` is a process that has not ended (a zombie has).
+#[cfg(windows)]
+fn running(pid: Option<u32>) -> bool {
+    crate::util::pid_alive(pid)
+}
+
+/// Whether `pid` is a process that has not ended (a zombie has).
+#[cfg(unix)]
 fn running(pid: Option<u32>) -> bool {
     pid.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok())
         .and_then(|stat| {
@@ -623,24 +795,6 @@ fn running(pid: Option<u32>) -> bool {
                 .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
         })
         .is_some_and(|state| state != "Z" && state != "X")
-}
-
-/// The direct child processes of `pid`, with their names.
-fn children(pid: u32) -> Vec<(u32, String)> {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|child| {
-            let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).ok()?;
-            let (head, rest) = stat.rsplit_once(')')?;
-            let name = head.split_once('(')?.1.to_owned();
-            let parent: u32 = rest.split_whitespace().nth(1)?.parse().ok()?;
-            (parent == pid).then_some((child, name))
-        })
-        .collect()
 }
 
 async fn run(command: &mut Command) -> Result<std::process::Output, String> {
@@ -656,15 +810,10 @@ async fn run_within(
         .get_program()
         .to_string_lossy()
         .into_owned();
-    match tokio::time::timeout(
-        limit,
-        command.stdin(Stdio::null()).kill_on_drop(true).output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("running {program}: {e}")),
-        Err(_) => Err(format!("{program} did not finish in time")),
+    match util::output_within(command, limit).await {
+        Some(Ok(output)) => Ok(output),
+        Some(Err(e)) => Err(format!("running {program}: {e}")),
+        None => Err(format!("{program} did not finish in time")),
     }
 }
 
@@ -691,10 +840,13 @@ mod tests {
     }
 
     /// `ETXTBSY` on Linux.
+    #[cfg(unix)]
     const fn libc_etxtbsy() -> i32 {
         26
     }
 
+    /// Unix: a shell's TERM trap.
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_ends_a_claude_waiting_for_its_editor() {
         // a shell defers its TERM trap until its foreground child (the
@@ -703,11 +855,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("claude");
         std::fs::write(&script, "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 600\n").unwrap();
-        std::fs::set_permissions(
-            &script,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap();
+        fsx::set_mode(&script, 0o755).unwrap();
         // NOTE: a parallel test forking between the write and the exec holds the
         // script open ("text file busy"); spawning is retried
         let mut child = loop {
@@ -730,6 +878,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Unix: on Windows the editor opens a console window.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_editor_saves_cancels_or_is_ended() {
         let dir = std::env::temp_dir().join(format!("ccdash-edit-{}", std::process::id()));
@@ -743,7 +893,7 @@ mod tests {
             { echo edited; cat \"$1\"; } > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
         )
         .unwrap();
-        std::fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
+        fsx::set_mode(&script, 0o755).unwrap();
         // NOTE: through `sh`: a parallel test forking between the write and an
         // exec of the script holds it open ("text file busy")
         let cmd = vec![
@@ -789,6 +939,30 @@ mod tests {
         let err = waited.await.unwrap().unwrap_err();
         assert!(err.starts_with("cancelled"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_stop_ends_the_whole_tree() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        for _ in 0..50 {
+            if procs::children(pid)
+                .iter()
+                .any(|(_, name)| name.eq_ignore_ascii_case("ping.exe"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let said = end_interactive(pid).await.unwrap();
+        assert!(said.to_ascii_lowercase().contains("ping.exe"), "{said}");
+        assert!(!child.wait().unwrap().success());
     }
 
     #[tokio::test]
@@ -876,6 +1050,8 @@ mod tests {
         assert!(elsewhere.saved_args().is_none(), "needs the channel flags");
     }
 
+    /// Unix: `/tmp` and `echo` as a program.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_wake_runs_no_leading_flags_and_its_failure_is_the_launch_failure() {
         let waking = |command: &[&str]| {
@@ -924,6 +1100,8 @@ mod tests {
         assert!(direnv_vars("direnv: error", &globs).is_err());
     }
 
+    /// Unix: `/tmp` and `sh`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn direnv_runs_in_the_launch_directory_and_its_failure_is_the_launch_failure() {
         let cfg = |direnv: &[&str]| config::Launch {
@@ -972,7 +1150,9 @@ mod tests {
         std::fs::write(&old, "{}").unwrap();
         let stale = SystemTime::now() - SETTINGS_KEEP - Duration::from_secs(60);
         let age = |path: &Path| {
-            std::fs::File::open(path)
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
                 .unwrap()
                 .set_modified(stale)
                 .unwrap();

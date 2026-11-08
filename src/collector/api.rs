@@ -38,10 +38,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    net::{
-        UnixListener, UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
     sync::{broadcast::error::RecvError, mpsc, oneshot},
 };
 use tracing::debug;
@@ -52,6 +48,7 @@ use crate::{
     ask::Answer,
     config::CollectorConfig,
     emit::{INTERRUPT_REASON, tool_hook},
+    ipc,
     knowledge::{Upsert, tools},
     protocol::{Call, Injection, Reply, Who},
     sync::collector::Handle as SyncHandle,
@@ -123,7 +120,7 @@ enum Request {
 }
 
 pub async fn serve(
-    listener: UnixListener,
+    mut listener: ipc::Listener,
     local: Local,
     cfg: Arc<CollectorConfig>,
     sync: Option<SyncHandle>,
@@ -131,7 +128,7 @@ pub async fn serve(
 ) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok(stream) => {
                 let (local, cfg, sync, workspace) =
                     (local.clone(), cfg.clone(), sync.clone(), workspace.clone());
                 tokio::spawn(async move {
@@ -140,19 +137,23 @@ pub async fn serve(
                     }
                 });
             }
-            Err(e) => debug!("api accept: {e}"),
+            Err(e) => {
+                debug!("api accept: {e}");
+                // NOTE: a lasting failure (no handles left) would spin the runtime
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
     }
 }
 
 async fn handle(
-    stream: UnixStream,
+    stream: ipc::Accepted,
     local: Local,
     cfg: Arc<CollectorConfig>,
     sync: Option<SyncHandle>,
     workspace: Option<WsHandle>,
 ) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = ipc::split(stream);
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         let reply = match serde_json::from_str::<Request>(&line) {
@@ -514,8 +515,8 @@ async fn resolve(local: &Local, key: &str) -> Result<String> {
 
 /// Relays between the actor and one `ccdash channel` until either side leaves.
 async fn channel(
-    mut lines: Lines<BufReader<OwnedReadHalf>>,
-    mut write: OwnedWriteHalf,
+    mut lines: Lines<BufReader<ipc::ReadHalf>>,
+    mut write: ipc::WriteHalf,
     local: Local,
     pid: u32,
 ) -> Result<()> {
@@ -546,8 +547,8 @@ async fn channel(
 /// Holds a prompt for `ccdash ask` until the hub answers it, lets go of
 /// it, or the hook goes away.
 async fn ask(
-    mut lines: Lines<BufReader<OwnedReadHalf>>,
-    mut write: OwnedWriteHalf,
+    mut lines: Lines<BufReader<ipc::ReadHalf>>,
+    mut write: ipc::WriteHalf,
     local: Local,
     envelope: Box<Envelope>,
 ) -> Result<()> {
@@ -568,7 +569,7 @@ async fn ask(
     Ok(())
 }
 
-async fn subscribe(mut write: OwnedWriteHalf, local: Local) -> Result<()> {
+async fn subscribe(mut write: ipc::WriteHalf, local: Local) -> Result<()> {
     let mut updates = local.subscribe();
     send(&mut write, &tagged("snapshot", &local.snapshot().await?)).await?;
     loop {
@@ -594,7 +595,7 @@ fn error(message: String) -> Value {
     json!({ "type": "error", "message": message })
 }
 
-async fn send(write: &mut OwnedWriteHalf, value: &Value) -> Result<()> {
+async fn send(write: &mut ipc::WriteHalf, value: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
     write.write_all(&line).await?;

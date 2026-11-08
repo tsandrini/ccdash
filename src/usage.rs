@@ -4,7 +4,7 @@
 //! memory, nothing saved. The report is `SDKUsageReport` in the Agent SDK
 //! reference (experimental).
 
-use std::{process::Stdio, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -52,18 +52,15 @@ pub async fn run(command: Vec<String>, every: Duration, tx: mpsc::Sender<LocalCm
 
 async fn poll(command: &[String]) -> Result<Vec<ScopedLimit>> {
     let (program, args) = command.split_first().context("empty usage command")?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        Command::new(program)
+    let output = crate::util::output_within(
+        Command::new(crate::util::program(program))
             .args(args)
             .args(ARGS)
             .current_dir(std::env::temp_dir())
             .env("CLAUDE_CODE_SAFE_MODE", "1")
             .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
-            .env_remove("CLAUDECODE")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+            .env_remove("CLAUDECODE"),
+        Duration::from_secs(60),
     )
     .await
     .context("timed out")??;

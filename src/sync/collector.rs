@@ -15,7 +15,6 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -40,6 +39,7 @@ use super::{
     line_digest, session_of, valid_path, watch,
 };
 use crate::{
+    paths,
     protocol::ToHub,
     util::{now_ms, pid_alive},
 };
@@ -399,9 +399,26 @@ impl Stat {
     fn of(meta: &fs::Metadata) -> Self {
         Self {
             size: meta.len(),
-            mtime: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            mtime: mtime_ns(meta),
         }
     }
+}
+
+/// The modification time in nanoseconds since the Unix epoch.
+#[cfg(unix)]
+fn mtime_ns(meta: &fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.mtime() * 1_000_000_000 + meta.mtime_nsec()
+}
+
+/// The modification time in nanoseconds since the Unix epoch (100 ns
+/// steps on NTFS).
+#[cfg(windows)]
+fn mtime_ns(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// A regular file's `Stat`; none for anything else or nothing.
@@ -1066,7 +1083,7 @@ impl Syncer {
         let meta = fs::metadata(&target)?;
         let synced = Synced {
             size,
-            mtime: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            mtime: mtime_ns(&meta),
             version: row.version,
             fp: fp_of(&target, size)?,
             deleted: false,
@@ -1364,7 +1381,7 @@ fn describe(root: &Path, path: &str, copy: &str) -> Option<ConflictDetails> {
     let (current, copied) = (root.join(path), root.join(copy));
     let (a, b) = (fs::metadata(&current).ok()?, fs::metadata(&copied).ok()?);
     let shared = shared_prefix(&current, &copied).ok()?;
-    let millis = |m: &fs::Metadata| m.mtime() * 1000 + m.mtime_nsec() / 1_000_000;
+    let millis = |m: &fs::Metadata| mtime_ns(m) / 1_000_000;
     Some(ConflictDetails {
         current_size: a.len(),
         copy_size: b.len(),
@@ -1955,9 +1972,7 @@ pub fn base_url(collect_url: &str) -> String {
 pub fn default_root() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".claude")
-        })
+        .unwrap_or_else(|| paths::home().unwrap_or_default().join(".claude"))
 }
 
 #[cfg(test)]

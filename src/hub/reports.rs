@@ -12,7 +12,6 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -39,6 +38,7 @@ use super::{
     http::{ApiError, App},
 };
 use crate::{
+    fsx,
     knowledge::{self, NoteKind, Status, Upsert, slugify, valid_slug},
     protocol::Who,
     report,
@@ -87,7 +87,7 @@ impl Reports {
     /// Opens `dir` (created private) and draws the view links' key.
     pub fn open(dir: &Path, max_mb: u32) -> Result<Self> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        fsx::set_mode(dir, 0o700)?;
         let mut seed = [0u8; 32];
         SystemRandom::new()
             .fill(&mut seed)

@@ -9,7 +9,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{BufRead, Write as _},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -43,6 +42,7 @@ use super::{
     WorkspaceSetup, WorkspaceStats, valid_host, valid_unit,
 };
 use crate::{
+    fsx,
     hub::{collect::Tokens, core::Cmd},
     util::now_ms,
 };
@@ -203,7 +203,7 @@ impl Repos {
     /// They cannot be written.
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+        fsx::set_mode(root, 0o700)?;
         let hooks = root.join(".hooks");
         fs::create_dir_all(&hooks)?;
         let exe = std::env::current_exe().context("locating the ccdash executable")?;
@@ -215,7 +215,7 @@ impl Repos {
         if fs::read_to_string(&hook).ok().as_deref() != Some(script.as_str()) {
             fs::write(&hook, script)?;
         }
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+        fsx::set_mode(&hook, 0o755)?;
         Ok(Self {
             root: root.to_owned(),
             hooks,
@@ -2411,7 +2411,7 @@ mod tests {
             git_ok(&["config", "core.hooksPath"], Some(&path))
                 .unwrap()
                 .trim(),
-            dir.join("workspace/.hooks").to_string_lossy()
+            dir.join("workspace").join(".hooks").to_string_lossy()
         );
         assert!(repos.sync_refs("ts/u").unwrap().is_empty());
         assert!(repos.history("ts/u").unwrap().is_empty());

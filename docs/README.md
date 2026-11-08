@@ -12,7 +12,8 @@ in step across machines. It runs on NixOS with flakes and Home Manager.
 - **Look around first:** `nix run github:tsandrini/ccdash#demo` serves the
   panel on a made-up workspace at <http://127.0.0.1:7840/#token=demo>.
 - [Installation](installation.md): one machine, or a hub and your
-  workstations, then your phone.
+  workstations, then your phone. A workstation can also run
+  [Windows](windows.md).
 - [Getting started](getting-started.md): workspaces, the knowledge tools and
   skills, a first session from the phone.
 - [Troubleshooting](troubleshooting.md) when a machine does not show up.

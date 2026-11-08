@@ -586,7 +586,12 @@ mod tests {
         let files = find_html(std::slice::from_ref(&dir)).unwrap();
         let names: Vec<String> = files
             .iter()
-            .map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+            .map(|f| {
+                f.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert_eq!(names, ["bad.html", "plain.html", "sub/good.html"]);
         let good = inspect(&dir.join("sub/good.html")).unwrap().unwrap();

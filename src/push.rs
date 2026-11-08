@@ -7,7 +7,7 @@
 //! ends. Subscriptions the push service reports gone (404, 410) are
 //! dropped.
 
-use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
+use std::{fs::OpenOptions, io::Write, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -24,6 +24,7 @@ use ts_rs::TS;
 
 use crate::{
     config,
+    fsx::ModeExt,
     notify::{Category, Note, Sink},
     store::Store,
     util::{now_ms, truncate},
@@ -602,8 +603,6 @@ pub fn log_failures(results: &[(Subscription, Outcome)]) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
     use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 
@@ -687,10 +686,14 @@ mod tests {
         let keys = Keys::load_or_create(&path).unwrap();
         let again = Keys::load_or_create(&path).unwrap();
         assert_eq!(keys.public_key(), again.public_key());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(decode(&keys.public_key()).unwrap().len(), 65);
 
         let header = keys
@@ -850,7 +853,7 @@ mod tests {
         server.join().unwrap();
         assert!(subscriptions(&store.reader().unwrap()).unwrap().is_empty());
         drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

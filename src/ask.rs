@@ -11,7 +11,6 @@
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::net::UnixStream,
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,7 +18,7 @@ use serde_json::{Value, json};
 use ts_rs::TS;
 
 use crate::{
-    emit,
+    emit, ipc,
     model::{AskKind, Choice, Question},
     paths,
     util::truncate,
@@ -57,7 +56,7 @@ pub fn run() -> i32 {
 /// Sends the prompt and blocks until a decision or until the daemon closes
 /// the connection.
 fn wait(payload: Value) -> Option<Value> {
-    let mut stream = UnixStream::connect(paths::api_socket()).ok()?;
+    let mut stream = ipc::Stream::connect(&paths::api_socket()).ok()?;
     let request = json!({ "cmd": "ask", "envelope": emit::envelope(Source::Hook, payload, None) });
     let mut line = serde_json::to_vec(&request).ok()?;
     line.push(b'\n');

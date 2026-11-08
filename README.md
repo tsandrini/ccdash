@@ -22,6 +22,7 @@ workspace; more are in the [panel](docs/panel.md) guide.
   - [3.2 Each workstation](#32-each-workstation)
   - [3.3 Your phone](#33-your-phone)
   - [3.4 One machine](#34-one-machine)
+  - [3.5 A Windows workstation](#35-a-windows-workstation)
 - [4. Everyday use](#4-everyday-use)
 - [5. Configuration](#5-configuration)
 - [6. Development](#6-development)
@@ -190,6 +191,19 @@ prints a link that signs this browser in; a phone needs the hub reachable
 from it first (nginx, a VPN). Notes from before ccdash come in with
 `ccdash import memory <dir>` ([knowledge](docs/knowledge.md#6-import-and-export)).
 
+### 3.5 A Windows workstation
+
+A workstation can also run Windows, reporting to a hub on Linux (the hub
+runs on Linux only). From the repository:
+
+```powershell
+pwsh -File windows\install.ps1 -Build -Hub wss://ccdash.example.org/collect -Token .\token
+```
+
+It installs the collector, the hooks and the plugin, and starts the
+collector at logon; the channel, Open and Edit are switches, off until
+given. Steps and differences: [Windows](docs/windows.md).
+
 ## 4. Everyday use
 
 On a workstation:
@@ -272,6 +286,7 @@ started](docs/getting-started.md) and
 | [knowledge](docs/knowledge.md)                                 | notes, tools, injections, import and export                   |
 | [reports](docs/reports.md)                                     | HTML reports: the skill, publishing, the viewer, storage      |
 | [machines](docs/machines.md)                                   | uptime and basic numbers, lock, suspend, wake-on-LAN          |
+| [windows](docs/windows.md)                                     | a Windows workstation: install, hooks, paths, differences     |
 | [security](docs/security.md)                                   | tokens, devices, what can reach the hub                       |
 | [data](docs/data.md)                                           | what is stored where, retention, backups                      |
 | [configuration](docs/configuration.md)                         | every configuration key                                       |

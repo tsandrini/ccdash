@@ -413,6 +413,7 @@ fn a_new_parser_rebuilds() {
     assert_eq!(index::pass_now(&catalog, &f.dir.join("claude")), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn the_catalog_is_private() {
     use std::os::unix::fs::PermissionsExt;

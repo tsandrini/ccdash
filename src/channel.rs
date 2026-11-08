@@ -12,11 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
     sync::mpsc,
 };
 
-use crate::{knowledge::tools, paths};
+use crate::{ipc, knowledge::tools, paths};
 
 /// What the daemon sends a session's channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +44,8 @@ pub fn run() -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(serve(std::os::unix::process::parent_id()))
+        // NOTE: 0 matches no session: the tools answer, unattributed
+        .block_on(serve(crate::procs::parent_id().unwrap_or(0)))
 }
 
 /// Answers Claude Code on stdio until it closes stdin; the daemon link runs
@@ -112,7 +112,7 @@ async fn tool_call(id: Value, params: &Value, pid: u32) -> Value {
 
 /// `(ok, text)` from the collector's `tool` request.
 async fn run_tool(name: &str, args: &Value, pid: u32) -> Result<(bool, String)> {
-    let mut stream = UnixStream::connect(paths::api_socket())
+    let mut stream = ipc::connect(&paths::api_socket())
         .await
         .context("the collector is not running")?;
     let cwd = std::env::var("CLAUDE_PROJECT_DIR")
@@ -196,7 +196,7 @@ fn respond(msg: &Value) -> Option<Value> {
 
 async fn link(pid: u32, out: mpsc::Sender<Value>) {
     loop {
-        if let Ok(stream) = UnixStream::connect(paths::api_socket()).await {
+        if let Ok(stream) = ipc::connect(&paths::api_socket()).await {
             let _ = relay(stream, pid, &out).await;
         }
         if out.is_closed() {
@@ -206,8 +206,8 @@ async fn link(pid: u32, out: mpsc::Sender<Value>) {
     }
 }
 
-async fn relay(stream: UnixStream, pid: u32, out: &mpsc::Sender<Value>) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+async fn relay(stream: ipc::Connected, pid: u32, out: &mpsc::Sender<Value>) -> Result<()> {
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     let mut hello = serde_json::to_vec(&json!({ "cmd": "channel", "pid": pid }))?;
     hello.push(b'\n');

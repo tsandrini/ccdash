@@ -5,13 +5,12 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
 };
 
 use tracing::warn;
 
-use crate::protocol::ToHub;
+use crate::{fsx::ModeExt, protocol::ToHub};
 
 pub struct Queue {
     path: PathBuf,

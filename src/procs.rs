@@ -1,6 +1,12 @@
-//! CPU and memory of every session's process tree, read from `/proc`.
+//! CPU and memory of every session's process tree, read from `/proc`; on
+//! Windows from a Toolhelp snapshot and per-process queries.
 
-use std::{collections::HashMap, fs, time::Duration};
+#[cfg(unix)]
+use std::fs;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use crate::{
     collector::{Local, LocalCmd},
@@ -9,7 +15,8 @@ use crate::{
     util::{now_ms, truncate},
 };
 
-/// `USER_HZ`, the unit of CPU times in `/proc/<pid>/stat`.
+/// `USER_HZ`, the unit of CPU times in `/proc/<pid>/stat`; Windows times
+/// are converted to it.
 const TICKS_PER_SEC: f64 = 100.0;
 const TOP: usize = 5;
 const CMD_LEN: usize = 160;
@@ -22,17 +29,19 @@ const SHELL_MARK: &str = "/shell-snapshots/";
 /// stamped: start times come in ticks, and the stamps from another process.
 const SHELL_SLACK_MS: i64 = 2_000;
 /// How long a command gets to honour SIGTERM.
+#[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_secs(3);
 
 struct Stat {
     ppid: u32,
-    /// The process group.
+    /// The process group; on Windows the process itself.
     pgrp: u32,
     comm: String,
     /// utime + stime + cutime + cstime. A reaped child's total moves into its
-    /// parent's cutime, so the sum over a tree only grows.
+    /// parent's cutime, so the sum over a tree only grows. On Windows the
+    /// process's own times only.
     ticks: u64,
-    /// Start time in ticks since boot.
+    /// Start time in ticks since boot; on Windows since the Unix epoch.
     start: u64,
 }
 
@@ -64,11 +73,9 @@ impl Poller {
     /// Measures the trees under `roots` (`(session id, pid)`). CPU figures are
     /// averages since the previous call and read 0 on the first one.
     pub fn poll(&mut self, roots: &[(String, u32)], now: i64) -> Vec<ProcPoll> {
-        let table = scan();
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (pid, stat) in &table {
-            children.entry(stat.ppid).or_default().push(*pid);
-        }
+        let pids: Vec<u32> = roots.iter().map(|(_, pid)| *pid).collect();
+        let table = scan(&pids);
+        let children = children_of(&table);
         let elapsed = self
             .last
             .map(|last| (now - last) as f64 / 1000.0)
@@ -86,10 +93,7 @@ impl Poller {
             let members = subtree(*root, &children);
             let total: u64 = members.iter().map(|pid| table[pid].ticks).sum();
             let tree_key = (*root, root_stat.start);
-            let cpu_pct = self
-                .trees
-                .get(&tree_key)
-                .map_or(0.0, |prev| pct(total.saturating_sub(*prev)));
+            let prev_total = self.trees.get(&tree_key).copied();
             trees.insert(tree_key, total);
             let forked_from = self
                 .forks
@@ -98,6 +102,7 @@ impl Poller {
             forks.insert(tree_key, forked_from.clone());
 
             let mut mem_total = 0;
+            let mut members_ticks = 0;
             let mut infos: Vec<ProcInfo> = members
                 .iter()
                 .map(|pid| {
@@ -110,6 +115,7 @@ impl Poller {
                         None if self.last.is_some_and(|last| started_at >= last) => stat.ticks,
                         None => 0,
                     };
+                    members_ticks += ticks;
                     procs.insert(key, stat.ticks);
                     let mem_bytes = match self.mem.get(&key) {
                         Some(&(bytes, at)) if now - at < MEM_EVERY_MS => {
@@ -133,6 +139,15 @@ impl Poller {
                     }
                 })
                 .collect();
+            // NOTE: Windows keeps no reaped children's times: a tree's total drops when one
+            // exits, so its members' own deltas count instead
+            let cpu_pct = prev_total.map_or(0.0, |prev| {
+                pct(if cfg!(unix) {
+                    total.saturating_sub(prev)
+                } else {
+                    members_ticks
+                })
+            });
             infos.sort_by(|a, b| {
                 b.cpu_pct
                     .total_cmp(&a.cpu_pct)
@@ -188,6 +203,7 @@ pub async fn run(local: Local, every: Duration) {
     }
 }
 
+#[cfg(unix)]
 fn boot_ms() -> i64 {
     fs::read_to_string("/proc/stat")
         .ok()
@@ -196,6 +212,12 @@ fn boot_ms() -> i64 {
                 .find_map(|line| line.strip_prefix("btime ")?.trim().parse::<i64>().ok())
         })
         .map_or(0, |secs| secs * 1000)
+}
+
+/// Windows start times count from the Unix epoch.
+#[cfg(windows)]
+fn boot_ms() -> i64 {
+    0
 }
 
 /// A child of a Claude process, as `running_shells` judges it.
@@ -221,9 +243,70 @@ fn running_shells(children: &[Child], since_ms: i64) -> Vec<(u32, u64)> {
         .collect()
 }
 
-fn signal_group(pgrp: u32, signal: i32) {
+/// Asks the group `pgrp` to end, by force with `force`.
+#[cfg(unix)]
+pub fn end_group(pgrp: u32, force: bool) {
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
     // SAFETY: `kill` takes plain integers; a gone group is an error we ignore
     unsafe { libc::kill(-(pgrp as i32), signal) };
+}
+
+/// Ends `pgrp` (a process; Windows has no groups) and everything below
+/// it, at once: Windows has no request to end.
+#[cfg(windows)]
+pub fn end_group(pgrp: u32, _force: bool) {
+    end_tree(pgrp, None::<fn()>);
+}
+
+/// How long `end_tree` waits for its root to be gone before `root_gone`.
+#[cfg(windows)]
+const ROOT_GONE: Duration = Duration::from_secs(2);
+
+/// Ends `root` and everything below it, at once, as `end_group`; with
+/// `root_gone`, waits for `root` itself to be gone and runs it then, before
+/// the rest goes (not at all when `root` would not end).
+#[cfg(windows)]
+pub fn end_tree(root: u32, mut root_gone: Option<impl FnOnce()>) {
+    let table = scan(&[root]);
+    // NOTE: gone already, or not to be queried
+    if !table.contains_key(&root) {
+        return;
+    }
+    // NOTE: parents first, so none is left to start a replacement for an ended child
+    let mut ended: Vec<(u32, u64)> = Vec::new();
+    for pid in subtree(root, &children_of(&table)) {
+        let terminated = crate::win::terminate(pid).is_ok();
+        ended.extend(table.get(&pid).map(|stat| (pid, stat.start)));
+        // NOTE: the root comes first
+        if pid == root
+            && terminated
+            && root_gone.is_some()
+            && crate::win::wait_gone(root, ROOT_GONE)
+            && let Some(then) = root_gone.take()
+        {
+            then();
+        }
+    }
+    // NOTE: and what one started between the snapshot and its end
+    for _ in 0..3 {
+        let late: Vec<(u32, u64)> = crate::win::processes()
+            .into_iter()
+            .filter(|p| ended.iter().any(|(pid, _)| *pid == p.ppid))
+            .filter_map(|p| {
+                let start = start_of(p.pid)?;
+                let parent = ended.iter().find(|(pid, _)| *pid == p.ppid)?;
+                (start >= parent.1 && !ended.iter().any(|(pid, _)| *pid == p.pid))
+                    .then_some((p.pid, start))
+            })
+            .collect();
+        if late.is_empty() {
+            break;
+        }
+        for &(pid, _) in &late {
+            let _ = crate::win::terminate(pid);
+        }
+        ended.extend(late);
+    }
 }
 
 /// Ends the Bash calls the Claude process `claude` is waiting on, as Esc in
@@ -231,10 +314,43 @@ fn signal_group(pgrp: u32, signal: i32) {
 /// by force if it ignores the request. A background shell stays. How many
 /// were asked to stop.
 pub async fn end_tool_shells(claude: u32, since_ms: i64) -> usize {
+    // NOTE: off the runtime's thread: reading the table and ending trees blocks
+    // (on Windows a snapshot and a query per process)
+    let shells = tokio::task::spawn_blocking(move || {
+        let shells = tool_shells(claude, since_ms);
+        for &(pid, _) in &shells {
+            end_group(pid, false);
+        }
+        shells
+    })
+    .await
+    .unwrap_or_default();
+    let count = shells.len();
+    // NOTE: Windows ended the trees at once; SIGTERM may be ignored
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        tokio::time::sleep(TERM_GRACE).await;
+        for (pid, start) in shells {
+            // NOTE: the start time tells a stubborn shell from a reused pid
+            if start_of(pid) == Some(start) {
+                end_group(pid, true);
+            }
+        }
+    });
+    count
+}
+
+/// The shells of the Bash calls `claude` runs since `since_ms`, with their
+/// start times.
+fn tool_shells(claude: u32, since_ms: i64) -> Vec<(u32, u64)> {
     let boot = boot_ms();
-    let children: Vec<Child> = scan()
+    let table = scan(&[claude]);
+    let Some(claude_start) = table.get(&claude).map(|stat| stat.start) else {
+        return Vec::new();
+    };
+    let children: Vec<Child> = table
         .into_iter()
-        .filter(|(_, stat)| stat.ppid == claude)
+        .filter(|(_, stat)| stat.ppid == claude && stat.start >= claude_start)
         .map(|(pid, stat)| Child {
             pid,
             pgrp: stat.pgrp,
@@ -243,24 +359,12 @@ pub async fn end_tool_shells(claude: u32, since_ms: i64) -> usize {
             args: args(pid).join(" "),
         })
         .collect();
-    let shells = running_shells(&children, since_ms);
-    for &(pid, _) in &shells {
-        signal_group(pid, libc::SIGTERM);
-    }
-    let count = shells.len();
-    tokio::spawn(async move {
-        tokio::time::sleep(TERM_GRACE).await;
-        for (pid, start) in shells {
-            // NOTE: the start time tells a stubborn shell from a reused pid
-            if read_stat(pid).is_some_and(|stat| stat.start == start) {
-                signal_group(pid, libc::SIGKILL);
-            }
-        }
-    });
-    count
+    running_shells(&children, since_ms)
 }
 
-fn scan() -> HashMap<u32, Stat> {
+/// Every process: `/proc` holds the parents only per process.
+#[cfg(unix)]
+fn scan(_roots: &[u32]) -> HashMap<u32, Stat> {
     let Ok(dir) = fs::read_dir("/proc") else {
         return HashMap::new();
     };
@@ -271,10 +375,76 @@ fn scan() -> HashMap<u32, Stat> {
     .collect()
 }
 
+#[cfg(unix)]
 fn read_stat(pid: u32) -> Option<Stat> {
     parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
+/// When `pid` started, in [`Stat::start`]'s units; none when it is gone.
+#[cfg(unix)]
+fn start_of(pid: u32) -> Option<u64> {
+    read_stat(pid).map(|stat| stat.start)
+}
+
+/// `roots` and the processes under them, from the snapshot's parent ids,
+/// querying only those: a child must have started no earlier than its
+/// parent. Times in [`TICKS_PER_SEC`] units.
+#[cfg(windows)]
+fn scan(roots: &[u32]) -> HashMap<u32, Stat> {
+    let procs = crate::win::processes();
+    let mut by_parent: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut by_pid: HashMap<u32, usize> = HashMap::new();
+    for (i, p) in procs.iter().enumerate() {
+        by_parent.entry(p.ppid).or_default().push(i);
+        by_pid.insert(p.pid, i);
+    }
+    let stat_of = |i: usize| {
+        let p = &procs[i];
+        let times = crate::win::process_times(p.pid)?;
+        Some(Stat {
+            ppid: p.ppid,
+            pgrp: p.pid,
+            comm: p.exe.clone(),
+            ticks: times.cpu_100ns / 100_000,
+            start: start_ticks(&times)?,
+        })
+    };
+    let mut table = HashMap::new();
+    let mut queue = Vec::new();
+    for &root in roots {
+        if let Some(stat) = by_pid.get(&root).and_then(|&i| stat_of(i)) {
+            table.insert(root, stat);
+            queue.push(root);
+        }
+    }
+    while let Some(pid) = queue.pop() {
+        let start = table[&pid].start;
+        for &i in by_parent.get(&pid).into_iter().flatten() {
+            let kid = procs[i].pid;
+            if kid == pid || table.contains_key(&kid) {
+                continue;
+            }
+            if let Some(stat) = stat_of(i).filter(|stat| stat.start >= start) {
+                table.insert(kid, stat);
+                queue.push(kid);
+            }
+        }
+    }
+    table
+}
+
+#[cfg(windows)]
+fn start_ticks(times: &crate::win::Times) -> Option<u64> {
+    u64::try_from(times.started_ms / 10).ok()
+}
+
+/// When `pid` started, in [`Stat::start`]'s units; none when it is gone.
+#[cfg(windows)]
+fn start_of(pid: u32) -> Option<u64> {
+    start_ticks(&crate::win::process_times(pid)?)
+}
+
+#[cfg(unix)]
 fn parse_stat(raw: &str) -> Option<Stat> {
     let open = raw.find('(')?;
     let close = raw.rfind(')')?;
@@ -294,13 +464,33 @@ fn parse_stat(raw: &str) -> Option<Stat> {
     })
 }
 
+/// Parent → children, through parents that started no later than the
+/// child: Windows never reparents an orphan, so its parent's pid may be
+/// another process's by now.
+fn children_of(table: &HashMap<u32, Stat>) -> HashMap<u32, Vec<u32>> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, stat) in table {
+        if table
+            .get(&stat.ppid)
+            .is_some_and(|parent| parent.start <= stat.start)
+        {
+            children.entry(stat.ppid).or_default().push(*pid);
+        }
+    }
+    children
+}
+
 fn subtree(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut members = vec![root];
+    let mut seen = HashSet::from([root]);
     let mut i = 0;
     while i < members.len() {
-        let parent = members[i];
-        if let Some(kids) = children.get(&parent) {
-            members.extend(kids.iter().filter(|kid| **kid != parent));
+        if let Some(kids) = children.get(&members[i]) {
+            for kid in kids {
+                if seen.insert(*kid) {
+                    members.push(*kid);
+                }
+            }
         }
         i += 1;
     }
@@ -308,6 +498,7 @@ fn subtree(root: u32, children: &HashMap<u32, Vec<u32>>) -> Vec<u32> {
 }
 
 /// PSS from `smaps_rollup`, falling back to RSS where that is unreadable.
+#[cfg(unix)]
 fn mem_bytes(pid: u32) -> u64 {
     let field = |file: &str, key: &str| {
         let text = fs::read_to_string(format!("/proc/{pid}/{file}")).ok()?;
@@ -319,6 +510,124 @@ fn mem_bytes(pid: u32) -> u64 {
         .map_or(0, |kib| kib * 1024)
 }
 
+/// The working set.
+#[cfg(windows)]
+fn mem_bytes(pid: u32) -> u64 {
+    crate::win::process_memory(pid).unwrap_or(0)
+}
+
+/// The command line of `pid`; none when it is gone.
+#[cfg(unix)]
+pub fn cmdline(pid: u32) -> Option<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// The command line of `pid`; none when it is gone or not this user's.
+#[cfg(windows)]
+pub fn cmdline(pid: u32) -> Option<String> {
+    crate::win::command_line(pid)
+}
+
+#[cfg(windows)]
+fn args(pid: u32) -> Vec<String> {
+    cmdline(pid)
+        .map(|line| crate::win::split_command_line(&line))
+        .unwrap_or_default()
+}
+
+/// The direct children of `pid`, with their names.
+#[cfg(windows)]
+pub fn children(pid: u32) -> Vec<(u32, String)> {
+    let Some(start) = start_of(pid) else {
+        return Vec::new();
+    };
+    crate::win::processes()
+        .into_iter()
+        .filter(|p| p.ppid == pid && p.pid != pid && start_of(p.pid).is_some_and(|s| s >= start))
+        .map(|p| (p.pid, p.exe))
+        .collect()
+}
+
+/// The direct children of `pid`, with their names.
+#[cfg(unix)]
+pub fn children(pid: u32) -> Vec<(u32, String)> {
+    let table = scan(&[pid]);
+    let Some(start) = table.get(&pid).map(|stat| stat.start) else {
+        return Vec::new();
+    };
+    table
+        .into_iter()
+        .filter(|(child, stat)| stat.ppid == pid && *child != pid && stat.start >= start)
+        .map(|(child, stat)| (child, stat.comm))
+        .collect()
+}
+
+/// The process that started this one: on Windows the nearest one above it
+/// that is not a shell, since hooks and MCP servers may run under one
+/// there, and none when no parent can be told.
+#[cfg(unix)]
+pub fn parent_id() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+/// What may stand between Claude Code (`claude.exe`, or `node.exe` from
+/// npm) and a hook on Windows.
+#[cfg(windows)]
+const SHELLS: &[&str] = &[
+    "bash.exe",
+    "sh.exe",
+    "dash.exe",
+    "zsh.exe",
+    "env.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+];
+
+/// Asks each ancestor on its own: a hook runs this every time.
+#[cfg(windows)]
+pub fn parent_id() -> Option<u32> {
+    first_above_shells(
+        std::process::id(),
+        crate::win::parent_of,
+        crate::win::exe_name,
+        start_of,
+    )
+}
+
+/// The nearest process above `pid` that is not a shell, else the highest
+/// shell; none when even the parent cannot be told (gone, its pid reused,
+/// not to be opened).
+#[cfg(windows)]
+fn first_above_shells(
+    mut pid: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    exe_of: impl Fn(u32) -> Option<String>,
+    start_of: impl Fn(u32) -> Option<u64>,
+) -> Option<u32> {
+    let mut start = start_of(pid);
+    let mut found = None;
+    for _ in 0..8 {
+        let Some(ppid) = parent_of(pid) else {
+            break;
+        };
+        // NOTE: Windows never reparents: a later start is another process with the gone parent's pid
+        let Some(ppid_start) = start_of(ppid).filter(|s| start.is_some_and(|child| *s <= child))
+        else {
+            break;
+        };
+        found = Some(ppid);
+        if !exe_of(ppid).is_some_and(|exe| SHELLS.contains(&exe.to_ascii_lowercase().as_str())) {
+            break;
+        }
+        (pid, start) = (ppid, Some(ppid_start));
+    }
+    found
+}
+
+#[cfg(unix)]
 fn args(pid: u32) -> Vec<String> {
     fs::read(format!("/proc/{pid}/cmdline"))
         .unwrap_or_default()
@@ -336,7 +645,10 @@ fn fork_parent(args: &[String]) -> Option<String> {
     }
     let i = args.iter().position(|a| a == "--resume" || a == "-r")?;
     let value = args.get(i + 1)?;
-    let id = value.rsplit('/').next()?.trim_end_matches(".jsonl");
+    let id = value
+        .rsplit(std::path::is_separator)
+        .next()?
+        .trim_end_matches(".jsonl");
     let uuid = id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     uuid.then(|| id.to_owned())
 }
@@ -344,9 +656,19 @@ fn fork_parent(args: &[String]) -> Option<String> {
 /// A readable program name: the Nix package of the program (or of the
 /// script an interpreter runs), else the executable without wrapper noise.
 fn display_name(comm: &str, args: &[String]) -> String {
-    let base = |arg: &str| arg.rsplit('/').next().unwrap_or(arg).to_owned();
+    let base = |arg: &str| {
+        let name = arg.rsplit(std::path::is_separator).next().unwrap_or(arg);
+        // NOTE: Windows names executables in any case (NODE.EXE)
+        let exe = name.len().checked_sub(4).filter(|&at| {
+            cfg!(windows)
+                && name
+                    .get(at..)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+        });
+        exe.map_or(name, |at| &name[..at]).to_owned()
+    };
     let interpreter = args.first().is_some_and(|arg| {
-        let name = base(arg);
+        let name = base(arg).to_ascii_lowercase();
         [
             "node", "python", "bash", "sh", "bun", "deno", "ruby", "perl",
         ]
@@ -361,7 +683,7 @@ fn display_name(comm: &str, args: &[String]) -> String {
     if let Some(name) = program.and_then(|arg| nix_package(arg)) {
         return name;
     }
-    let name = program.map_or_else(|| comm.to_owned(), |arg| base(arg));
+    let name = program.map_or_else(|| base(comm), |arg| base(arg));
     let name = name.trim_start_matches('.');
     name.strip_suffix("-wrapped").unwrap_or(name).to_owned()
 }
@@ -403,6 +725,7 @@ fn mask_secrets(args: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn parses_stat_with_odd_comm() {
         let raw = concat!(
@@ -450,6 +773,26 @@ mod tests {
         let mut members = subtree(1, &children);
         members.sort_unstable();
         assert_eq!(members, [1, 2, 3, 4]);
+        let cycle = HashMap::from([(0, vec![0, 1]), (1, vec![2]), (2, vec![1])]);
+        let mut members = subtree(0, &cycle);
+        members.sort_unstable();
+        assert_eq!(members, [0, 1, 2]);
+    }
+
+    #[test]
+    fn a_parent_that_started_later_is_not_one() {
+        let stat = |ppid, start| Stat {
+            ppid,
+            pgrp: 0,
+            comm: String::new(),
+            ticks: 0,
+            start,
+        };
+        // NOTE: 7's parent is gone; 5 took its pid later
+        let table = HashMap::from([(5, stat(1, 100)), (6, stat(5, 120)), (7, stat(5, 50))]);
+        let children = children_of(&table);
+        assert_eq!(children.get(&5), Some(&vec![6]));
+        assert_eq!(subtree(5, &children), [5, 6]);
     }
 
     #[test]
@@ -502,6 +845,127 @@ mod tests {
             Some("bd459acf-f32e-4e9b-9a8e-ef2ee7758fca".into())
         );
         assert_eq!(fork_parent(&args(&["claude", "--resume", "abc"])), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_give_names_and_forks() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            display_name("claude.exe", &args(&[r"C:\Users\u\.local\bin\claude.exe"])),
+            "claude"
+        );
+        assert_eq!(
+            display_name(
+                "NODE.EXE",
+                &args(&[r"C:\NODEJS\NODE.EXE", r"C:\app\cli.js"])
+            ),
+            "cli.js"
+        );
+        assert_eq!(display_name("claude.exe", &[]), "claude");
+        assert_eq!(
+            fork_parent(&args(&[
+                "claude",
+                "--fork-session",
+                "--resume",
+                r"C:\Users\u\.claude\projects\x\bd459acf-f32e-4e9b-9a8e-ef2ee7758fca.jsonl",
+            ])),
+            Some("bd459acf-f32e-4e9b-9a8e-ef2ee7758fca".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_session_above_its_hook_s_shells() {
+        let chain: HashMap<u32, (u32, &str)> = HashMap::from([
+            (10, (9, "ccdash.exe")),
+            (9, (8, "bash.exe")),
+            (8, (7, "node.exe")),
+            (7, (1, "WindowsTerminal.exe")),
+        ]);
+        let parent = |pid: u32| chain.get(&pid).map(|(ppid, _)| *ppid);
+        let exe = |pid: u32| chain.get(&pid).map(|(_, exe)| (*exe).to_owned());
+        let in_order = |pid: u32| Some(u64::from(pid));
+        assert_eq!(
+            first_above_shells(10, parent, exe, in_order),
+            Some(8),
+            "npm's node.exe"
+        );
+        // NOTE: 8 started after its child: the pid was reused
+        let reused = |pid: u32| Some(if pid == 8 { 500 } else { u64::from(pid) });
+        assert_eq!(first_above_shells(10, parent, exe, reused), Some(9));
+        assert_eq!(first_above_shells(10, parent, exe, |_| None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ends_a_child_s_tree() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let me = std::process::id();
+        assert!(children(me).iter().any(|(pid, _)| *pid == child.id()));
+        let mut grandchild = None;
+        for _ in 0..50 {
+            grandchild = children(child.id()).first().map(|(pid, _)| *pid);
+            if grandchild.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let grandchild = grandchild.expect("ping under cmd");
+        assert!(scan(&[me]).contains_key(&grandchild));
+        let tree = scan(&[child.id()]);
+        assert!(tree.contains_key(&grandchild) && !tree.contains_key(&me));
+        end_group(child.id(), true);
+        assert!(!child.wait().unwrap().success());
+        // NOTE: a group gone by the time it is ended
+        end_group(child.id(), true);
+        // NOTE: TerminateProcess returns before the process is gone
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !crate::win::pid_alive(grandchild)
+        });
+        assert!(gone, "{grandchild} still runs");
+    }
+
+    /// The console is restored between the root's end and its children's:
+    /// the shell prompts again as soon as Claude Code is gone.
+    #[cfg(windows)]
+    #[test]
+    fn a_tree_s_root_is_gone_before_its_children() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 >NUL"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let root = child.id();
+        let grandchild = (0..50)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                children(root).first().map(|(pid, _)| *pid)
+            })
+            .expect("ping under cmd");
+        let mut seen = None;
+        end_tree(
+            root,
+            Some(|| {
+                seen = Some((
+                    crate::win::pid_alive(root),
+                    crate::win::pid_alive(grandchild),
+                ));
+            }),
+        );
+        assert_eq!(seen, Some((false, true)), "(root, child) running then");
+        assert!(!child.wait().unwrap().success());
+        assert!(crate::win::wait_gone(grandchild, Duration::from_secs(2)));
+        let mut again = false;
+        end_tree(root, Some(|| again = true));
+        assert!(!again, "nothing to end, nothing to run");
     }
 
     #[test]

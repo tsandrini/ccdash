@@ -5,6 +5,7 @@
 # Setting up
 
 - [Installation](installation.md)
+  - [A Windows workstation](windows.md)
 - [Getting started](getting-started.md)
 - [Troubleshooting](troubleshooting.md)
 

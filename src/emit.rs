@@ -11,14 +11,14 @@
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    os::unix::net::{UnixDatagram, UnixStream},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
 
 use crate::{
+    ipc,
     knowledge::tools,
     paths,
     protocol::Injection,
@@ -27,7 +27,8 @@ use crate::{
 };
 
 /// Hooks run with a 5 s timeout; the collector answers from the cache
-/// before these run out.
+/// before these run out. Counted from the hook's start, so the ingest send
+/// and the connect come out of them.
 const START_WAIT: Duration = Duration::from_millis(3500);
 const HOOK_WAIT: Duration = Duration::from_millis(1800);
 /// Why a turn ended, as the terminal shows it and Claude reads it at its
@@ -45,7 +46,7 @@ pub fn run(source: Source, command: &[String]) -> i32 {
     let Some((program, args)) = command.split_first() else {
         return 0;
     };
-    let Ok(mut child) = Command::new(program)
+    let Ok(mut child) = Command::new(crate::util::program(program))
         .args(args)
         .stdin(Stdio::piped())
         .spawn()
@@ -66,16 +67,14 @@ fn send(source: Source, input: &[u8]) {
         Source::Hook => apply_pending_title(&payload),
         Source::Statusline => None,
     };
+    let started = Instant::now();
     let env = envelope(source, payload, applied_title);
     let Some(bytes) = wire::encode(env.clone()) else {
         return;
     };
-    if let Ok(socket) = UnixDatagram::unbound() {
-        let _ = socket.set_nonblocking(true);
-        let _ = socket.send_to(&bytes, paths::ingest_socket());
-    }
+    ipc::send(&paths::ingest_socket(), &bytes);
     if source == Source::Hook {
-        let answer = inject(&env).unwrap_or_default();
+        let answer = inject(&env, started).unwrap_or_default();
         if let Some(output) = hook_output(&env.payload, env.applied_title.as_deref(), &answer) {
             println!("{output}");
         }
@@ -103,8 +102,9 @@ pub fn tool_hook(payload: &Value) -> bool {
     ) && payload.get("agent_id").is_none_or(Value::is_null)
 }
 
-/// Asks the collector what to inject for this hook, within the hook's time.
-fn inject(env: &Envelope) -> Option<Answer> {
+/// Asks the collector what to inject for this hook, within the hook's time
+/// (from `started`).
+fn inject(env: &Envelope, started: Instant) -> Option<Answer> {
     let what = tools::injection_of(&env.payload);
     if what.is_none() && !tool_hook(&env.payload) {
         return None;
@@ -113,14 +113,15 @@ fn inject(env: &Envelope) -> Option<Answer> {
         Some(Injection::SessionStart) => START_WAIT,
         _ => HOOK_WAIT,
     };
-    let mut stream = UnixStream::connect(paths::api_socket()).ok()?;
-    stream.set_read_timeout(Some(wait)).ok()?;
+    let left = || Some(wait.saturating_sub(started.elapsed())).filter(|left| !left.is_zero());
+    let mut stream = ipc::Stream::connect_within(&paths::api_socket(), left()?).ok()?;
     stream
-        .set_write_timeout(Some(Duration::from_millis(500)))
+        .set_write_timeout(Some(left()?.min(Duration::from_millis(500))))
         .ok()?;
     let mut line = serde_json::to_vec(&json!({ "cmd": "inject", "envelope": env })).ok()?;
     line.push(b'\n');
     stream.write_all(&line).ok()?;
+    stream.set_read_timeout(Some(left()?)).ok()?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).ok()?;
     let reply: Value = serde_json::from_str(&reply).ok()?;
@@ -195,7 +196,7 @@ pub fn envelope(source: Source, payload: Value, applied_title: Option<String>) -
         pid: std::env::var("CLAUDE_PID")
             .ok()
             .and_then(|p| p.parse().ok())
-            .or_else(|| Some(std::os::unix::process::parent_id())),
+            .or_else(crate::procs::parent_id),
         remote_id: std::env::var("CLAUDE_CODE_BRIDGE_SESSION_ID")
             .ok()
             .filter(|id| !id.is_empty()),

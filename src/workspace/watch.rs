@@ -5,19 +5,30 @@
 //! directories are reported for the scheduler to check with
 //! `git check-ignore` before they are watched, so an `npm install` costs
 //! two events. Events reach the scheduler as `Event`s; a queue overflow
-//! asks for a sweep.
+//! asks for a sweep. On Windows `Registry` is `watch_windows.rs`'s.
 
+#[cfg(unix)]
 use std::{
     collections::HashMap,
-    fs, io,
-    path::{Path, PathBuf},
+    io,
     sync::{Arc, Mutex, mpsc::Sender},
     thread,
 };
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
+#[cfg(unix)]
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(unix)]
+use tracing::warn;
 
+#[cfg(windows)]
+pub use super::watch_windows::Registry;
+
+#[cfg(unix)]
 const EVENT_BUFFER: usize = 256 << 10;
 
 /// What the watcher tells the scheduler.
@@ -35,6 +46,7 @@ pub enum Event {
     Stopped,
 }
 
+#[cfg(unix)]
 fn mask() -> WatchMask {
     WatchMask::MODIFY
         | WatchMask::CLOSE_WRITE
@@ -50,6 +62,7 @@ fn mask() -> WatchMask {
         | WatchMask::EXCL_UNLINK
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 enum Entry {
     /// A directory of a unit, `rel` relative to the unit (`""` its root).
@@ -58,6 +71,7 @@ enum Entry {
     Layout { level: u32, path: PathBuf },
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct Map {
     by_wd: HashMap<WatchDescriptor, Entry>,
@@ -66,12 +80,14 @@ struct Map {
 
 /// Adds and removes watches from any thread; the reader thread maps
 /// events through the shared table.
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct Registry {
     watches: Watches,
     map: Arc<Mutex<Map>>,
 }
 
+#[cfg(unix)]
 impl Registry {
     /// Starts the reader thread with the root (and the bundle directories
     /// at every level above unit depth) watched for layout changes.
@@ -203,7 +219,9 @@ impl Registry {
             .ok()
             .map_or(0, |map| map.by_unit.get(unit).map_or(0, Vec::len))
     }
+}
 
+impl Registry {
     /// Watches `dir` and every directory under it (a new, non-ignored
     /// directory whose files are not in `ls-files` yet), pruning the
     /// always excluded names and nested repositories; the nested
@@ -289,6 +307,7 @@ pub fn git_dirs(git_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(unix)]
 fn run(
     mut inotify: Inotify,
     map: Arc<Mutex<Map>>,
@@ -468,6 +487,26 @@ mod tests {
         fs::create_dir_all(root.join("c")).unwrap();
         let seen = until(&rx, |e| *e == Event::Layout);
         assert!(seen.contains(&Event::Layout), "{seen:?}");
+
+        // NOTE: a bundle root (above unit depth) and a nested repository (below) are units too
+        fs::create_dir_all(root.join("r/src")).unwrap();
+        fs::create_dir_all(root.join("b/u/sub/src")).unwrap();
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        reg.forget_under("b/u", "sub");
+        reg.watch_tree("r", &root.join("r"), "", &[]);
+        reg.watch_tree("b/u/sub", &root.join("b/u/sub"), "", &[]);
+        for (file, unit) in [
+            ("r/top.rs", "r"),
+            ("r/src/a.rs", "r"),
+            ("b/u/sub/src/b.rs", "b/u/sub"),
+        ] {
+            fs::write(root.join(file), "x").unwrap();
+            let seen = until(&rx, |e| *e == Event::Touched(unit.into()));
+            assert!(
+                seen.contains(&Event::Touched(unit.into())),
+                "{file}: {seen:?}"
+            );
+        }
 
         reg.forget("b/u");
         assert_eq!(reg.count("b/u"), 0);

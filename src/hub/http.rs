@@ -11,13 +11,7 @@
 //! `crate::sync::hub`).
 
 use std::{
-    convert::Infallible,
-    fs::OpenOptions,
-    io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
+    convert::Infallible, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc, time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +48,7 @@ use crate::{
     catalog::{self, Catalog},
     config::HubConfig,
     conversation,
+    fsx::ModeExt,
     history::{self, History},
     knowledge::{
         self, Filter, NoteKind, NoteOp, Status, Upsert,
@@ -313,9 +308,7 @@ pub fn load_token(cfg: &HubConfig) -> Result<String> {
     {
         return Ok(token.trim().to_owned());
     }
-    let mut bytes = [0u8; 24];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let token = util::random_hex(24)?;
     std::fs::create_dir_all(paths::state_dir())?;
     OpenOptions::new()
         .write(true)
@@ -1225,20 +1218,10 @@ async fn prompts(
 ) -> Result<Json<Value>, ApiError> {
     let dirs = match query.workspace.as_deref().filter(|w| !w.is_empty()) {
         None => None,
-        Some(names) => Some(
-            serde_json::to_string(
-                &names
-                    .split(',')
-                    .map(|name| {
-                        app.workspaces.dir(name).map(str::to_owned).ok_or(ApiError(
-                            StatusCode::BAD_REQUEST,
-                            format!("unknown workspace {name:?}"),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .map_err(anyhow::Error::from)?,
-        ),
+        Some(names) => Some(crate::workspace::dirs_param(&workspace_dirs(
+            &app.workspaces,
+            names,
+        )?)),
     };
     let session = match query.session.filter(|s| !s.is_empty()) {
         None => None,
@@ -1397,17 +1380,7 @@ impl RangeQuery {
             .clamp(oldest, until - 60_000);
         let dirs = match &self.workspace {
             None => None,
-            Some(names) => Some(
-                names
-                    .split(',')
-                    .map(|name| {
-                        workspaces.dir(name).map(str::to_owned).ok_or(ApiError(
-                            StatusCode::BAD_REQUEST,
-                            format!("unknown workspace {name:?}"),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+            Some(names) => Some(workspace_dirs(workspaces, names)?),
         };
         Ok(Scope {
             since,
@@ -1417,6 +1390,23 @@ impl RangeQuery {
             host: self.host.clone().filter(|h| !h.is_empty()),
         })
     }
+}
+
+/// Every directory of the comma-separated workspace `names`: a workspace
+/// may list one per machine.
+fn workspace_dirs(workspaces: &Workspaces, names: &str) -> Result<Vec<String>, ApiError> {
+    let mut dirs = Vec::new();
+    for name in names.split(',') {
+        let of = workspaces.dirs(name);
+        if of.is_empty() {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown workspace {name:?}"),
+            ));
+        }
+        dirs.extend(of);
+    }
+    Ok(dirs)
 }
 
 async fn history(

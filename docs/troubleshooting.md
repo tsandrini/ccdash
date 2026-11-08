@@ -1,8 +1,9 @@
 # Troubleshooting
 
 Where to look: the collector's log with `journalctl --user -u ccdash` on the
-workstation, the hub's with `journalctl -u ccdash-hub` on the hub, and
-`ccdash status` for what the hub knows of this machine.
+workstation (on Windows `%LOCALAPPDATA%\ccdash\state\collector.log`), the
+hub's with `journalctl -u ccdash-hub` on the hub, and `ccdash status` for
+what the hub knows of this machine.
 
 1. [A machine does not show up](#1-a-machine-does-not-show-up)
 2. [The knowledge tools refuse](#2-the-knowledge-tools-refuse)
@@ -58,6 +59,9 @@ The panel offers only what the machine does.
 | Start a session (no machine)      | a connected collector with Claude Code (`launch.command`)                                         |
 | Lock, Suspend                     | `power.lock`, `power.suspend`                                                                     |
 | The Claude state, Workspace pages | `sync.enable`; the hub's and the collectors' `workspace.enable`                                   |
+
+On Windows the script's switches turn these on
+([Windows](windows.md#2-optional-features)).
 
 Without the allowlist Claude Code does not load the channel, so Reply stays
 away; `claudeCode.channel.devFlag` loads it anyway, at the price of a

@@ -1,25 +1,40 @@
-//! niri IPC: window/focus event stream and the focus action.
+//! niri IPC: window/focus event stream and the focus action. Unix only.
 
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
+use serde_json::Value;
+#[cfg(unix)]
+use serde_json::json;
+use tokio::sync::mpsc;
+#[cfg(unix)]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    sync::mpsc,
 };
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 use crate::{
     collector::LocalCmd,
     state::{NiriEvent, Window},
 };
 
+#[cfg(unix)]
 fn socket() -> Option<String> {
     std::env::var("NIRI_SOCKET").ok().filter(|s| !s.is_empty())
 }
 
+#[cfg(windows)]
+pub async fn run(_tx: mpsc::Sender<LocalCmd>) {
+    info!("niri is not on Windows, window tracking disabled");
+}
+
+#[cfg(unix)]
 pub async fn run(tx: mpsc::Sender<LocalCmd>) {
     let Some(path) = socket() else {
         info!("NIRI_SOCKET unset, window tracking disabled");
@@ -34,6 +49,7 @@ pub async fn run(tx: mpsc::Sender<LocalCmd>) {
     }
 }
 
+#[cfg(unix)]
 async fn stream(path: &str, tx: &mpsc::Sender<LocalCmd>) -> Result<()> {
     let socket = UnixStream::connect(path).await.context("connecting")?;
     let (read, mut write) = socket.into_split();
@@ -54,6 +70,7 @@ async fn stream(path: &str, tx: &mpsc::Sender<LocalCmd>) -> Result<()> {
     bail!("stream closed")
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn parse_event(line: &str) -> Option<NiriEvent> {
     let value: Value = serde_json::from_str(line).ok()?;
     let (name, body) = value.as_object()?.iter().next()?;
@@ -72,6 +89,7 @@ pub fn parse_event(line: &str) -> Option<NiriEvent> {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn parse_window(v: &Value) -> Option<Window> {
     Some(Window {
         id: v.get("id")?.as_u64()?,
@@ -81,6 +99,12 @@ fn parse_window(v: &Value) -> Option<Window> {
     })
 }
 
+#[cfg(windows)]
+pub async fn focus(_window_id: u64) -> Result<()> {
+    bail!("no window focus on Windows")
+}
+
+#[cfg(unix)]
 pub async fn focus(window_id: u64) -> Result<()> {
     let path = socket().context("NIRI_SOCKET unset")?;
     let socket = UnixStream::connect(path).await?;

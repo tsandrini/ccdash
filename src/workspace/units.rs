@@ -407,7 +407,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             wt.unsyncable.as_deref(),
-            Some(format!("a linked worktree of {}", root.join("wt/../main").display()).as_str())
+            Some(
+                format!(
+                    "a linked worktree of {}",
+                    root.join("wt").join("../main").display()
+                )
+                .as_str()
+            )
         );
         fs::create_dir_all(root.join("main/.git/modules/sub")).unwrap();
         fs::create_dir_all(root.join("main/sub")).unwrap();

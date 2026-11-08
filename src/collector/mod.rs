@@ -13,8 +13,6 @@ mod skills;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::Permissions,
-    os::unix::{fs::PermissionsExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -23,8 +21,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::{
-    net::{TcpListener, UnixDatagram, UnixListener},
-    signal::unix::{SignalKind, signal},
+    net::TcpListener,
     sync::{Notify, broadcast, mpsc, oneshot},
 };
 use tracing::{debug, info, warn};
@@ -34,9 +31,9 @@ use crate::{
     agents,
     channel::ToChannel,
     config::{CollectorConfig, Launch, Power},
-    git,
+    fsx, git, ipc,
     knowledge::{self, Note, Query},
-    machine::{MachineReport, PowerAction, Sampler, display_session},
+    machine::{self, MachineReport, PowerAction, Sampler, display_session},
     model::{
         HostFeatures, HostStatus, Palette, RateLimits, ScopedLimit, Session, Skill, Snapshot,
         Update,
@@ -58,6 +55,7 @@ use crate::{
 pub enum LocalCmd {
     Envelope(Envelope),
     Agents(Vec<AgentEntry>, i64),
+    #[cfg_attr(not(unix), allow(dead_code))]
     Niri(NiriEvent),
     Procs(Vec<ProcPoll>, i64),
     Usage(Vec<ScopedLimit>, i64),
@@ -243,6 +241,74 @@ fn features(cfg: &CollectorConfig) -> HostFeatures {
     }
 }
 
+/// How long `background` watches the new collector for an early exit.
+#[cfg(windows)]
+const BACKGROUND_SETTLE: Duration = Duration::from_secs(2);
+
+/// Starts `ccdash collector` again with no console window (the helpers it
+/// runs share that hidden console; editors and attaches get their own), its
+/// output in `<state dir>\collector.log`, rewritten at each start.
+///
+/// # Errors
+///
+/// A collector already listens, or the new one could not start or exited
+/// at once.
+#[cfg(windows)]
+pub fn background(config: Option<PathBuf>) -> Result<()> {
+    use std::{
+        io::Write,
+        os::windows::{fs::OpenOptionsExt, process::CommandExt},
+    };
+    let dir = paths::state_dir();
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // NOTE: one start at a time, from the check to the settled child: two at logon would
+    // both truncate the log
+    let _starting = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(dir.join("collector.start"))
+        .map_err(|_| anyhow::anyhow!("another ccdash collector is starting"))?;
+    // NOTE: the log is truncated below: a running collector writes to it
+    if ipc::serving(&paths::api_socket()) {
+        bail!("a ccdash collector is already running");
+    }
+    let log_path = dir.join("collector.log");
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg("collector");
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .spawn()
+        .context("starting the collector")?;
+    // NOTE: past the checks, a window opened for this start alone (the Run key's) goes,
+    // not to stand through the settling; what follows is in the log as well
+    crate::win::leave_own_console();
+    std::thread::sleep(BACKGROUND_SETTLE);
+    if let Some(status) = child.try_wait()? {
+        let message = format!("the collector exited at once ({status})");
+        if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = writeln!(log, "ccdash collector --background: {message}");
+        }
+        bail!("{message}; see {}", log_path.display());
+    }
+    let _ = writeln!(
+        std::io::stdout(),
+        "collector running (pid {}), its log in {}",
+        child.id(),
+        log_path.display()
+    );
+    Ok(())
+}
+
 pub fn run(cfg: CollectorConfig) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -253,12 +319,12 @@ pub fn run(cfg: CollectorConfig) -> Result<()> {
 async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
     let dir = paths::runtime_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::set_permissions(&dir, Permissions::from_mode(0o700))?;
+    fsx::set_mode(&dir, 0o700)?;
     let state_dir = paths::state_dir();
     std::fs::create_dir_all(&state_dir)?;
-    std::fs::set_permissions(&state_dir, Permissions::from_mode(0o700))?;
+    fsx::set_mode(&state_dir, 0o700)?;
     let (ingest_path, api_path) = (paths::ingest_socket(), paths::api_socket());
-    if StdUnixStream::connect(&api_path).is_ok() {
+    if ipc::serving(&api_path) {
         bail!(
             "another ccdash collector is listening on {}",
             api_path.display()
@@ -302,8 +368,8 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
         hub_rx,
         local.sender(),
     ));
-    let mut disks = vec![PathBuf::from("/")];
-    disks.extend(std::env::var_os("HOME").map(PathBuf::from));
+    let mut disks = vec![machine::root_disk()];
+    disks.extend(paths::home());
     tokio::spawn(machine_loop(
         Sampler::new(disks).collector(cfg.power.suspend, cfg.power.lock),
         local.sender(),
@@ -311,9 +377,9 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
         report_now,
     ));
 
-    let ingest = UnixDatagram::bind(replace(&ingest_path)?)
+    let ingest = ipc::Ingest::bind(replace(&ingest_path)?)
         .with_context(|| format!("binding {}", ingest_path.display()))?;
-    let api = UnixListener::bind(replace(&api_path)?)
+    let api = ipc::Listener::bind(replace(&api_path)?)
         .with_context(|| format!("binding {}", api_path.display()))?;
     for addr in &cfg.telemetry.listen {
         if !addr.ip().is_loopback() {
@@ -366,16 +432,13 @@ async fn serve(cfg: Arc<CollectorConfig>) -> Result<()> {
         ));
     }
     info!(
-        "ccdash collector up on {host}, sockets in {}, hub {}",
-        dir.display(),
+        "ccdash collector up on {host}, sockets {} and {}, hub {}",
+        ipc::address(&api_path),
+        ipc::address(&ingest_path),
         cfg.hub.url
     );
 
-    let mut term = signal(SignalKind::terminate())?;
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
+    util::shutdown().await?;
     info!("shutting down");
     let _ = std::fs::remove_file(&ingest_path);
     let _ = std::fs::remove_file(&api_path);
@@ -537,7 +600,7 @@ fn replace(path: &Path) -> Result<&Path> {
     }
 }
 
-async fn ingest_loop(socket: UnixDatagram, tx: mpsc::Sender<LocalCmd>) {
+async fn ingest_loop(mut socket: ipc::Ingest, tx: mpsc::Sender<LocalCmd>) {
     let mut buf = vec![0u8; wire::MAX_DATAGRAM + 1024];
     loop {
         let len = match socket.recv(&mut buf).await {
@@ -1076,7 +1139,7 @@ impl Actor {
         let result = serde_json::to_vec(&cache)
             .map_err(std::io::Error::other)
             .and_then(|bytes| std::fs::write(&tmp, bytes))
-            .and_then(|()| std::fs::set_permissions(&tmp, Permissions::from_mode(0o600)))
+            .and_then(|()| fsx::set_mode(&tmp, 0o600))
             .and_then(|()| std::fs::rename(&tmp, &self.cache_path));
         if let Err(e) = result {
             warn!("notes cache: {e}");
@@ -1317,6 +1380,16 @@ impl Actor {
                     && resume
                         .as_deref()
                         .is_some_and(|id| self.has_saved_options(id));
+                // NOTE: the hub names a workspace's first directory; this machine's may be another
+                let cwd = if Path::new(&cwd).is_dir() {
+                    cwd
+                } else {
+                    self.workspaces
+                        .elsewhere(&cwd)
+                        .into_iter()
+                        .find(|dir| Path::new(dir).is_dir())
+                        .unwrap_or(cwd)
+                };
                 let spec = LaunchSpec {
                     cwd,
                     prompt,

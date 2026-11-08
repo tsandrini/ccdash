@@ -6,7 +6,11 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{knowledge::valid_slug, model::Claim};
+use crate::{
+    knowledge::valid_slug,
+    model::Claim,
+    workspace::{after_key, path_key, windows_path, windows_root},
+};
 
 // NOTE: `issue` is added to older databases by `store::ADDED_COLUMNS`
 pub const SCHEMA: &str = "
@@ -82,7 +86,9 @@ pub fn new(
 }
 
 /// `path` made absolute against `cwd`, without `.` parts, repeated or
-/// trailing slashes; `..` is refused.
+/// trailing slashes; `..` is refused. A Windows session (its cwd says so)
+/// takes `/` separators (`C:/…`, `//server/share/…`), as its workspace
+/// directories do, and Git Bash's `/c/…` for `C:/…`.
 pub fn normalize(path: &str, cwd: &str) -> Result<String, String> {
     let path = path.trim();
     if path.is_empty() {
@@ -91,20 +97,66 @@ pub fn normalize(path: &str, cwd: &str) -> Result<String, String> {
     if path.len() > MAX_PATH {
         return Err("a path is too long".into());
     }
-    let base = if path.starts_with('/') { "" } else { cwd };
+    let windows = windows_path(cwd);
+    let (path, cwd) = if windows {
+        (git_bash(&path.replace('\\', "/")), cwd.replace('\\', "/"))
+    } else {
+        (path.to_owned(), cwd.to_owned())
+    };
+    let cwd_root = root_len(&cwd, windows).unwrap_or(0);
+    let (root, base, rest) = match root_len(&path, windows) {
+        Some(n) => (&path[..n], "", &path[n..]),
+        // NOTE: `\x` on Windows is under the root of the cwd's drive or share
+        None if windows && path.starts_with('/') => (&cwd[..cwd_root], "", &path[1..]),
+        None => (&cwd[..cwd_root], &cwd[cwd_root..], path.as_str()),
+    };
     let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
-    for part in path.split('/') {
+    for part in rest.split('/') {
         match part {
             "" | "." => {}
             ".." => return Err(format!("{path}: `..` is not allowed")),
             part => parts.push(part),
         }
     }
-    Ok(format!("/{}", parts.join("/")))
+    let root = match root {
+        "" if !windows => "/".to_owned(),
+        // NOTE: a share named without a trailing slash (`//nas/p`)
+        root if !root.is_empty() && !root.ends_with('/') => format!("{root}/"),
+        root => root.to_owned(),
+    };
+    Ok(format!("{root}{}", parts.join("/")))
 }
 
-/// Whether `path` is `root` or below it.
+/// A Git Bash path (`/c/Users/…`, `/cygdrive/c/…`) as Windows writes it
+/// (`C:/Users/…`); any other path as it is.
+fn git_bash(path: &str) -> String {
+    let rest = path.strip_prefix("/cygdrive").unwrap_or(path);
+    let b = rest.as_bytes();
+    if b.len() >= 2
+        && b[0] == b'/'
+        && b[1].is_ascii_alphabetic()
+        && b.get(2).is_none_or(|c| *c == b'/')
+    {
+        let drive = char::from(b[1]).to_ascii_uppercase();
+        format!("{drive}:/{}", rest.get(3..).unwrap_or(""))
+    } else {
+        path.to_owned()
+    }
+}
+
+/// The length of `path`'s root: `/`; on Windows `C:/` or `//server/share/`.
+fn root_len(path: &str, windows: bool) -> Option<usize> {
+    if windows {
+        windows_root(path)
+    } else {
+        path.starts_with('/').then_some(1)
+    }
+}
+
+/// Whether `path` is `root` or below it; Windows paths in any case and
+/// with either separator.
 pub fn within(path: &str, root: &str) -> bool {
+    let (path, root) = (path_key(path), path_key(root));
     let root = root.trim_end_matches('/');
     path == root
         || path
@@ -120,13 +172,19 @@ pub fn covers(claim: &Claim, path: &str) -> bool {
 /// `path` relative to `base` when it lies under it; unchanged for an
 /// empty base.
 pub fn relative<'a>(path: &'a str, base: &str) -> &'a str {
+    let base = path_key(base);
     let base = base.trim_end_matches('/');
     if base.is_empty() {
         return path;
     }
-    path.strip_prefix(base)
+    let under = path_key(path)
+        .strip_prefix(base)
         .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|rest| !rest.is_empty())
+        .is_some_and(|rest| !rest.is_empty());
+    // NOTE: cut from `path` itself, which keeps its case
+    under
+        .then(|| after_key(path, base.len() + 1))
+        .flatten()
         .unwrap_or(path)
 }
 
@@ -271,6 +329,83 @@ mod tests {
         assert_eq!(relative("/ws/repo", "/ws/repo/"), "/ws/repo");
         let capped = new("x", &[], Some(10_000), None, "/ws/repo", root, 0).unwrap();
         assert_eq!(capped.until, Some(MAX_UNTIL_MIN * MINUTE_MS));
+    }
+
+    #[test]
+    fn windows_paths_resolve_and_compare_in_any_case() {
+        let root = "C:/Users/u/ws/repo";
+        let claim = new(
+            "x",
+            &[
+                r"src\hub".into(),
+                r"C:\Users\u\ws\repo\web".into(),
+                "c:/users/u/ws/repo/README.md".into(),
+                r"\Users\u\ws\repo\docs".into(),
+            ],
+            None,
+            None,
+            root,
+            root,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            claim.paths,
+            [
+                "C:/Users/u/ws/repo/src/hub",
+                "C:/Users/u/ws/repo/web",
+                "c:/users/u/ws/repo/README.md",
+                "C:/Users/u/ws/repo/docs"
+            ]
+        );
+        assert!(covers(&claim, r"C:\Users\u\ws\repo\src\hub\core.rs"));
+        assert!(covers(&claim, r"C:\USERS\u\ws\repo\README.md"));
+        assert!(!covers(&claim, r"C:\Users\u\ws\repo\src\hubs\x.rs"));
+        assert!(within(r"C:\Účty\repo\Src", "c:/účty/repo"));
+        assert_eq!(relative("C:/Účty/repo/Src", "c:/účty/repo"), "Src");
+        assert_eq!(
+            describe(&claim, root, 0),
+            "\"x\" (src/hub, web, README.md, docs)"
+        );
+        assert!(new("x", &[r"D:\elsewhere".into()], None, None, root, root, 0).is_err());
+        assert!(new("x", &[r"..\other".into()], None, None, root, root, 0).is_err());
+        let raw = new("x", &["a".into()], None, None, r"C:\tmp\p", r"C:\tmp\p", 0).unwrap();
+        assert_eq!(raw.paths, ["C:/tmp/p/a"]);
+        let unc = new("x", &["a".into()], None, None, r"\\nas\p", r"\\nas\p", 0).unwrap();
+        assert_eq!(unc.paths, ["//nas/p/a"]);
+        // NOTE: `\x` is under the share's root, as under a drive's
+        let share = r"\\nas\p\repo";
+        let from_root = new("x", &[r"\repo\docs".into()], None, None, share, share, 0).unwrap();
+        assert_eq!(from_root.paths, ["//nas/p/repo/docs"]);
+        let bash = new(
+            "x",
+            &[
+                "/c/Users/u/ws/repo/src".into(),
+                "/cygdrive/c/Users/u/ws/repo/web".into(),
+            ],
+            None,
+            None,
+            root,
+            root,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            bash.paths,
+            ["C:/Users/u/ws/repo/src", "C:/Users/u/ws/repo/web"]
+        );
+        // NOTE: a Linux session's `//` is `/`
+        let linux = new(
+            "x",
+            &["//ws/repo/a".into()],
+            None,
+            None,
+            "/ws/repo",
+            "/ws/repo",
+            0,
+        )
+        .unwrap();
+        assert_eq!(linux.paths, ["/ws/repo/a"]);
     }
 
     #[test]

@@ -136,14 +136,17 @@ impl Busy {
         }
     }
 
-    /// Whether a live tool call touches `dir`: the session's label.
+    /// Whether a live tool call touches `dir`: the session's label. Paths
+    /// compare as workspace directories do: a Windows path in any case.
     pub fn covers(&self, dir: &Path, now: i64) -> Option<String> {
+        let key = |path: &str| super::path_key(super::trimmed(&super::slashed(path))).into_owned();
+        let dir = key(&dir.to_string_lossy());
         let map = self.0.lock().ok()?;
         map.iter()
             .filter(|(_, (_, since))| now - since < TOOL_STALE_MS)
             .find(|(_, (cwd, _))| {
-                let cwd = Path::new(cwd);
-                dir.starts_with(cwd) || cwd.starts_with(dir)
+                let cwd = key(cwd);
+                super::within(&dir, &cwd) || super::within(&cwd, &dir)
             })
             .map(|(session, _)| session.chars().take(8).collect())
     }
@@ -1792,6 +1795,13 @@ fn worker(shared: &Shared, rx: &Arc<Mutex<Receiver<Job>>>, tx: &Sender<Msg>) {
 }
 
 /// CPU time of the calling thread (user + system), in ms.
+#[cfg(windows)]
+fn thread_cpu_ms() -> u64 {
+    crate::win::thread_cpu_ms()
+}
+
+/// CPU time of the calling thread (user + system), in ms.
+#[cfg(unix)]
 fn thread_cpu_ms() -> u64 {
     // SAFETY: a zeroed rusage is a valid value; getrusage fills it in.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1803,7 +1813,14 @@ fn thread_cpu_ms() -> u64 {
     tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
+/// The process's working set, in kB.
+#[cfg(windows)]
+fn rss_kb() -> u64 {
+    crate::win::process_memory(std::process::id()).map_or(0, |bytes| bytes / 1024)
+}
+
 /// The process's resident set, in kB (`/proc/self/statm`).
+#[cfg(unix)]
 fn rss_kb() -> u64 {
     fs::read_to_string("/proc/self/statm")
         .ok()
@@ -1858,7 +1875,7 @@ fn no_repo(e: &anyhow::Error) -> bool {
 }
 
 /// Processes holding files open, for the quiescent rule; read once per
-/// pass when needed.
+/// pass when needed. None on Windows (no `/proc`).
 struct OpenFiles(Vec<(PathBuf, String)>);
 
 impl OpenFiles {
@@ -2828,6 +2845,22 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_live_call_covers_its_unit_in_any_case_on_windows() {
+        let busy = super::Busy::default();
+        busy.start("aaaaaaaa-1", r"C:\Users\me\code\Work\x", 0);
+        busy.start("bbbbbbbb-1", "/home/me/w/u/src", 0);
+        let covers = |dir: &str| busy.covers(std::path::Path::new(dir), 1);
+        assert_eq!(
+            covers(r"C:\Users\me\code\work\x").as_deref(),
+            Some("aaaaaaaa")
+        );
+        assert_eq!(covers("c:/users/me/code/work").as_deref(), Some("aaaaaaaa"));
+        assert_eq!(covers("/home/me/w/u").as_deref(), Some("bbbbbbbb"));
+        assert_eq!(covers("/home/me/w/U"), None, "case counts on Linux");
+        assert_eq!(covers("/home/me/w/u2"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -2894,7 +2927,7 @@ mod tests {
         assert_eq!(saved.conflicts.len(), 1);
         assert_eq!(saved.held.unwrap().added, 3000);
         assert!(!db.load("none").unwrap().adopted);
-        fs::remove_dir_all(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

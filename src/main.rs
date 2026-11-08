@@ -15,9 +15,11 @@ mod conversation;
 mod demo;
 mod drafts;
 mod emit;
+mod fsx;
 mod git;
 mod history;
 mod hub;
+mod ipc;
 mod knowledge;
 mod machine;
 mod markdown;
@@ -40,6 +42,8 @@ mod tokens;
 mod usage;
 mod util;
 mod waits;
+#[cfg(windows)]
+mod win;
 mod wire;
 mod workspace;
 mod wrap_up;
@@ -67,7 +71,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the hub: store, web UI, API, collector links, notifications.
+    /// Run the hub: store, web UI, API, collector links, notifications
+    /// (Linux only).
     Hub {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -76,6 +81,11 @@ enum Command {
     Collector {
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Start it again with no console window, its log in
+        /// `%LOCALAPPDATA%\ccdash\state\collector.log`, and return.
+        #[cfg(windows)]
+        #[arg(long)]
+        background: bool,
     },
     /// Claude Code hook: forward the hook payload on stdin to the collector.
     Emit,
@@ -163,7 +173,8 @@ enum Command {
     #[command(hide = true)]
     PreReceive,
     /// A hub on a made-up workspace with two stand-in machines, to try the
-    /// panel or take screenshots: a fresh database each run, nothing real.
+    /// panel or take screenshots: a fresh database each run, nothing real
+    /// (Linux only).
     Demo {
         /// Where its database and files go (made, or emptied when an earlier
         /// demo made it; default: a `ccdash-demo` temporary directory).
@@ -172,6 +183,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7840")]
         listen: std::net::SocketAddr,
     },
+    /// Ends Claude Code process PID and everything under it from inside its
+    /// console, then turns off the terminal modes it left on (run by the
+    /// collector's stop, not by hand).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    EndTree { pid: u32 },
     /// Write every note of the hub's database as markdown with frontmatter:
     /// `<dir>/<workspace>/<kind>/<slug>.md`. Reads the database directly,
     /// so it works on a backup copy too.
@@ -349,9 +366,16 @@ fn main() -> ExitCode {
         Command::Tee { command } => return exit(emit::run(Source::Statusline, &command)),
         Command::Hub { config } => {
             logging();
-            config::load::<HubConfig>(config).and_then(hub::run)
+            hub_here("the hub")
+                .and_then(|()| config::load::<HubConfig>(config))
+                .and_then(hub::run)
         }
-        Command::Collector { config } => {
+        #[cfg(windows)]
+        Command::Collector {
+            config,
+            background: true,
+        } => collector::background(config),
+        Command::Collector { config, .. } => {
             logging();
             config::load::<CollectorConfig>(config).and_then(collector::run)
         }
@@ -456,10 +480,12 @@ fn main() -> ExitCode {
                 }),
         },
         Command::PreReceive => return exit(workspace::hub::pre_receive()),
+        #[cfg(windows)]
+        Command::EndTree { pid } => actions::end_tree_in_console(pid),
         Command::Export { config, db, dir } => export(config, db, &dir),
         Command::Demo { dir, listen } => {
             logging();
-            demo::run(dir, listen)
+            hub_here("ccdash demo, a hub,").and_then(|()| demo::run(dir, listen))
         }
     };
     match result {
@@ -475,13 +501,27 @@ fn exit(code: i32) -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
+/// The hub runs on Linux only, and so does the demo: a Windows machine is
+/// a workstation, its collector reporting to a hub elsewhere.
+fn hub_here(what: &str) -> Result<()> {
+    if cfg!(windows) {
+        anyhow::bail!(
+            "{what} runs on Linux only: on Windows run the collector, against a hub on Linux"
+        );
+    }
+    Ok(())
+}
+
 fn logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("CCDASH_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .without_time()
-        .init();
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_env("CCDASH_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    // NOTE: no journal on Windows: a redirected stderr is the log file itself
+    if cfg!(windows) && !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        builder.with_ansi(false).init();
+    } else {
+        builder.without_time().init();
+    }
 }
 
 /// The hub's web address: with a fresh device token minted in the hub's

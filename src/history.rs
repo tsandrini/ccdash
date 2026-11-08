@@ -174,8 +174,9 @@ pub fn lanes(conn: &Connection, scope: &Scope, live: &[Session]) -> Result<Vec<L
     let mut transitions = transitions_in(conn, scope)?;
     let mut closes = closes_in(conn, scope)?;
     let mut lanes = Vec::new();
+    let covered = scope.matcher();
     for row in sessions_overlapping(conn, scope)? {
-        if !scope.covers(&row.host, &row.cwd) {
+        if !covered.covers(&row.host, &row.cwd) {
             continue;
         }
         let current = live.get(row.id.as_str()).copied();

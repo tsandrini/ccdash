@@ -2352,14 +2352,12 @@ impl Core {
     /// workspace's, else `cwd` itself: the base claims resolve against and
     /// are shown relative to.
     fn root_of(&self, cwd: &str, project: Option<&str>) -> String {
-        match self.workspaces.of(cwd) {
-            Some(ws) => {
-                let dir = self.workspaces.dir(&ws).unwrap_or(cwd);
-                match project {
-                    Some(p) => format!("{dir}/{p}"),
-                    None => dir.to_owned(),
-                }
-            }
+        // NOTE: the directory `cwd` is in: a workspace may list one per machine
+        match self.workspaces.dir_of(cwd) {
+            Some(dir) => match project {
+                Some(p) => crate::workspace::join(dir, p),
+                None => dir.to_owned(),
+            },
             None => cwd.to_owned(),
         }
     }
@@ -4936,7 +4934,7 @@ mod tests {
         assert_eq!(claim.what, "Fix it");
         assert_eq!(claim.issue.as_deref(), Some("w--fix-it"));
         assert!(claim.paths.is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5621,7 +5619,7 @@ mod tests {
         .await
         .unwrap();
         assert!(hub.snapshot().await.unwrap().hosts.is_empty());
-        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

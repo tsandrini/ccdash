@@ -88,7 +88,10 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, &generated).unwrap();
         }
-        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        // NOTE: a CRLF checkout (core.autocrlf) holds the same file
+        let committed = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         assert!(
             committed == generated,
             "{FILE} is stale: run `CCDASH_UPDATE_TYPES=1 cargo test api`"

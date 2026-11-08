@@ -201,7 +201,7 @@ mod tests {
         )
         .await;
         assert!(
-            !ok && text.contains("reading /nonexistent/nope.html"),
+            !ok && text.contains("reading /nonexistent") && text.contains("nope.html"),
             "{text}"
         );
         let dir = std::env::temp_dir();

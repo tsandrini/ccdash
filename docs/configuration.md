@@ -1,9 +1,10 @@
 # Configuration
 
-Both daemons read TOML (`--config`, else `$XDG_CONFIG_HOME/ccdash/config.toml`)
-and reject unknown keys. The Nix modules write the files: their options
-cover the common keys, `settings` takes the rest. In paths, `$VAR` and
-`${VAR}` expand.
+Both daemons read TOML (`--config`, else `$XDG_CONFIG_HOME/ccdash/config.toml`;
+on Windows `%APPDATA%\ccdash\config.toml`) and reject unknown keys. The Nix
+modules write the files, and on Windows [the script](windows.md) the
+collector's: their options cover the common keys, `settings` takes the rest.
+In paths, `$VAR` and `${VAR}` expand.
 
 1. [NixOS module (hub)](#1-nixos-module-hub)
 2. [Home Manager module (collector)](#2-home-manager-module-collector)
@@ -87,3 +88,8 @@ options](https://tsandrini.github.io/ccdash/options/home-manager.html).
 | `power.suspend_command`                     | `["systemctl", "suspend"]`                      | suspends; returns once the sleep is on its way                                           |
 | `power.lock`                                | `false`                                         | carry out the panel's Lock                                                               |
 | `power.lock_command`                        | `["loginctl", "lock-session", "{session}"]`     | locks the user's display session (`{session}`: its id)                                   |
+
+On Windows `host` defaults to the DNS host name, lowercased; `niri.enable`
+to `false`; `power.lock_command` to `["rundll32.exe",
+"user32.dll,LockWorkStation"]`; and `power.suspend_command` to a hidden
+PowerShell calling `SetSuspendState` (sleep, not hibernation).

@@ -372,10 +372,11 @@ fn shares(
         ))
     })?;
     let mut by: BTreeMap<(bool, Option<String>), f64> = BTreeMap::new();
+    let covered = scope.matcher();
     for row in rows {
         let (min, max, started_at, cwd, host) = row?;
         let cost = if started_at >= since { max } else { max - min };
-        let key = if scope.covers(&host, &cwd) {
+        let key = if covered.covers(&host, &cwd) {
             (false, workspaces.of(&cwd))
         } else {
             (true, None)
