@@ -5,6 +5,8 @@
 	// start sheet offers them) and the one it has now.
 	import { Unauthorized } from '#lib/api/client.js';
 	import { fetchTargets, setSessionProject, type Session } from '#lib/api/index.js';
+	import { SmartSelect, type Choice } from '#lib/components/ui/smart-select/index.js';
+	import { plural } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
 
 	let { session: s }: { session: Session } = $props();
@@ -19,9 +21,20 @@
 	const options = $derived(
 		[...new Set([...(names ?? []), ...(s.project_pinned && s.project ? [s.project] : [])])].sort()
 	);
-	const fromDir = $derived(
-		s.project && !s.project_pinned ? `${s.project} (from the directory)` : 'none (the workspace)'
+	const others = $derived(
+		live.list.filter((o) => o.id !== s.id && o.workspace === s.workspace && o.activity !== 'gone')
 	);
+	const choices = $derived<Choice[]>([
+		{
+			value: DIR,
+			label: s.project && !s.project_pinned ? s.project : 'none',
+			hint: s.project && !s.project_pinned ? 'From the directory' : 'The workspace itself'
+		},
+		...options.map((p) => {
+			const n = others.filter((o) => o.project === p).length;
+			return { value: p, label: p, meta: n ? plural(n, 'other session') : undefined };
+		})
+	]);
 
 	$effect(() => {
 		const { host, workspace } = s;
@@ -53,16 +66,15 @@
 </script>
 
 <div class="flex flex-col gap-1">
-	<select
-		class="h-8 w-full max-w-xs min-w-0 rounded-lg border border-input bg-transparent px-2 text-sm text-foreground dark:bg-input/30"
-		aria-label="Project"
+	<SmartSelect
+		class="max-w-xs"
+		label="Project"
 		{value}
+		options={choices}
 		disabled={busy || names === null}
-		onchange={(e) => pick(e.currentTarget.value)}
-	>
-		<option value={DIR}>{fromDir}</option>
-		{#each options as p (p)}<option value={p}>{p}</option>{/each}
-	</select>
+		searchPlaceholder="Filter projects"
+		onchange={pick}
+	/>
 	<p class="text-xs text-muted-foreground">
 		Notes default to it; the project's other sessions are the ones this one hears about. A session
 		at the workspace root sets it with <code class="font-mono">claim</code>.

@@ -25,6 +25,7 @@
 	import type { StartPreset } from '#lib/starter.svelte.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import { SmartSelect, type Choice } from '#lib/components/ui/smart-select/index.js';
 	import PromptField from '#lib/components/session/PromptField.svelte';
 	import {
 		clearDraft,
@@ -35,24 +36,19 @@
 		noteDraft,
 		remoteDraft
 	} from '#lib/drafts.js';
-	import { place } from '#lib/format.js';
+	import { fmtBytes, place, plural } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
+	import { fmtPct } from '#lib/machines.js';
+	import { customModel, MODELS } from '#lib/models.js';
 	import { issuePrompt } from '#lib/notes.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
 	import { starter } from '#lib/starter.svelte.js';
 
-	const MODELS: [string, string][] = [
-		['', 'Default'],
-		['fable', 'Fable'],
-		['opus', 'Opus'],
-		['sonnet', 'Sonnet'],
-		['haiku', 'Haiku']
-	];
-	const MODES: [string, string][] = [
-		['', 'Default'],
-		['plan', 'Plan'],
-		['acceptEdits', 'Accept edits']
+	const MODES: Choice[] = [
+		{ value: '', label: 'Default', hint: "The host's own setting" },
+		{ value: 'plan', label: 'Plan', hint: 'Reads and plans, changes nothing' },
+		{ value: 'acceptEdits', label: 'Accept edits', hint: 'Edits files without asking' }
 	];
 	/** The project select's value for no project (workspace-wide). */
 	const ROOT = '/';
@@ -96,6 +92,47 @@
 		)
 	);
 	const vimEsc = $derived(prefs.vimOn);
+
+	/** "3 sessions", or nothing for none: a row's figure. */
+	const open = (n: number) => (n ? plural(n, 'session') : undefined);
+	const running = $derived(live.list.filter((s) => s.activity !== 'gone'));
+	const hostChoices = $derived<Choice[]>(
+		connected.map((h) => {
+			const m = live.hosts.find((x) => x.name === h)?.machine;
+			const parts = [
+				h === live.here ? 'this device' : null,
+				m && m.cpu.usage_pct !== null ? `CPU ${fmtPct(m.cpu.usage_pct)}` : null,
+				m?.memory.total ? `mem ${fmtBytes(m.memory.used)} of ${fmtBytes(m.memory.total)}` : null
+			];
+			return {
+				value: h,
+				label: h,
+				hint: parts.filter(Boolean).join(' · ') || undefined,
+				meta: open(running.filter((s) => s.host === h).length)
+			};
+		})
+	);
+	const wsChoices = $derived<Choice[]>(
+		workspacesHere.map((w) => ({
+			value: w.name,
+			label: w.name,
+			hint: plural(w.projects.length, 'project'),
+			meta: open(running.filter((s) => s.workspace === w.name).length)
+		}))
+	);
+	const projectChoices = $derived<Choice[]>([
+		...(names ?? []).map((p) => ({
+			value: p,
+			label: p,
+			meta: open(running.filter((s) => s.workspace === ws && s.project === p).length)
+		})),
+		{
+			value: ROOT,
+			label: '(no project)',
+			hint: 'The workspace itself',
+			meta: open(running.filter((s) => s.workspace === ws && !s.project).length)
+		}
+	]);
 	let fieldFocused = $state(false);
 
 	// A fresh sheet: where sessions can start, then the preset, else the
@@ -259,8 +296,6 @@
 		}
 	}
 
-	const selectClass =
-		'h-8 w-full min-w-0 rounded-lg border border-input bg-transparent px-2 text-sm text-foreground dark:bg-input/30';
 	const choiceClass = 'flex min-w-0 flex-col gap-1 text-xs text-muted-foreground';
 </script>
 
@@ -302,28 +337,29 @@
 		{:else}
 			<div class="flex flex-wrap items-end gap-2">
 				{#if !resume}
-					<label class="{choiceClass} w-36">
+					<div class="{choiceClass} w-36">
 						Host
-						<select class={selectClass} bind:value={host} onchange={pickHost}>
-							{#each connected as h (h)}<option value={h}>{h}</option>{/each}
-						</select>
-					</label>
-					<label class="{choiceClass} w-40">
+						<SmartSelect label="Host" bind:value={host} options={hostChoices} onchange={pickHost} />
+					</div>
+					<div class="{choiceClass} w-40">
 						Workspace
-						<select class={selectClass} bind:value={ws} onchange={() => (project = '')}>
-							{#each workspacesHere as w (w.name)}<option value={w.name}>{w.name}</option>{/each}
-						</select>
-					</label>
-					<label class="{choiceClass} w-56 flex-1">
+						<SmartSelect
+							label="Workspace"
+							bind:value={ws}
+							options={wsChoices}
+							onchange={() => (project = '')}
+						/>
+					</div>
+					<div class="{choiceClass} min-w-56 flex-1">
 						Project
-						<select class={selectClass} bind:value={project}>
-							<option value="" disabled
-								>{names?.length ? 'Pick a project' : 'No project here'}</option
-							>
-							{#each names ?? [] as p (p)}<option value={p}>{p}</option>{/each}
-							<option value={ROOT}>(no project: the workspace itself)</option>
-						</select>
-					</label>
+						<SmartSelect
+							label="Project"
+							bind:value={project}
+							options={projectChoices}
+							placeholder={names?.length ? 'Pick a project' : 'No project here'}
+							searchPlaceholder="Filter projects"
+						/>
+					</div>
 				{:else}
 					<div class="{choiceClass} flex-1" role="group" aria-label="Machine">
 						Machine
@@ -346,18 +382,20 @@
 						</div>
 					</div>
 				{/if}
-				<label class="{choiceClass} w-32">
+				<div class="{choiceClass} w-36">
 					Model
-					<select class={selectClass} bind:value={model}>
-						{#each MODELS as [value, name] (value)}<option {value}>{name}</option>{/each}
-					</select>
-				</label>
-				<label class="{choiceClass} w-36">
+					<SmartSelect
+						label="Model"
+						bind:value={model}
+						options={MODELS}
+						custom={customModel}
+						searchPlaceholder="Opus, 4.8, a full name…"
+					/>
+				</div>
+				<div class="{choiceClass} w-36">
 					Permission mode
-					<select class={selectClass} bind:value={mode}>
-						{#each MODES as [value, name] (value)}<option {value}>{name}</option>{/each}
-					</select>
-				</label>
+					<SmartSelect label="Permission mode" bind:value={mode} options={MODES} />
+				</div>
 			</div>
 			{#if resume}
 				{#if !resumeHosts.length}
