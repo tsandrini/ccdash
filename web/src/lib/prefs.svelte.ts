@@ -83,7 +83,7 @@ nmap <Space>q :q<CR>
 nmap <Space>r :noh<CR>`;
 
 /** What the start sheet picked last; empty strings are the host's defaults. */
-export type StartChoice = { host: string; model: string; mode: string };
+export type StartChoice = { host: string; model: string; mode: string; effort: string };
 
 /** The text size a framed report shows; the report's own switch sets it. */
 export type ReportSize = 'small' | 'normal' | 'big';
@@ -155,7 +155,13 @@ class Prefs {
 	/** The machine whose editor "Edit in the editor" opens; empty picks the
 	 * session's host, else the first connected one that can. */
 	editHost = $state<string>(browser ? (localStorage.getItem(EDIT_HOST_KEY) ?? '') : '');
-	start = $state<StartChoice>(load(START_KEY, { host: '', model: '', mode: '' }));
+	start = $state<StartChoice>({
+		host: '',
+		model: '',
+		mode: '',
+		effort: '',
+		...load<Partial<StartChoice>>(START_KEY, {})
+	});
 	graph = $state<GraphLook>({ ...DEFAULT_GRAPH, ...load<Partial<GraphLook>>(GRAPH_KEY, {}) });
 	/** Reports in the panel's frame have no storage of their own (an opaque
 	 * origin), so the pick made in one report is kept here for all. */

@@ -23,6 +23,7 @@ use crate::{
     },
 };
 
+/// 17: the effort a session starts on (`Launch.effort`).
 /// 16: what a collector does (`Hello.features`, replacing `Hello.edit`).
 /// 15: drafts opened in an editor on a machine (`Hello.edit`, `Edit` and
 /// `EditCancel` down, `Edited` up).
@@ -46,7 +47,7 @@ use crate::{
 /// `Stop`, `Open` down; `Launched`, `Stopped` up), `branch` and `launched`
 /// on sessions, `branch` on agents entries and envelopes, `launch` on
 /// envelopes.
-pub const VERSION: u32 = 16;
+pub const VERSION: u32 = 17;
 
 /// Collector → hub.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +447,9 @@ pub enum ToCollector {
         model: Option<String>,
         #[serde(default)]
         permission_mode: Option<String>,
+        /// One of `actions::EFFORTS`; the session's own when None.
+        #[serde(default)]
+        effort: Option<String>,
         #[serde(default)]
         resume: Option<String>,
     },
@@ -684,6 +688,7 @@ mod tests {
             prompt: "hi".into(),
             model: None,
             permission_mode: Some("plan".into()),
+            effort: None,
             resume: None,
         };
         let text = serde_json::to_string(&launch).unwrap();

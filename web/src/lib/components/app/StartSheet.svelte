@@ -39,7 +39,7 @@
 	import { fmtBytes, place, plural } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
 	import { fmtPct } from '#lib/machines.js';
-	import { customModel, MODELS } from '#lib/models.js';
+	import { customModel, EFFORTS, MODELS } from '#lib/models.js';
 	import { issuePrompt } from '#lib/notes.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
@@ -59,6 +59,7 @@
 	let project = $state('');
 	let model = $state('');
 	let mode = $state('');
+	let effort = $state('');
 	let text = $state('');
 	let field = $state<PromptField | null>(null);
 	/** Where sessions can start; null until loaded. */
@@ -92,6 +93,13 @@
 		)
 	);
 	const vimEsc = $derived(prefs.vimOn);
+
+	/** The lists of a session to resume: no pick keeps what it ran on. */
+	const kept = (list: Choice[]): Choice[] =>
+		resume ? list.map((c) => (c.value ? c : { ...c, label: 'As it was', hint: undefined })) : list;
+	const modelChoices = $derived(kept(MODELS));
+	const effortChoices = $derived(kept(EFFORTS));
+	const modeChoices = $derived(kept(MODES));
 
 	/** "3 sessions", or nothing for none: a row's figure. */
 	const open = (n: number) => (n ? plural(n, 'session') : undefined);
@@ -141,8 +149,10 @@
 		if (!starter.open) return;
 		const preset = starter.preset;
 		untrack(() => {
-			model = prefs.start.model;
-			mode = prefs.start.mode;
+			// a session to resume keeps its own options unless one is picked
+			model = preset.resume ? '' : prefs.start.model;
+			mode = preset.resume ? '' : prefs.start.mode;
+			effort = preset.resume ? '' : prefs.start.effort;
 			pending = null;
 			error = '';
 			targets = null;
@@ -256,10 +266,11 @@
 				prompt: body,
 				model: model || undefined,
 				permission_mode: mode || undefined,
+				effort: effort || undefined,
 				resume: resume?.id,
 				issue: issue?.slug
 			});
-			prefs.setStart({ host, model, mode });
+			if (!resume) prefs.setStart({ host, model, mode, effort });
 			field?.remember(body);
 			// NOTE: the stream may have moved the launch on before this answer came
 			if (!live.launches.has(launch.id)) live.launches.set(launch.id, launch);
@@ -387,14 +398,18 @@
 					<SmartSelect
 						label="Model"
 						bind:value={model}
-						options={MODELS}
+						options={modelChoices}
 						custom={customModel}
 						searchPlaceholder="Opus, 4.8, a full name…"
 					/>
 				</div>
+				<div class="{choiceClass} w-32">
+					Effort
+					<SmartSelect label="Effort" bind:value={effort} options={effortChoices} />
+				</div>
 				<div class="{choiceClass} w-36">
 					Permission mode
-					<SmartSelect label="Permission mode" bind:value={mode} options={MODES} />
+					<SmartSelect label="Permission mode" bind:value={mode} options={modeChoices} />
 				</div>
 			</div>
 			{#if resume}
@@ -406,6 +421,11 @@
 					<p class="text-xs text-muted-foreground">
 						It last ran on {resume.host}; {host} fetches its transcript from the hub first, then resumes
 						it as a copy under a new id (the old one stays as it was).
+					</p>
+				{:else if model || effort || mode}
+					<p class="text-xs text-muted-foreground">
+						With another model, effort or permission mode Claude Code continues it as a copy under a
+						new id; the old one stays as it was.
 					</p>
 				{/if}
 			{/if}

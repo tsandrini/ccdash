@@ -48,7 +48,7 @@ use super::{
     reports, web,
 };
 use crate::{
-    actions::{self, MAX_PROMPT, PERMISSION_MODES},
+    actions::{self, EFFORTS, MAX_PROMPT, PERMISSION_MODES},
     analytics::{self, Analytics, LimitTracks},
     ask::Answer,
     catalog::{self, Catalog},
@@ -582,6 +582,11 @@ pub(crate) struct LaunchBody {
     #[serde(default)]
     #[ts(optional)]
     permission_mode: Option<String>,
+    /// `low`, `medium`, `high`, `xhigh` or `max`; the session's own when
+    /// absent.
+    #[serde(default)]
+    #[ts(optional)]
+    effort: Option<String>,
     /// An ended session to continue (on its host, in its directory).
     #[serde(default)]
     #[ts(optional)]
@@ -625,6 +630,12 @@ async fn launch(
         && !PERMISSION_MODES.contains(&m.as_str())
     {
         return Err(refuse(format!("permission mode {m:?} is not offered")));
+    }
+    let effort = body.effort.filter(|e| !e.is_empty());
+    if let Some(e) = &effort
+        && !EFFORTS.contains(&e.as_str())
+    {
+        return Err(refuse(format!("effort {e:?} is not offered")));
     }
     let ws_dir = app
         .workspaces
@@ -720,6 +731,7 @@ async fn launch(
             prompt,
             model,
             permission_mode,
+            effort,
             resume,
             issue,
         })

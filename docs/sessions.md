@@ -18,7 +18,10 @@ sessions that need you, and the session page pins **Open on** and
 
 **Start a session** on Now (or **Start** on a project page) asks for a
 connected host, a workspace and one of its projects, the model, the
-permission mode (the host's default, plan, accept edits) and the prompt.
+effort (the default, or low to max), the permission mode (the host's
+default, plan, accept edits) and the prompt. The lists narrow as you type:
+the model's has the aliases (`opus` follows the newest release) and the
+versions by name, and takes any other name `claude --model` knows.
 The panel waits until the session reports and opens its page; its prompts
 reach the phone like any other's, and a finished turn notifies "Finished".
 
@@ -34,7 +37,7 @@ on the chosen host. The collector then runs, in the workspace's directory:
 
 ```sh
 <launch.command> --bg [--resume <id>] [--model <m>] \
-  [--permission-mode <pm>] --channels plugin:ccdash@inline \
+  [--permission-mode <pm>] [--effort <level>] --channels plugin:ccdash@inline \
   --settings $XDG_STATE_HOME/ccdash/launch/<launch id>.json -- <prompt>
 ```
 
@@ -61,6 +64,13 @@ Any past session resumes on any connected machine that
 [syncs](state-sync.md): the collector fetches the transcript first. An
 ended session's page has **Resume…** at its foot (and in its Actions menu);
 every other one is found under **Sessions › Past**.
+
+Resumed as it was, a background session of the same machine goes on under
+its own id. Pick another model, effort or permission mode and Claude Code
+continues it as a copy under a new id, on those; the old one stays. That
+is also how a session changes its model or effort from the panel: a
+running session takes neither from outside, only `/model` and `/effort`
+typed into it.
 
 ### Finding it: Sessions › Past
 

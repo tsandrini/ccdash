@@ -535,6 +535,7 @@ pub struct LaunchReq {
     pub prompt: String,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    pub effort: Option<String>,
     pub resume: Option<String>,
     pub issue: Option<LaunchIssue>,
 }
@@ -3003,6 +3004,7 @@ impl Core {
                 prompt: req.prompt,
                 model: req.model,
                 permission_mode: req.permission_mode,
+                effort: req.effort,
                 resume: req.resume,
             },
         );
@@ -3170,6 +3172,7 @@ impl Core {
             prompt: text.to_owned(),
             model: None,
             permission_mode: None,
+            effort: None,
             resume: Some(id.clone()),
             issue: None,
         })?;
@@ -4689,13 +4692,18 @@ mod tests {
             prompt,
             model,
             permission_mode,
+            effort,
             resume,
         } = sent
         else {
             unreachable!()
         };
         assert_eq!((cwd.as_str(), prompt.as_str()), ("/w", "carry on"));
-        assert_eq!((model, permission_mode), (None, None), "its saved options");
+        assert_eq!(
+            (model, permission_mode, effort),
+            (None, None, None),
+            "its saved options"
+        );
         assert_eq!(resume.as_deref(), Some(id));
 
         // one wake at a time
@@ -4914,6 +4922,7 @@ mod tests {
                 prompt: "go".into(),
                 model: None,
                 permission_mode: None,
+                effort: None,
                 resume: None,
                 issue: Some(LaunchIssue {
                     slug: "w--fix-it".into(),
@@ -4963,6 +4972,7 @@ mod tests {
             prompt: "go".into(),
             model: None,
             permission_mode: Some("plan".into()),
+            effort: None,
             resume: resume.map(str::to_owned),
             issue: None,
         };

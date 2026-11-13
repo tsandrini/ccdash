@@ -19,7 +19,7 @@ Read the collector's log; the first line about the hub says why.
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | `connecting: HTTP error: 401 Unauthorized`                           | the token is not one the hub lists: another secret, the wrong file, or the hub not rebuilt since                    |
 | `refused: this token is desk's, but the machine calls itself laptop` | the host name differs from its key in the hub's `collectors`: rename the key or set the collector's `settings.host` |
-| `refused: the hub speaks protocol 16, not 15`                        | the hub and this collector are different releases: update both ([installation](installation.md#8-updating))         |
+| `refused: the hub speaks protocol 17, not 16`                        | the hub and this collector are different releases: update both ([installation](installation.md#8-updating))         |
 | `connecting: … Connection refused`                                   | the hub is down, or `hub.url` points elsewhere (`/collect` on the hub's address, `wss://` behind nginx)             |
 
 Nothing in the log at all: `systemctl --user status ccdash`. The collector

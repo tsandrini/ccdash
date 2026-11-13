@@ -33,6 +33,8 @@ const POWER_TIMEOUT: Duration = Duration::from_secs(15);
 const SETTINGS_KEEP: Duration = Duration::from_secs(30 * 24 * 3600);
 /// What a launch may ask for besides the configured default.
 pub const PERMISSION_MODES: &[&str] = &["plan", "acceptEdits"];
+/// The effort levels a launch may ask for (`claude --effort`).
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Longest prompt a launch takes, in characters.
 pub const MAX_PROMPT: usize = 20_000;
 
@@ -168,6 +170,8 @@ pub struct LaunchSpec {
     pub model: Option<String>,
     /// One of [`PERMISSION_MODES`]; the configured default when None.
     pub permission_mode: Option<String>,
+    /// One of [`EFFORTS`]; the model's or the session's own when None.
+    pub effort: Option<String>,
     /// The session to continue.
     pub resume: Option<String>,
     /// Handed to the session's hooks as `CCDASH_LAUNCH`.
@@ -196,6 +200,11 @@ impl LaunchSpec {
         {
             return Err(format!("permission mode {mode:?} is not offered"));
         }
+        if let Some(effort) = &self.effort
+            && !EFFORTS.contains(&effort.as_str())
+        {
+            return Err(format!("effort {effort:?} is not offered"));
+        }
         if let Some(id) = &self.resume
             && !paths::plain_session_id(id)
         {
@@ -219,6 +228,9 @@ impl LaunchSpec {
         }
         if let Some(mode) = &self.permission_mode {
             args.extend(["--permission-mode".into(), mode.clone()]);
+        }
+        if let Some(effort) = &self.effort {
+            args.extend(["--effort".into(), effort.clone()]);
         }
         if channel {
             args.extend(["--channels".into(), "plugin:ccdash@inline".into()]);
@@ -812,6 +824,7 @@ mod tests {
             prompt: "-v fix it".into(),
             model: Some("haiku".into()),
             permission_mode: Some("plan".into()),
+            effort: Some("xhigh".into()),
             resume: None,
             nonce: "0123abcd".into(),
             saved: false,
@@ -823,8 +836,16 @@ mod tests {
         let file = Path::new("/state/launch/0123abcd.json");
         let args = spec().args(file, true);
         assert_eq!(
-            &args[..5],
-            ["--bg", "--model", "haiku", "--permission-mode", "plan"]
+            &args[..7],
+            [
+                "--bg",
+                "--model",
+                "haiku",
+                "--permission-mode",
+                "plan",
+                "--effort",
+                "xhigh"
+            ]
         );
         assert!(
             args.windows(2)
@@ -1032,6 +1053,10 @@ mod tests {
             },
             LaunchSpec {
                 permission_mode: Some("bypassPermissions".into()),
+                ..spec()
+            },
+            LaunchSpec {
+                effort: Some("--bare".into()),
                 ..spec()
             },
             LaunchSpec {

@@ -63,6 +63,17 @@ export const MODELS: Choice[] = [
 	version('Haiku 4.5', 'claude-haiku-4-5', 'Previous Haiku, 200K context')
 ];
 
+/** The effort levels a session can start on (`EFFORTS` in src/actions.rs);
+ * `''` leaves it to the model and the host. */
+export const EFFORTS: Choice[] = [
+	{ value: '', label: 'Default', hint: "The model's or the host's own" },
+	{ value: 'low', label: 'Low', hint: 'Quick and terse, for simple tasks' },
+	{ value: 'medium', label: 'Medium', hint: 'Balanced' },
+	{ value: 'high', label: 'High', hint: 'Thorough, for demanding work' },
+	{ value: 'xhigh', label: 'Extra high', hint: 'Long coding and agentic work', meta: 'xhigh' },
+	{ value: 'max', label: 'Max', hint: 'When correctness matters more than cost' }
+];
+
 // NOTE: mirrors `valid_model` in src/actions.rs, which has the last word
 const MODEL_NAME = /^[A-Za-z0-9._[\]][A-Za-z0-9._[\]-]{0,63}$/;
 

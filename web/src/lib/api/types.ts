@@ -809,6 +809,11 @@ model?: string,
  */
 permission_mode?: string, 
 /**
+ * `low`, `medium`, `high`, `xhigh` or `max`; the session's own when
+ * absent.
+ */
+effort?: string, 
+/**
  * An ended session to continue (on its host, in its directory).
  */
 resume?: string, 

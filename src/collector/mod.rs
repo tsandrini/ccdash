@@ -1310,10 +1310,12 @@ impl Actor {
                 prompt,
                 model,
                 permission_mode,
+                effort,
                 resume,
             } => {
                 let saved = model.is_none()
                     && permission_mode.is_none()
+                    && effort.is_none()
                     && resume
                         .as_deref()
                         .is_some_and(|id| self.has_saved_options(id));
@@ -1322,6 +1324,7 @@ impl Actor {
                     prompt,
                     model,
                     permission_mode,
+                    effort,
                     resume,
                     nonce: launch.clone(),
                     saved,

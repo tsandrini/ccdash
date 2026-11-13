@@ -185,5 +185,5 @@ nix flake update ccdash
 
 Then rebuild the hub and every workstation together. Hub and collectors
 speak a versioned protocol; a collector older or newer than its hub is
-refused (`refused: the hub speaks protocol 16, not 15` in its log) until
+refused (`refused: the hub speaks protocol 17, not 16` in its log) until
 both run the same release.
