@@ -10,6 +10,7 @@ import LockOpenIcon from '@lucide/svelte/icons/lock-open';
 import MonitorUpIcon from '@lucide/svelte/icons/monitor-up';
 import OctagonXIcon from '@lucide/svelte/icons/octagon-x';
 import PlayIcon from '@lucide/svelte/icons/play';
+import RepeatIcon from '@lucide/svelte/icons/repeat';
 import {
 	forgetSession,
 	interruptSession,
@@ -23,7 +24,8 @@ import { live } from './live/store.svelte';
 import { busy, isBackground, label } from './session';
 import { resumableSession, starter } from './starter.svelte';
 
-export type ActionId = 'open' | 'interrupt' | 'resolve' | 'keep' | 'continue' | 'kill' | 'forget';
+export type ActionId =
+	'open' | 'interrupt' | 'resolve' | 'keep' | 'continue' | 'switch' | 'kill' | 'forget';
 
 export type Confirm = { title: string; body: string; button: string };
 
@@ -117,6 +119,19 @@ export const ACTIONS: SessionAction[] = [
 		icon: PlayIcon,
 		offered: (s) => !running(s) && Boolean(s.workspace),
 		run: async (s) => starter.show({ resume: resumableSession(s) })
+	},
+	{
+		id: 'switch',
+		label: () => 'Switch model & effort…',
+		icon: RepeatIcon,
+		// NOTE: a running session takes neither from outside: its sheet stops it and continues a copy
+		offered: (s) =>
+			running(s) &&
+			online(s) &&
+			isBackground(s) &&
+			Boolean(s.workspace) &&
+			live.features(s.host).launch,
+		run: async (s) => starter.show({ resume: resumableSession(s), switching: true })
 	},
 	{
 		id: 'kill',

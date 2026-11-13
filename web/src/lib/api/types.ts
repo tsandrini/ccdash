@@ -818,6 +818,11 @@ effort?: string,
  */
 resume?: string, 
 /**
+ * `resume` may still be running: a background session is stopped
+ * first, then continued (as a copy, when anything about it changes).
+ */
+restart?: boolean, 
+/**
  * An open issue of the workspace the session is started for: it
  * claims it as soon as it reports, so the board shows it working.
  */

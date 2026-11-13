@@ -1,6 +1,7 @@
 // The start sheet's state: opened from Now (the scope's workspace), a
-// project page (its project), an ended session's page (continuing it) or
-// an open issue (a session to work on it).
+// project page (its project), an ended session's page (continuing it), a
+// running one's (switching its model and effort) or an open issue (a
+// session to work on it).
 
 import type { PastSession, Session } from './api/types';
 import { label } from './session';
@@ -13,6 +14,9 @@ export type Resumable = {
 	workspace: string | null;
 	project: string | null;
 	title: string;
+	/** What it runs on, as the session reports it. */
+	model?: string | null;
+	effort?: string | null;
 };
 
 export const resumableSession = (s: Session): Resumable => ({
@@ -21,7 +25,9 @@ export const resumableSession = (s: Session): Resumable => ({
 	cwd: s.cwd,
 	workspace: s.workspace ?? null,
 	project: s.project ?? null,
-	title: label(s)
+	title: label(s),
+	model: s.model,
+	effort: s.effort
 });
 
 export const resumablePast = (s: PastSession): Resumable => ({
@@ -39,6 +45,9 @@ export type StartPreset = {
 	project?: string | null;
 	/** The ended session to continue: its host, workspace and project. */
 	resume?: Resumable;
+	/** `resume` is running: stop it and continue it on another model or
+	 * effort, which makes it a copy under a new id. */
+	switching?: boolean;
 	/** The open issue the session is for: it claims it when it reports. */
 	issue?: { slug: string; title: string };
 };

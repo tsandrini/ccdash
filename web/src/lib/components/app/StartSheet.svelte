@@ -3,7 +3,9 @@
 	// the workspace's root, under a project with notes and a directory on
 	// that host) or continues an ended one, on the host it ran on or
 	// another that syncs it: host, workspace and project, the model, the
-	// permission mode, the prompt. A dialog over most of the page, the
+	// permission mode, the prompt. For a running session it switches the
+	// model and effort: the hub stops it and continues it as a copy, which
+	// the sheet says before its button does it. A dialog over most of the page, the
 	// prompt's editor filling it: the longest prompts are written here. For
 	// an issue the prompt is written already, to edit. The draft lives on
 	// the hub, so closing the dialog loses nothing. Waits for the session to
@@ -43,6 +45,7 @@
 	import { issuePrompt } from '#lib/notes.js';
 	import { prefs } from '#lib/prefs.svelte.js';
 	import { scope } from '#lib/scope.svelte.js';
+	import { busy as sessionBusy } from '#lib/session.js';
 	import { starter } from '#lib/starter.svelte.js';
 
 	const MODES: Choice[] = [
@@ -87,18 +90,36 @@
 	const workspacesHere = $derived(targets?.find((t) => t.host === host)?.workspaces ?? []);
 	const names = $derived(workspacesHere.find((w) => w.name === ws)?.projects);
 	const launch = $derived<Launch | undefined>(pending ? live.launches.get(pending) : undefined);
+	/** The running session whose model and effort are switched. */
+	const switching = $derived(starter.preset.switching ? resume : undefined);
+	const target = $derived(switching ? live.sessions.get(switching.id) : undefined);
+	/** Stopped already (an earlier try's resume failed): only the copy is left to start. */
+	const stopped = $derived(Boolean(switching) && (!target || target.activity === 'gone'));
 	const ready = $derived(
 		Boolean(
-			host && ws && (resume || project) && text.trim() && !busy && !pending && !draft?.editing
+			host &&
+			ws &&
+			(resume || project) &&
+			(!switching || ((model || effort) && host === switching.host)) &&
+			text.trim() &&
+			!busy &&
+			!pending &&
+			!draft?.editing
 		)
 	);
 	const vimEsc = $derived(prefs.vimOn);
 
 	/** The lists of a session to resume: no pick keeps what it ran on. */
-	const kept = (list: Choice[]): Choice[] =>
-		resume ? list.map((c) => (c.value ? c : { ...c, label: 'As it was', hint: undefined })) : list;
-	const modelChoices = $derived(kept(MODELS));
-	const effortChoices = $derived(kept(EFFORTS));
+	const kept = (list: Choice[], now?: string | null): Choice[] =>
+		resume
+			? list.map((c) =>
+					c.value
+						? c
+						: { ...c, label: switching ? 'As it is' : 'As it was', hint: now ?? undefined }
+				)
+			: list;
+	const modelChoices = $derived(kept(MODELS, resume?.model));
+	const effortChoices = $derived(kept(EFFORTS, resume?.effort));
 	const modeChoices = $derived(kept(MODES));
 
 	/** "3 sessions", or nothing for none: a row's figure. */
@@ -268,6 +289,7 @@
 				permission_mode: mode || undefined,
 				effort: effort || undefined,
 				resume: resume?.id,
+				restart: switching ? true : undefined,
 				issue: issue?.slug
 			});
 			if (!resume) prefs.setStart({ host, model, mode, effort });
@@ -317,16 +339,21 @@
 	>
 		<Dialog.Header class="gap-1 pr-8">
 			<Dialog.Title
-				>{resume
-					? 'Resume the session'
-					: issue
-						? 'Work on this issue'
-						: 'Start a session'}</Dialog.Title
+				>{switching
+					? 'Switch model & effort'
+					: resume
+						? 'Resume the session'
+						: issue
+							? 'Work on this issue'
+							: 'Start a session'}</Dialog.Title
 			>
 			<Dialog.Description>
 				{#if issue}
 					Starts a session on “{issue.title}”. It claims the issue when it reports, so the board
 					shows it in progress.
+				{:else if switching}
+					A running session takes no other model or effort from outside, so “{switching.title}” is
+					stopped and its conversation continues on {switching.host} as a copy, on what you pick.
 				{:else if resume}
 					Resumes “{resume.title}” in the background on {host || resume.host}, in
 					{place(resume.cwd)}: its conversation goes on from where it stopped.
@@ -371,7 +398,7 @@
 							searchPlaceholder="Filter projects"
 						/>
 					</div>
-				{:else}
+				{:else if !switching}
 					<div class="{choiceClass} flex-1" role="group" aria-label="Machine">
 						Machine
 						<div class="flex flex-wrap gap-1.5">
@@ -407,12 +434,40 @@
 					Effort
 					<SmartSelect label="Effort" bind:value={effort} options={effortChoices} />
 				</div>
-				<div class="{choiceClass} w-36">
-					Permission mode
-					<SmartSelect label="Permission mode" bind:value={mode} options={modeChoices} />
-				</div>
+				{#if !switching}
+					<div class="{choiceClass} w-36">
+						Permission mode
+						<SmartSelect label="Permission mode" bind:value={mode} options={modeChoices} />
+					</div>
+				{/if}
 			</div>
-			{#if resume}
+			{#if switching}
+				{#if host !== switching.host}
+					<p class="text-xs text-critical">
+						{switching.host} is not connected or starts no sessions, so it cannot be restarted there.
+					</p>
+				{:else if stopped}
+					<p class="text-xs text-muted-foreground" data-slot="switch-warning">
+						The session is stopped. Its conversation continues in the background as a copy under a
+						new id, starting with the prompt below.
+					</p>
+				{:else}
+					<p
+						class="rounded-lg border border-warning/50 bg-warning/10 px-3 py-2 text-xs"
+						data-slot="switch-warning"
+					>
+						<strong class="font-medium">This stops the session and starts it again.</strong>
+						<code class="font-mono">claude stop</code> ends it on {switching.host}, then its
+						conversation continues in the background as a copy under a new id, starting with the
+						prompt below; the stopped one stays in the list as it was.
+						{#if target && sessionBusy(target)}
+							<strong class="font-medium"
+								>It is working now: the turn in progress is cut off.</strong
+							>
+						{/if}
+					</p>
+				{/if}
+			{:else if resume}
 				{#if !resumeHosts.length}
 					<p class="text-xs text-critical">
 						No connected machine has the workspace {resume.workspace}.
@@ -441,7 +496,11 @@
 					historyNote="The workspace's prompts."
 					{host}
 					workspace={ws || null}
-					placeholder={resume ? 'What next?' : 'What should Claude do?'}
+					placeholder={switching
+						? 'What should it do next, on the new model or effort?'
+						: resume
+							? 'What next?'
+							: 'What should Claude do?'}
 					label="Prompt"
 					rows={6}
 					fill
@@ -455,9 +514,21 @@
 					onsave={() => flushDraft(draftKey)}
 				>
 					{#snippet actions()}
-						<Button type="submit" size="sm" disabled={!ready} title="Ctrl Enter">
+						<Button
+							type="submit"
+							size="sm"
+							variant={switching && !stopped ? 'destructive' : 'default'}
+							disabled={!ready}
+							title="Ctrl Enter"
+						>
 							{#if busy || pending}<LoaderCircleIcon class="animate-spin" />{/if}
-							{resume ? 'Resume' : 'Start'}
+							{switching
+								? stopped
+									? 'Continue as a copy'
+									: 'Stop and switch'
+								: resume
+									? 'Resume'
+									: 'Start'}
 						</Button>
 					{/snippet}
 				</PromptField>

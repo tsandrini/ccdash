@@ -67,10 +67,18 @@ every other one is found under **Sessions › Past**.
 
 Resumed as it was, a background session of the same machine goes on under
 its own id. Pick another model, effort or permission mode and Claude Code
-continues it as a copy under a new id, on those; the old one stays. That
-is also how a session changes its model or effort from the panel: a
-running session takes neither from outside, only `/model` and `/effort`
-typed into it.
+continues it as a copy under a new id, on those; the old one stays.
+
+A running session takes no other model or effort from outside, only
+`/model` and `/effort` typed into it. For a background session the panel
+does the next best thing in one step: **Switch model & effort…** in its
+Actions menu asks for the two and the next prompt, says what it is about
+to do, and on **Stop and switch** the hub stops the session
+(`claude stop`) and continues its conversation as a copy on what you
+picked. A turn in progress is cut off. If the stop fails nothing changes;
+if the copy fails to start, the session stays stopped and the same sheet
+(or **Resume…** on its page) starts it. A session in a terminal is not
+offered this: change it there.
 
 ### Finding it: Sessions › Past
 

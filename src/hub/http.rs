@@ -62,7 +62,7 @@ use crate::{
     },
     machine::PowerAction,
     messages,
-    model::{Activity, LaunchTarget, Session, Snapshot, TargetWorkspace},
+    model::{Activity, Kind, LaunchTarget, Session, Snapshot, TargetWorkspace},
     paths,
     push::{self, Push},
     store::{self, Store},
@@ -591,6 +591,11 @@ pub(crate) struct LaunchBody {
     #[serde(default)]
     #[ts(optional)]
     resume: Option<String>,
+    /// `resume` may still be running: a background session is stopped
+    /// first, then continued (as a copy, when anything about it changes).
+    #[serde(default)]
+    #[ts(optional)]
+    restart: Option<bool>,
     /// An open issue of the workspace the session is started for: it
     /// claims it as soon as it reports, so the board shows it working.
     #[serde(default)]
@@ -599,7 +604,8 @@ pub(crate) struct LaunchBody {
 }
 
 /// Starts a background session at the workspace's directory under a known
-/// project, or continues an ended one; `202 { launch }`, followed by
+/// project, or continues an ended one (with `restart`, a running background
+/// one, stopped first); `202 { launch }`, followed by
 /// `launch` updates on the stream. The directory is the workspace's (the
 /// harness and direnv live there), never the client's; the project is the
 /// session's label.
@@ -642,14 +648,31 @@ async fn launch(
         .dir(&body.workspace)
         .ok_or_else(|| refuse(format!("unknown workspace {:?}", body.workspace)))?
         .to_owned();
+    // The running session to stop before it is continued.
+    let mut restart = None;
     let (cwd, resume) = match &body.resume {
         Some(key) => {
             let live = app.hub.resolve(key).await?;
-            if live.as_ref().is_some_and(|s| s.activity != Activity::Gone) {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    "the session is still running".into(),
-                ));
+            if let Some(s) = live.as_ref().filter(|s| s.activity != Activity::Gone) {
+                if body.restart != Some(true) {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "the session is still running".into(),
+                    ));
+                }
+                if s.kind != Kind::Background {
+                    return Err(refuse(
+                        "only a background session restarts from here: change it in its terminal"
+                            .into(),
+                    ));
+                }
+                if s.host != body.host {
+                    return Err(refuse(format!(
+                        "the session runs on {}: it restarts there",
+                        s.host
+                    )));
+                }
+                restart = Some(s.id.clone());
             }
             let s = match live {
                 Some(s) => s,
@@ -721,6 +744,26 @@ async fn launch(
         Some(slug) => Some(open_issue(&app, &body.workspace, slug).await?),
         None => None,
     };
+    // NOTE: last, so a refused request leaves the session running
+    if let Some(id) = restart {
+        tokio::time::timeout(
+            STOP_WAIT,
+            app.hub.session_cmd(|reply| Cmd::Stop { key: id, reply }),
+        )
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                "the host did not answer the stop: the session was not restarted".into(),
+            )
+        })??
+        .map_err(|e| {
+            ApiError(
+                StatusCode::CONFLICT,
+                format!("the session was not stopped, so nothing changed: {e}"),
+            )
+        })?;
+    }
     let launch = app
         .hub
         .launch(LaunchReq {
