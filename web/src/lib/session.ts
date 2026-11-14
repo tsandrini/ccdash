@@ -29,6 +29,32 @@ export const shown = (s: Session): Shown =>
 export const barActivity = (s: Session): Activity =>
 	shown(s) === 'finished' ? 'idle' : s.activity;
 
+/**
+ * An ended session whose conversation goes on in a copy that is listed
+ * too: the lists leave it to that one, whose chat starts with its part.
+ *
+ * @param s - The session.
+ * @param listed - The ids of the sessions the list shows.
+ * @returns Whether the list leaves it out.
+ */
+export const folded = (s: Session, listed: Set<string>) =>
+	s.activity === 'gone' && s.continued_as !== null && listed.has(s.continued_as);
+
+/**
+ * How the session `s` is linked to is named beside it: by its title when
+ * that tells the two apart (a copy takes the title over), else by its id.
+ *
+ * @param s - The session the link is shown on.
+ * @param other - The linked session, when the panel has it.
+ * @param id - The linked session's id.
+ * @returns The name to show.
+ *
+ * @example
+ * linkName(copy, undefined, '94f90b09-83ae-…') // 'session 94f90b09'
+ */
+export const linkName = (s: Session, other: Session | undefined, id: string) =>
+	other && label(other) !== label(s) ? label(other) : `session ${id.slice(0, 8)}`;
+
 export const children = (all: Iterable<Session>, s: Session) =>
 	[...all].filter((c) => c.parent === s.id && c.activity !== 'gone');
 
@@ -70,6 +96,7 @@ export type Groups = {
 /** The sessions in the groups the pages show, each sorted by attention. */
 export function group(sessions: Session[]): Groups {
 	const all = sessions.filter((s) => !stub(s)).sort(byAttention);
+	const listed = new Set(all.map((s) => s.id));
 	const mine = all.filter((s) => !isAgent(s));
 	const agents = all.filter(isAgent);
 	return {
@@ -79,7 +106,7 @@ export function group(sessions: Session[]): Groups {
 		parked: mine.filter((s) => s.activity === 'parked'),
 		idle: mine.filter((s) => s.activity === 'idle'),
 		agents: agents.filter((s) => s.activity !== 'gone' && s.activity !== 'permission'),
-		gone: all.filter((s) => s.activity === 'gone')
+		gone: all.filter((s) => s.activity === 'gone' && !folded(s, listed))
 	};
 }
 
@@ -160,7 +187,8 @@ export const signature = (s: Session) =>
 		s.inbox?.length,
 		s.claim?.since,
 		s.outbox?.length,
-		s.interrupting
+		s.interrupting,
+		s.continues
 	].join('|');
 
 /** The session's workspace name and project directory, for headers. */

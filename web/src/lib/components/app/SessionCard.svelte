@@ -1,12 +1,13 @@
 <script lang="ts">
-	// A session in a list: state, title, where (with the branch), what it
-	// is doing, claim, inbox, a resolved mark, meta, the last hour; its
-	// Actions menu beside the link.
+	// A session in a list: state, title, where (with the branch), the
+	// session it continues as a copy (or was continued as), what it is
+	// doing, claim, inbox, a resolved mark, meta, the last hour; its Actions
+	// menu beside the link.
 	import { resolvedNote } from '#lib/actions.js';
 	import type { Lane, Session } from '#lib/api/types.js';
 	import { fmtBytes, fmtDuration, fmtUsd, known, plain, plural, toolTitle } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
-	import { children, claimPaths, isAgent, label, quietFor, shown } from '#lib/session.js';
+	import { children, claimPaths, isAgent, label, linkName, quietFor, shown } from '#lib/session.js';
 	import Clock from './Clock.svelte';
 	import Meter from './Meter.svelte';
 	import SessionActions from './SessionActions.svelte';
@@ -82,6 +83,16 @@
 				>{parent
 					? `Started by ${label(parent)}`
 					: `Started by session ${s.parent?.slice(0, 8)}`}</span
+			>
+		{/if}
+		{#if s.continues}
+			<span class="text-xs text-muted-foreground"
+				>Continues {linkName(s, live.sessions.get(s.continues), s.continues)} as a copy</span
+			>
+		{/if}
+		{#if s.continued_as}
+			<span class="text-xs text-muted-foreground"
+				>Continued as {linkName(s, live.sessions.get(s.continued_as), s.continued_as)}</span
 			>
 		{/if}
 		{#if s.asleep}

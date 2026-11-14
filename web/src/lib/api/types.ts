@@ -486,7 +486,12 @@ task?: TaskNotification,
 /**
  * What started the exchange instead of a prompt: a subagent's message.
  */
-agent?: AgentMessage, items: Array<Item>, 
+agent?: AgentMessage, 
+/**
+ * The earlier session the exchange happened in, in the chat of a
+ * session that continues it as a copy.
+ */
+session?: string, items: Array<Item>, 
 /**
  * Oldest tool calls left out of `items` in very long exchanges.
  */
@@ -747,7 +752,20 @@ command?: string,
 /**
  * A Bash call's output, or a failed call's error, capped by the hub.
  */
-output?: string, } | { "kind": "permission", id: number, at: number, tool: string, summary: string, } | { "kind": "answered", id: number, at: number, tool: string, action: string, via: string, } | { "kind": "message", id: number, at: number, html: string, } | { "kind": "reply", id: number, at: number, html: string, } | { "kind": "error", id: number, at: number, error: string, } | { "kind": "subagent", id: number, at: number, agent_type: string, description: string | null, ms: number | null, tools: number | null, html: string, } | { "kind": "compact", id: number, at: number, trigger: string | null, html: string, } | { "kind": "task", id: number, at: number, subject: string, status: string, } | { "kind": "start", id: number, at: number, source: string, } | { "kind": "end", id: number, at: number, reason: string, } | { "kind": "interrupted", id: number, at: number, } | { "kind": "report", id: number, at: number, workspace: string, slug: string, title: string, 
+output?: string, } | { "kind": "permission", id: number, at: number, tool: string, summary: string, } | { "kind": "answered", id: number, at: number, tool: string, action: string, via: string, } | { "kind": "message", id: number, at: number, html: string, } | { "kind": "reply", id: number, at: number, html: string, } | { "kind": "error", id: number, at: number, error: string, } | { "kind": "subagent", id: number, at: number, agent_type: string, description: string | null, ms: number | null, tools: number | null, html: string, } | { "kind": "compact", id: number, at: number, trigger: string | null, html: string, } | { "kind": "task", id: number, at: number, subject: string, status: string, } | { "kind": "start", id: number, at: number, source: string, } | { "kind": "end", id: number, at: number, reason: string, } | { "kind": "continued", id: number, at: number, session: string, 
+/**
+ * The earlier session's title; none without one.
+ */
+title: string | null, 
+/**
+ * The store has the earlier session, so its page opens.
+ */
+known: boolean, 
+/**
+ * What the earlier session ran on and what the copy started on,
+ * as far as the hub knew then.
+ */
+from_model: string | null, from_effort: string | null, model: string | null, effort: string | null, } | { "kind": "interrupted", id: number, at: number, } | { "kind": "report", id: number, at: number, workspace: string, slug: string, title: string, 
 /**
  * An earlier report under the slug was replaced.
  */
@@ -1251,7 +1269,9 @@ model: string | null, branch: string | null, version: string | null,
  */
 entrypoint: string | null, cost_usd: number | null, lines_added: number | null, lines_removed: number | null, 
 /**
- * The session it was continued in (a copy under a new id).
+ * The session it was continued in (a copy under a new id): Claude
+ * Code's mark in the transcript, else the link the hub made when one
+ * of its resumes came back as a copy.
  */
 continued_in: string | null, 
 /**
@@ -1485,7 +1505,17 @@ short_id: string | null, kind: Kind,
 /**
  * Session that started this one (a fork, or `claude --bg` run by Claude).
  */
-parent: string | null, pid: number | null, cwd: string, 
+parent: string | null, 
+/**
+ * The session whose conversation this one continues: Claude Code
+ * resumed it as a copy under a new id (other options, or it was still
+ * running). The chat shows that session's part first.
+ */
+continues: string | null, 
+/**
+ * The newest session that continues this one as a copy.
+ */
+continued_as: string | null, pid: number | null, cwd: string, 
 /**
  * Configured workspace holding `cwd`.
  */

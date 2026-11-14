@@ -190,6 +190,7 @@ fn builds_lists_and_searches() {
     assert_eq!(a.cost_usd, Some(0.5));
     assert_eq!(a.model.as_deref(), Some("claude-opus-5-5"));
     assert!(!a.known);
+    assert_eq!(a.continued_in, None);
     // NOTE: the store first saw B on flat; the hub took its transcript from navi
     let b = &page.sessions[0];
     assert_eq!(
@@ -257,6 +258,18 @@ fn builds_lists_and_searches() {
         ..q("")
     });
     assert_eq!(page.total, 0);
+
+    // a resume the hub ran came back as a copy: no mark in the transcript, the hub's link
+    f.store
+        .execute(
+            "INSERT INTO sessions (id, host, cwd, kind, started_at, continues)
+                VALUES ('the-copy', 'navi', '/home/me/w/proj', 'background', 9, ?1)",
+            params![A],
+        )
+        .unwrap();
+    let page = f.list(q(""));
+    let a = page.sessions.iter().find(|s| s.id == A).unwrap();
+    assert_eq!(a.continued_in.as_deref(), Some("the-copy"));
 }
 
 #[test]

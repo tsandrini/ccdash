@@ -102,7 +102,9 @@ pub struct PastSession {
     pub cost_usd: Option<f64>,
     pub lines_added: Option<i64>,
     pub lines_removed: Option<i64>,
-    /// The session it was continued in (a copy under a new id).
+    /// The session it was continued in (a copy under a new id): Claude
+    /// Code's mark in the transcript, else the link the hub made when one
+    /// of its resumes came back as a copy.
     pub continued_in: Option<String>,
     /// It runs now: go to it rather than resume it.
     pub open: bool,
@@ -602,7 +604,10 @@ const SESSION: &str = "SELECT c.n, c.id, COALESCE(c.cwd, ''), COALESCE(c.first_a
     COALESCE(c.last_at, 0), c.size, c.custom_title, c.ai_title, c.summary, c.recap,
     c.first_prompt, c.last_prompt, c.last_reply, c.prompts, c.replies, c.tools, c.active_ms,
     c.compactions, c.models, c.branch, c.version, c.entrypoint, c.cost_usd, c.lines_added,
-    c.lines_removed, c.continued_in, COALESCE(c.host, ''), s.project, s.title, s.id IS NOT NULL,
+    c.lines_removed,
+    COALESCE(c.continued_in, (SELECT k.id FROM store.sessions k WHERE k.continues = c.id
+        ORDER BY k.started_at DESC, k.id LIMIT 1)),
+    COALESCE(c.host, ''), s.project, s.title, s.id IS NOT NULL,
     (SELECT group_concat(h.host, char(31)) FROM catalog_hosts h WHERE h.session = c.n)
     FROM catalog c LEFT JOIN store.sessions s ON s.id = c.id";
 

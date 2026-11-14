@@ -5,7 +5,7 @@
 	import type { Item, Session } from '#lib/api/types.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { fmtStamp } from '#lib/format.js';
-	import { busy, notice } from '#lib/session.js';
+	import { busy, label, notice } from '#lib/session.js';
 	import ConvItem from './ConvItem.svelte';
 	import LiveBlock from './LiveBlock.svelte';
 	import MessageItem from './MessageItem.svelte';
@@ -132,7 +132,7 @@
 								i === parts(ex.items, ex.omitted).length - 1}
 						/>
 					{:else}
-						<ConvItem item={part.item} isLastReply={part.item.id === lastReply} />
+						<ConvItem item={part.item} isLastReply={part.item.id === lastReply} own={label(s)} />
 					{/if}
 				{/each}
 			</section>

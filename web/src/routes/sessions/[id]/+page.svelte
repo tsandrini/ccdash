@@ -3,7 +3,9 @@
 	// branch, context, cost, Open in Claude, Open on and Resolved with the
 	// other actions in a menu), Chat / Shell / Details, the open asks pinned
 	// above the composer; an ended session (also one only history still
-	// knows) offers Resume.
+	// knows) offers Resume. A session that continues another as a copy, or
+	// was continued as one, links to it; its chat starts with the earlier
+	// session's part.
 	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import ArrowDownIcon from '@lucide/svelte/icons/arrow-down';
@@ -28,7 +30,7 @@
 	import { Convo } from '#lib/components/session/convo.svelte.js';
 	import { fmtStamp, fmtUsd, known } from '#lib/format.js';
 	import { live } from '#lib/live/store.svelte.js';
-	import { claimPaths, isAgent, label, signature, shown } from '#lib/session.js';
+	import { claimPaths, isAgent, label, linkName, signature, shown } from '#lib/session.js';
 	import { resumableSession, starter } from '#lib/starter.svelte.js';
 
 	const id = $derived(page.params.id!);
@@ -130,6 +132,9 @@
 		{#if convo.missing || live.ready}
 			No session {id.slice(0, 8)} is known to the hub (it may have ended before the hub restarted).
 			<a class="underline" href="/sessions">All sessions</a>
+			{#if id.length === 36}
+				· <a class="underline" href="/sessions/past?id={id}">Look for it in Past</a>
+			{/if}
 		{:else}
 			Loading…
 		{/if}
@@ -221,6 +226,20 @@
 						>{:else}Started by session {s.parent?.slice(0, 8)}{/if}
 				</p>
 			{/if}
+			{#if s.continues}
+				<p class="text-xs text-muted-foreground">
+					Continues <a class="underline" href="/sessions/{s.continues}"
+						>{linkName(s, live.sessions.get(s.continues), s.continues)}</a
+					> as a copy: the chat starts with that session's part.
+				</p>
+			{/if}
+			{#if s.continued_as}
+				<p class="text-xs text-muted-foreground">
+					Continued as <a class="underline" href="/sessions/{s.continued_as}"
+						>{linkName(s, live.sessions.get(s.continued_as), s.continued_as)}</a
+					>, a copy: the conversation goes on there.
+				</p>
+			{/if}
 			{#if s.asleep}
 				<p class="text-xs text-muted-foreground">
 					Asleep: Claude Code stopped its idle process. A message restarts it from its saved
@@ -274,17 +293,24 @@
 			<footer class="border-t bg-background px-3 py-2 sm:px-4">
 				<div class="mx-auto flex w-full max-w-3xl flex-wrap items-center gap-2">
 					<p class="text-xs text-muted-foreground">
-						Ended {fmtStamp(s.activity_since)}.{s.workspace
-							? ` Resume it in the background, on ${s.host} or another machine.`
-							: ' It ran outside every workspace, so it cannot be resumed from here.'}
+						Ended {fmtStamp(s.activity_since)}.{s.continued_as
+							? ' The conversation goes on in a copy; resuming this one starts another.'
+							: s.workspace
+								? ` Resume it in the background, on ${s.host} or another machine.`
+								: ' It ran outside every workspace, so it cannot be resumed from here.'}
 					</p>
-					{#if s.workspace}
-						<Button
-							size="sm"
-							class="ml-auto"
-							onclick={() => starter.show({ resume: resumableSession(s) })}>Resume…</Button
-						>
-					{/if}
+					<span class="ml-auto flex items-center gap-2">
+						{#if s.workspace}
+							<Button
+								size="sm"
+								variant={s.continued_as ? 'outline' : 'default'}
+								onclick={() => starter.show({ resume: resumableSession(s) })}>Resume…</Button
+							>
+						{/if}
+						{#if s.continued_as}
+							<Button size="sm" href="/sessions/{s.continued_as}">Open the copy</Button>
+						{/if}
+					</span>
 				</div>
 			</footer>
 		{:else if s.asks.length || (s.hooked && !isAgent(s)) || s.channel || s.asleep}

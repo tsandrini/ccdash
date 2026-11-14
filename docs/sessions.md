@@ -69,6 +69,17 @@ Resumed as it was, a background session of the same machine goes on under
 its own id. Pick another model, effort or permission mode and Claude Code
 continues it as a copy under a new id, on those; the old one stays.
 
+A copy is the same conversation under another id, and the panel shows it
+as one. The copy takes the title over, and its chat starts with the
+earlier session's part: a line marks where it went on, with the model and
+effort on either side when they changed (`Opus 5.5 → Fable 5.2`) and a
+link to the earlier session. Its header and card say what it continues;
+the earlier session's say what it was continued as, and its page offers
+**Open the copy**. An ended session leaves the **Ended** list to its copy,
+and Past marks it **continued**. Cost, context, the process and Kill stay
+each session's own, and a session that was copied while it ran goes on by
+itself: the copy's chat shows it up to the moment of the copy.
+
 A running session takes no other model or effort from outside, only
 `/model` and `/effort` typed into it. For a background session the panel
 does the next best thing in one step: **Switch model & effort…** in its

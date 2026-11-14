@@ -148,6 +148,11 @@ pub enum StoreMsg {
         launched: bool,
         /// The explicit project (None leaves a stored one alone).
         project: Option<String>,
+        /// The session it continues as a copy (None leaves a stored one alone).
+        continues: Option<String>,
+        /// What it runs on (None leaves a stored one alone).
+        model: Option<String>,
+        effort: Option<String>,
     },
     /// A scoped limit read from `/usage`.
     Limit {
@@ -193,6 +198,22 @@ pub struct Effects {
     pub close: Vec<String>,
 }
 
+/// The model and effort a session runs (or ran) on, as far as the hub knows.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RanOn {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl From<&Session> for RanOn {
+    fn from(s: &Session) -> Self {
+        Self {
+            model: s.model.clone(),
+            effort: s.effort.clone(),
+        }
+    }
+}
+
 /// Persisted fields used to refill a session first seen after a daemon restart.
 #[derive(Debug, Default)]
 pub struct Restored {
@@ -211,6 +232,11 @@ pub struct Restored {
     pub resolved: Option<Resolved>,
     /// The explicit project, when one was set.
     pub project: Option<String>,
+    /// The session it continues as a copy, and the newest that continues it.
+    pub continues: Option<String>,
+    pub continued_as: Option<String>,
+    /// What it last ran on: a hub restart keeps it until the next hook.
+    pub ran_on: RanOn,
 }
 
 #[derive(Debug, Default)]
@@ -373,6 +399,10 @@ impl State {
             s.branch = s.branch.take().or(saved.branch);
             s.launched |= saved.launched;
             s.resolved = s.resolved.or(saved.resolved);
+            s.continues = s.continues.take().or(saved.continues);
+            s.continued_as = s.continued_as.take().or(saved.continued_as);
+            s.model = s.model.take().or(saved.ran_on.model);
+            s.effort = s.effort.take().or(saved.ran_on.effort);
             if !s.project_pinned
                 && let Some(project) = saved.project
             {
@@ -436,6 +466,50 @@ impl State {
     /// Waking it made a copy, which goes on under its own id.
     pub fn replaced(&mut self, id: &str, now: i64, fx: &mut Effects) {
         self.mark_gone(id, now, "copied", fx);
+    }
+
+    /// Links `id` to the session it continues as a copy and marks the seam
+    /// in its chat, with what `from` ran on (when the hub still knew) and
+    /// what the copy starts on. False when `id` is unknown or already
+    /// continues a session.
+    pub fn continues(&mut self, id: &str, from: &str, ran_on: &RanOn, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if s.continues.is_some() || id == from {
+            return false;
+        }
+        s.continues = Some(from.to_owned());
+        // NOTE: stamped with the copy's start (its host's clock, like its prompts), so it leads its chat
+        record(
+            &mut fx.store,
+            s.started_at,
+            id,
+            "continues",
+            json!({
+                "session": from,
+                "from_model": ran_on.model,
+                "from_effort": ran_on.effort,
+                "model": s.model,
+                "effort": s.effort,
+            }),
+        );
+        fx.store.push(session_row(s, None));
+        fx.touched.insert(id.to_owned());
+        true
+    }
+
+    /// Notes `copy` as the session that continues `id`; false when `id`
+    /// is not one of this host's.
+    pub fn continued_as(&mut self, id: &str, copy: &str, fx: &mut Effects) -> bool {
+        let Some(s) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        if s.continued_as.as_deref() != Some(copy) {
+            s.continued_as = Some(copy.to_owned());
+            fx.touched.insert(id.to_owned());
+        }
+        true
     }
 
     /// The owner's reply is on its way to a sleeping session as the prompt
@@ -524,6 +598,7 @@ impl State {
         let aux = self.aux.entry(id.to_owned()).or_default();
         aux.last_hook_at = ts;
         let s = self.sessions.get_mut(id).expect("ensured above");
+        let ran_on = RanOn::from(&*s);
         s.hooked = true;
         s.last_event_at = ts;
         if let Some(pid) = env.pid {
@@ -989,6 +1064,11 @@ impl State {
             }
             _ => {}
         }
+        if let Some(s) = self.sessions.get(id)
+            && ran_on != RanOn::from(s)
+        {
+            fx.store.push(session_row(s, None));
+        }
         if close {
             fx.close.push(id.to_owned());
         }
@@ -1044,8 +1124,15 @@ impl State {
             s.title = title;
             fx.store.push(session_row(s, None));
         }
+        let ran_on = RanOn::from(&*s);
         if let Some(model) = p.pointer("/model/display_name").and_then(Value::as_str) {
             s.model = Some(model.to_owned());
+        }
+        if let Some(effort) = p.get("effort").and_then(effort_of) {
+            s.effort = Some(effort);
+        }
+        if ran_on != RanOn::from(&*s) {
+            fx.store.push(session_row(s, None));
         }
         s.context_pct = p
             .pointer("/context_window/used_percentage")
@@ -1624,6 +1711,8 @@ impl State {
             short_id: None,
             kind: Kind::Interactive,
             parent: None,
+            continues: None,
+            continued_as: None,
             pid: None,
             cwd: cwd.unwrap_or_default().to_owned(),
             workspace: cwd.and_then(|cwd| self.workspaces.of(cwd)),
@@ -1916,10 +2005,15 @@ fn round_mib(bytes: u64) -> u64 {
     (bytes + MIB / 2) / MIB * MIB
 }
 
+/// A hook's `effort`: `{"level": "xhigh"}` (Claude Code 2.1), or the bare level.
 fn effort_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
+        Value::Object(o) => o
+            .get("level")
+            .filter(|l| !l.is_object())
+            .and_then(effort_of),
         _ => None,
     }
 }
@@ -2111,6 +2205,9 @@ fn session_row(s: &Session, ended_at: Option<i64>) -> StoreMsg {
         branch: s.branch.clone(),
         launched: s.launched,
         project: s.project.clone().filter(|_| s.project_pinned),
+        continues: s.continues.clone(),
+        model: s.model.clone(),
+        effort: s.effort.clone(),
     }
 }
 
@@ -3977,5 +4074,127 @@ mod tests {
         assert_eq!(claude_title("◐ Fix it"), Some("Fix it"));
         assert_eq!(claude_title("~/P/repo"), None);
         assert_eq!(claude_title("Čtení"), None);
+    }
+
+    #[test]
+    fn what_a_session_runs_on_is_stored_when_it_changes() {
+        let rows = |fx: &Effects| -> Vec<(Option<String>, Option<String>)> {
+            fx.store
+                .iter()
+                .filter_map(|m| match m {
+                    StoreMsg::Session { model, effort, .. } => {
+                        Some((model.clone(), effort.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let on = |model: &str, effort: &str| (Some(model.to_owned()), Some(effort.to_owned()));
+        let mut st = state();
+        let fx = hook(
+            &mut st,
+            1,
+            "SessionStart",
+            json!({"source": "startup", "model": "claude-opus-5-5", "effort": {"level": "high"}}),
+        );
+        assert_eq!(rows(&fx).last(), Some(&on("claude-opus-5-5", "high")));
+        let fx = hook(
+            &mut st,
+            2,
+            "UserPromptSubmit",
+            json!({"prompt": "go", "effort": {"level": "high"}}),
+        );
+        assert!(rows(&fx).is_empty(), "nothing changed");
+        let fx = hook(
+            &mut st,
+            3,
+            "PreToolUse",
+            json!({"tool_name": "Read", "effort": {"level": "max"}}),
+        );
+        assert_eq!(rows(&fx), [on("claude-opus-5-5", "max")], "`/effort max`");
+        let fx = statusline(&mut st, 4, "T");
+        assert_eq!(
+            rows(&fx).last(),
+            Some(&on("Haiku 5.5", "max")),
+            "the statusline's name for the model"
+        );
+
+        // a hub restart: as stored, until a hook says otherwise
+        let mut st = state();
+        hook(&mut st, 20, "PostToolUse", json!({"tool_name": "Read"}));
+        assert_eq!(session(&st).model, None);
+        st.restore(
+            SID,
+            Restored {
+                ran_on: RanOn {
+                    model: Some("Haiku 5.5".into()),
+                    effort: Some("max".into()),
+                },
+                ..Restored::default()
+            },
+        );
+        let s = session(&st);
+        assert_eq!(
+            (s.model.as_deref(), s.effort.as_deref()),
+            (Some("Haiku 5.5"), Some("max"))
+        );
+    }
+
+    #[test]
+    fn a_copy_is_linked_to_the_session_it_continues() {
+        let mut st = state();
+        hook(
+            &mut st,
+            100,
+            "SessionStart",
+            // the hook's own shape for the effort
+            json!({"source": "resume", "model": "claude-fable-5-2", "effort": {"level": "xhigh"}}),
+        );
+        let ran_on = RanOn {
+            model: Some("Opus 5.5".into()),
+            effort: Some("high".into()),
+        };
+        let mut fx = Effects::default();
+        assert!(st.continues(SID, "old", &ran_on, &mut fx));
+        assert_eq!(session(&st).continues.as_deref(), Some("old"));
+        let seam = fx.store.iter().find_map(|m| match m {
+            StoreMsg::Event {
+                ts,
+                kind: "continues",
+                data,
+                ..
+            } => Some((*ts, data.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            seam,
+            Some((
+                100,
+                json!({
+                    "session": "old",
+                    "from_model": "Opus 5.5",
+                    "from_effort": "high",
+                    "model": "claude-fable-5-2",
+                    "effort": "xhigh",
+                })
+            )),
+            "at the copy's start, with what each side ran on"
+        );
+        assert!(fx.store.iter().any(
+            |m| matches!(m, StoreMsg::Session { continues: Some(from), .. } if from == "old")
+        ));
+        assert!(fx.touched.contains(SID));
+
+        // one link per copy, and never to itself or for a stranger
+        let mut fx = Effects::default();
+        assert!(!st.continues(SID, "other", &ran_on, &mut fx));
+        assert!(!st.continues("nobody", "old", &ran_on, &mut fx));
+        assert!(fx.store.is_empty() && fx.touched.is_empty());
+        assert_eq!(session(&st).continues.as_deref(), Some("old"));
+
+        assert!(st.continued_as(SID, "copy", &mut fx));
+        assert_eq!(session(&st).continued_as.as_deref(), Some("copy"));
+        assert!(fx.touched.contains(SID));
+        assert!(!st.continued_as("nobody", "copy", &mut fx));
     }
 }

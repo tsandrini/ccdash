@@ -22,7 +22,7 @@ use crate::{
     agent_message, claims, knowledge, messages,
     model::{Activity, HostStatus, Kind, Resolved, Session, Stamped, Turn},
     paths, push,
-    state::{PREVIEW_LEN, Restored, StoreMsg, apply_task},
+    state::{PREVIEW_LEN, RanOn, Restored, StoreMsg, apply_task},
     task_notification, tokens,
     util::{now_ms, truncate},
     workspace::Workspaces,
@@ -117,12 +117,15 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("sessions", "launched", "INTEGER"),
     ("sessions", "project", "TEXT"),
     ("push_subscriptions", "categories", "TEXT"),
+    ("sessions", "continues", "TEXT"),
+    ("sessions", "model", "TEXT"),
+    ("sessions", "effort", "TEXT"),
 ];
 
 const UPSERT_SESSION: &str = "
 INSERT INTO sessions (id, host, cwd, name, title, kind, started_at, ended_at, branch, launched,
-    project)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+    project, continues, model, effort)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
 ON CONFLICT (id) DO UPDATE SET
     cwd = excluded.cwd,
     name = COALESCE(excluded.name, name),
@@ -131,7 +134,10 @@ ON CONFLICT (id) DO UPDATE SET
     ended_at = excluded.ended_at,
     branch = COALESCE(excluded.branch, branch),
     launched = MAX(COALESCE(launched, 0), excluded.launched),
-    project = excluded.project
+    project = excluded.project,
+    continues = COALESCE(excluded.continues, continues),
+    model = COALESCE(excluded.model, model),
+    effort = COALESCE(excluded.effort, effort)
 ";
 
 const UPSERT_HOST: &str = "
@@ -143,7 +149,7 @@ const PRUNE_EVERY_MS: i64 = 3_600_000;
 
 /// Work for the writer thread.
 enum Job {
-    Msg(String, StoreMsg),
+    Msg(String, Box<StoreMsg>),
     /// Runs on the writer connection, between batches.
     Exec(Box<dyn FnOnce(&mut Connection) + Send>),
 }
@@ -171,7 +177,7 @@ impl Store {
 
     /// Queues `msg`, which came from `host`.
     pub fn send(&self, host: &str, msg: StoreMsg) {
-        let _ = self.tx.send(Job::Msg(host.to_owned(), msg));
+        let _ = self.tx.send(Job::Msg(host.to_owned(), Box::new(msg)));
     }
 
     /// Runs `f` on the writer connection (the one place that writes) and
@@ -218,6 +224,13 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    create(&conn)?;
+    Ok(conn)
+}
+
+/// Creates what is missing of the store's tables and brings the stored
+/// data up to date.
+fn create(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(knowledge::SCHEMA)?;
     conn.execute_batch(push::SCHEMA)?;
@@ -227,9 +240,17 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     conn.execute_batch(crate::drafts::SCHEMA)?;
     conn.execute_batch(crate::sync::hub::SCHEMA)?;
     conn.execute_batch(crate::workspace::hub::SCHEMA)?;
-    migrate(&conn)?;
-    rewrite(&conn)?;
-    Ok(conn)
+    migrate(conn)?;
+    rewrite(conn)
+}
+
+/// An in-memory store with every table as an open one has it (the columns
+/// added since the first release too), for tests of the queries over it.
+#[cfg(test)]
+pub(crate) fn memory() -> Connection {
+    let conn = Connection::open_in_memory().expect("an in-memory database");
+    create(&conn).expect("the store's tables");
+    conn
 }
 
 fn writer(mut conn: Connection, rx: mpsc::Receiver<Job>, retention_ms: i64) {
@@ -238,7 +259,7 @@ fn writer(mut conn: Connection, rx: mpsc::Receiver<Job>, retention_ms: i64) {
         let mut batch: Vec<(String, StoreMsg)> = Vec::new();
         for job in std::iter::once(first).chain(rx.try_iter()) {
             match job {
-                Job::Msg(host, msg) => batch.push((host, msg)),
+                Job::Msg(host, msg) => batch.push((host, *msg)),
                 Job::Exec(f) => {
                     if let Err(e) = write_batch(&mut conn, &batch) {
                         warn!("store: {e:#}");
@@ -346,6 +367,9 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                 branch,
                 launched,
                 project,
+                continues,
+                model,
+                effort,
             } => {
                 tx.execute(
                     UPSERT_SESSION,
@@ -360,7 +384,10 @@ fn write_batch(conn: &mut Connection, batch: &[(String, StoreMsg)]) -> Result<()
                         ended_at,
                         branch,
                         launched,
-                        project
+                        project,
+                        continues,
+                        model,
+                        effort
                     ],
                 )?;
             }
@@ -597,9 +624,10 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
             })
         }))
     };
-    let (title, started_at, branch, launched, project) = conn
+    let (title, started_at, branch, launched, project, continues, ran_on) = conn
         .query_row(
-            "SELECT title, started_at, branch, COALESCE(launched, 0), project
+            "SELECT title, started_at, branch, COALESCE(launched, 0), project, continues,
+                    model, effort
                 FROM sessions WHERE id = ?1",
             [session],
             |r| {
@@ -609,11 +637,16 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, bool>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    RanOn {
+                        model: r.get(6)?,
+                        effort: r.get(7)?,
+                    },
                 ))
             },
         )
         .optional()?
-        .unwrap_or((None, None, None, false, None));
+        .unwrap_or_default();
     let hooked = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND kind != 'activity')",
         [session],
@@ -645,9 +678,42 @@ pub fn restored(conn: &Connection, session: &str) -> Result<Restored> {
         launched,
         resolved: last_resolved(&conn, session)?,
         project,
+        continues,
+        continued_as: continued_as(&conn, session)?,
+        ran_on,
     };
     conn.finish()?;
     Ok(restored)
+}
+
+/// What the store keeps of a session to name it beside another: its title
+/// (its name without one) and what it last ran on. None when the store
+/// never had the session.
+pub fn brief(conn: &Connection, session: &str) -> Result<Option<(Option<String>, RanOn)>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT COALESCE(NULLIF(title, ''), name), model, effort FROM sessions WHERE id = ?1",
+        )?
+        .query_row([session], |r| {
+            Ok((
+                r.get(0)?,
+                RanOn {
+                    model: r.get(1)?,
+                    effort: r.get(2)?,
+                },
+            ))
+        })
+        .optional()?)
+}
+
+/// The newest session that continues `session` as a copy.
+pub fn continued_as(conn: &Connection, session: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT id FROM sessions WHERE continues = ?1 ORDER BY started_at DESC, id LIMIT 1",
+        )?
+        .query_row([session], |r| r.get(0))
+        .optional()?)
 }
 
 /// The resolved mark the session still carries, as the reducer would
@@ -776,6 +842,10 @@ pub fn ended_session(
     session.tasks = saved.tasks;
     session.branch = saved.branch;
     session.launched = saved.launched;
+    session.continues = saved.continues;
+    session.continued_as = saved.continued_as;
+    session.model = saved.ran_on.model;
+    session.effort = saved.ran_on.effort;
     session.started_at = started_at;
     session.last_event_at = last;
     Ok(Some(session))
@@ -990,6 +1060,9 @@ mod tests {
                 branch: Some("main".into()),
                 launched: true,
                 project: Some("q".into()),
+                continues: Some("s0".into()),
+                model: Some("Opus 5.5".into()),
+                effort: None,
             },
         );
         store.send(
@@ -1005,6 +1078,9 @@ mod tests {
                 branch: None,
                 launched: false,
                 project: Some("q".into()),
+                continues: None,
+                model: None,
+                effort: Some("xhigh".into()),
             },
         );
         for (dt, kind, data) in [
@@ -1102,6 +1178,26 @@ mod tests {
         assert_eq!(saved.branch.as_deref(), Some("main"));
         assert!(saved.launched);
         assert_eq!(saved.project.as_deref(), Some("q"));
+        assert_eq!(
+            saved.continues.as_deref(),
+            Some("s0"),
+            "a later row without the link leaves it"
+        );
+        assert_eq!(saved.continued_as, None);
+        assert_eq!(
+            saved.ran_on,
+            RanOn {
+                model: Some("Opus 5.5".into()),
+                effort: Some("xhigh".into()),
+            },
+            "each as last known"
+        );
+        assert_eq!(
+            brief(&reader, "s1").unwrap(),
+            Some((Some("Fix it".into()), saved.ran_on.clone()))
+        );
+        assert_eq!(brief(&reader, "s0").unwrap(), None);
+        assert_eq!(continued_as(&reader, "s0").unwrap().as_deref(), Some("s1"));
 
         let workspaces = Workspaces::new(&["/w".into()], "/home");
         let ended = ended_session(&reader, "s", &workspaces).unwrap().unwrap();
@@ -1119,6 +1215,11 @@ mod tests {
         assert!(ended.project_pinned);
         assert_eq!(ended.prompt.unwrap().text, "second");
         assert!(ended.launched);
+        assert_eq!(ended.continues.as_deref(), Some("s0"));
+        assert_eq!(
+            (ended.model.as_deref(), ended.effort.as_deref()),
+            (Some("Opus 5.5"), Some("xhigh"))
+        );
         assert!(ended_session(&reader, "x", &workspaces).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

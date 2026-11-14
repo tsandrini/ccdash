@@ -1,9 +1,11 @@
 //! A session's conversation rebuilt from hook events: one exchange per
 //! prompt, task notification or subagent message, holding the tool calls,
-//! subagents, compactions and replies that followed it.
+//! subagents, compactions and replies that followed it. A session that
+//! continues another as a copy (Claude Code gave the conversation a new
+//! id) shows that session's exchanges first: one chat over the chain.
 
 use anyhow::Result;
-use rusqlite::{Connection, named_params, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 use serde::Serialize;
 use serde_json::Value;
 use ts_rs::TS;
@@ -13,12 +15,15 @@ use crate::{
     history::{Transition, segments},
     markdown,
     model::Activity,
+    store,
     task_notification::{self, TaskNotification},
     waits::{self, CLOSERS, Close, Edges},
     workspace::IN_SCOPE,
 };
 
 const MAX_TOOLS_PER_EXCHANGE: usize = 200;
+/// The sessions one chat reaches back over: a chain of copies.
+const MAX_PARTS: usize = 32;
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export_to = "types.ts")]
@@ -50,6 +55,11 @@ pub struct Exchange {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent: Option<AgentMessage>,
+    /// The earlier session the exchange happened in, in the chat of a
+    /// session that continues it as a copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub session: Option<String>,
     pub items: Vec<Item>,
     /// Oldest tool calls left out of `items` in very long exchanges.
     pub omitted: u32,
@@ -68,6 +78,7 @@ impl Exchange {
             via: None,
             task: None,
             agent: None,
+            session: None,
             items: Vec::new(),
             omitted: 0,
             last_message: None,
@@ -84,6 +95,11 @@ impl Exchange {
                     self.items.remove(i);
                 }
             }
+            // NOTE: the seam is the copy's start; "Session resumed" beside it says it twice
+            "continues" if matches!(self.items.last(), Some(Item::Start { .. })) => {
+                self.items.pop();
+            }
+            "start" if matches!(self.items.last(), Some(Item::Continued { .. })) => return,
             _ => {}
         }
         self.items.push(item);
@@ -177,6 +193,24 @@ pub enum Item {
         at: i64,
         reason: String,
     },
+    /// The seam of a chain: from here the conversation goes on as a copy
+    /// of `session` under this session's id. What comes before it in the
+    /// chat is that session's.
+    Continued {
+        id: i64,
+        at: i64,
+        session: String,
+        /// The earlier session's title; none without one.
+        title: Option<String>,
+        /// The store has the earlier session, so its page opens.
+        known: bool,
+        /// What the earlier session ran on and what the copy started on,
+        /// as far as the hub knew then.
+        from_model: Option<String>,
+        from_effort: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     /// The owner interrupted the turn from the panel.
     Interrupted {
         id: i64,
@@ -211,16 +245,107 @@ pub struct Stats {
     pub parked_ms: i64,
 }
 
+/// One session's share of a chat: its events before `until`.
+struct Part {
+    session: String,
+    until: i64,
+}
+
+/// The sessions whose events make up `session`'s chat, newest first:
+/// itself, then each session continued as a copy, up to when its copy
+/// started (the original may have gone on by itself after that).
+fn parts(conn: &Connection, session: &str) -> Result<Vec<Part>> {
+    let mut parts = vec![Part {
+        session: session.to_owned(),
+        until: i64::MAX,
+    }];
+    let mut stmt =
+        conn.prepare_cached("SELECT continues, started_at FROM sessions WHERE id = ?1")?;
+    while parts.len() < MAX_PARTS {
+        let last = parts.last().expect("starts with one");
+        let row = stmt
+            .query_row([&last.session], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        let Some((Some(from), started_at)) = row else {
+            break;
+        };
+        if parts.iter().any(|p| p.session == from) {
+            break;
+        }
+        let until = started_at.min(last.until);
+        parts.push(Part {
+            session: from,
+            until,
+        });
+    }
+    Ok(parts)
+}
+
 /// The newest `limit` exchanges before `before` (all of them when `None`),
-/// oldest first.
+/// oldest first: the session's own, and before them those of the sessions
+/// it continues as a copy, each marked with its session.
+///
+/// # Errors
+///
+/// Fails when the store cannot be read.
 pub fn conversation(
     conn: &Connection,
     session: &str,
     before: Option<i64>,
     limit: usize,
 ) -> Result<Conversation> {
-    let limit = limit.max(1);
     let before = before.unwrap_or(i64::MAX);
+    let mut left = limit.max(1);
+    let mut exchanges: Vec<Exchange> = Vec::new();
+    let mut more = false;
+    for (i, part) in parts(conn, session)?.iter().enumerate() {
+        let until = before.min(part.until);
+        if left == 0 {
+            more = has_events(conn, &part.session, until)?;
+            if more {
+                break;
+            }
+            continue;
+        }
+        let mut page = page_of(conn, &part.session, until, left)?;
+        if i > 0 {
+            for exchange in &mut page.exchanges {
+                exchange.session = Some(part.session.clone());
+            }
+        }
+        left -= page.prompts.min(left);
+        page.exchanges.append(&mut exchanges);
+        exchanges = page.exchanges;
+        if page.more {
+            more = true;
+            break;
+        }
+    }
+    Ok(Conversation { exchanges, more })
+}
+
+fn has_events(conn: &Connection, session: &str, before: i64) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM events WHERE session = ?1 AND ts < ?2
+                AND kind NOT IN ('activity', 'notification'))",
+        )?
+        .query_row(params![session, before], |r| r.get(0))?)
+}
+
+/// The exchanges of one session that [`page_of`] read.
+struct Page {
+    exchanges: Vec<Exchange>,
+    /// Older exchanges of the session exist.
+    more: bool,
+    /// The exchanges a prompt (or a notification) started: what `limit` counts.
+    prompts: usize,
+}
+
+/// The newest `limit` exchanges of one session before `before`, oldest first.
+fn page_of(conn: &Connection, session: &str, before: i64, limit: usize) -> Result<Page> {
     let prompts: Vec<i64> = conn
         .prepare_cached(
             "SELECT ts FROM events
@@ -273,7 +398,17 @@ pub fn conversation(
                 None => exchange.prompt = Some(raw),
             }
             exchanges.push(exchange);
-        } else if let Some(item) = item(id, at, &kind, &data) {
+        } else if let Some(mut item) = item(id, at, &kind, &data) {
+            if let Item::Continued {
+                session,
+                title,
+                known,
+                ..
+            } = &mut item
+                && let Some((stored, _)) = store::brief(conn, session)?
+            {
+                (*known, *title) = (true, stored);
+            }
             if exchanges.is_empty() {
                 exchanges.push(Exchange::new(id, at, None));
             }
@@ -286,7 +421,11 @@ pub fn conversation(
     for exchange in &mut exchanges {
         cap_tools(exchange);
     }
-    Ok(Conversation { exchanges, more })
+    Ok(Page {
+        exchanges,
+        more,
+        prompts: prompts.len().min(limit),
+    })
 }
 
 fn item(id: i64, at: i64, kind: &str, data: &Value) -> Option<Item> {
@@ -375,6 +514,17 @@ fn item(id: i64, at: i64, kind: &str, data: &Value) -> Option<Item> {
             at,
             reason: text(data, "reason"),
         },
+        "continues" => Item::Continued {
+            id,
+            at,
+            session: text(data, "session"),
+            title: None,
+            known: false,
+            from_model: data["from_model"].as_str().map(str::to_owned),
+            from_effort: data["from_effort"].as_str().map(str::to_owned),
+            model: data["model"].as_str().map(str::to_owned),
+            effort: data["effort"].as_str().map(str::to_owned),
+        },
         "interrupted" => Item::Interrupted { id, at },
         _ => return None,
     })
@@ -414,24 +564,33 @@ pub struct Prompt {
     pub text: String,
 }
 
-/// The newest `limit` distinct prompts, newest first: of one session, or
-/// of every session under `dirs` (every session when None).
+/// The newest `limit` distinct prompts, newest first: of one session (with
+/// those of the sessions it continues as a copy), or of every session
+/// under `dirs` (every session when None).
 pub fn prompts(
     conn: &Connection,
     session: Option<&str>,
     dirs: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Prompt>> {
+    let parts = match session {
+        Some(session) => parts(conn, session)?,
+        None => Vec::new(),
+    };
+    let sessions = session
+        .map(|_| serde_json::to_string(&parts.iter().map(|p| &p.session).collect::<Vec<_>>()))
+        .transpose()?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT e.ts, e.session, json_extract(e.data, '$.text') FROM events e
             JOIN sessions x ON x.id = e.session
-            WHERE e.kind = 'prompt' AND (:session IS NULL OR e.session = :session)
+            WHERE e.kind = 'prompt'
+                AND (:sessions IS NULL OR e.session IN (SELECT value FROM json_each(:sessions)))
                 AND {IN_SCOPE}
             ORDER BY e.ts DESC LIMIT :scan"
     ))?;
     let scan = i64::try_from(limit.saturating_mul(4).max(limit))?;
     let rows = stmt.query_map(
-        named_params! { ":session": session, ":dirs": dirs, ":host": Option::<String>::None, ":scan": scan },
+        named_params! { ":sessions": sessions, ":dirs": dirs, ":host": Option::<String>::None, ":scan": scan },
         |r| {
             Ok(Prompt {
                 at: r.get(0)?,
@@ -444,6 +603,13 @@ pub fn prompts(
     let mut out = Vec::new();
     for row in rows {
         let prompt = row?;
+        // NOTE: a continued session's prompts after its copy started are not the copy's
+        if parts
+            .iter()
+            .any(|p| p.session == prompt.session && prompt.at >= p.until)
+        {
+            continue;
+        }
         let key: String = prompt.text.split_whitespace().collect::<Vec<_>>().join(" ");
         if key.is_empty() || !seen.insert(key) {
             continue;
@@ -551,12 +717,194 @@ pub fn stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::SCHEMA;
 
     fn db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        store::memory()
+    }
+
+    /// `a` ← `b` ← `c`: `b` is a copy of `a` made at 20 (and `a` goes on by
+    /// itself), `c` a copy of `b` made at 40; `d` continues a session the
+    /// store never had.
+    fn chain() -> Connection {
+        use serde_json::json;
+        let conn = db();
+        for (id, title, started_at, continues) in [
+            ("a", Some("Refactor"), 1, None),
+            ("b", None, 20, Some("a")),
+            ("c", Some("Refactor"), 40, Some("b")),
+            ("d", None, 50, Some("lost")),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (id, host, cwd, title, kind, started_at, continues)
+                    VALUES (?1, 'h', '/w', ?2, 'background', ?3, ?4)",
+                params![id, title, started_at, continues],
+            )
+            .unwrap();
+        }
+        let put = |session: &str, ts: i64, kind: &str, data: Value| {
+            conn.execute(
+                "INSERT INTO events VALUES (?1, 'h', ?2, ?3, ?4)",
+                params![ts, session, kind, data.to_string()],
+            )
+            .unwrap();
+        };
+        put("a", 1, "start", json!({"source": "startup"}));
+        put("a", 2, "prompt", json!({"text": "a1"}));
+        put("a", 3, "reply", json!({"text": "ra1"}));
+        put("a", 5, "prompt", json!({"text": "a2"}));
+        put("a", 6, "reply", json!({"text": "ra2"}));
+        put("b", 20, "start", json!({"source": "resume"}));
+        put(
+            "b",
+            20,
+            "continues",
+            json!({"session": "a", "from_model": "Opus 5.5", "from_effort": "high",
+                "model": "claude-fable-5-2", "effort": "high"}),
+        );
+        put("b", 21, "prompt", json!({"text": "b1"}));
+        put("b", 22, "reply", json!({"text": "rb1"}));
+        put("a", 25, "prompt", json!({"text": "a3, after its copy"}));
+        put("b", 30, "end", json!({"reason": "stopped"}));
+        // the agents poll saw `c` before its SessionStart did
+        put("c", 40, "continues", json!({"session": "b"}));
+        put("c", 41, "start", json!({"source": "resume"}));
+        put("c", 42, "prompt", json!({"text": "c1"}));
+        put("c", 43, "reply", json!({"text": "rc1"}));
+        put("d", 50, "continues", json!({"session": "lost"}));
         conn
+    }
+
+    /// Each exchange as (the earlier session it is from, its prompt).
+    fn outline(c: &Conversation) -> Vec<(Option<&str>, Option<&str>)> {
+        c.exchanges
+            .iter()
+            .map(|e| (e.session.as_deref(), e.prompt.as_deref()))
+            .collect()
+    }
+
+    #[test]
+    fn a_copy_shows_what_it_continues_first() {
+        let conn = chain();
+        let c = conversation(&conn, "c", None, 10).unwrap();
+        assert_eq!(
+            outline(&c),
+            [
+                (Some("a"), None),
+                (Some("a"), Some("a1")),
+                (Some("a"), Some("a2")),
+                (Some("b"), None),
+                (Some("b"), Some("b1")),
+                (None, None),
+                (None, Some("c1")),
+            ],
+            "the chain, each part up to when its copy started"
+        );
+        assert!(!c.more);
+        let [
+            Item::Continued {
+                at: 20,
+                session,
+                title,
+                known: true,
+                from_model,
+                from_effort,
+                model,
+                effort,
+                ..
+            },
+        ] = &c.exchanges[3].items[..]
+        else {
+            panic!(
+                "the seam stands for the copy's start: {:?}",
+                c.exchanges[3].items
+            );
+        };
+        assert_eq!(
+            (session.as_str(), title.as_deref()),
+            ("a", Some("Refactor"))
+        );
+        assert_eq!(
+            [from_model, from_effort, model, effort].map(|v| v.as_deref()),
+            [
+                Some("Opus 5.5"),
+                Some("high"),
+                Some("claude-fable-5-2"),
+                Some("high")
+            ]
+        );
+        assert!(
+            matches!(
+                c.exchanges[5].items[..],
+                [Item::Continued { ref session, title: None, known: true, .. }] if session == "b"
+            ),
+            "{:?}",
+            c.exchanges[5].items
+        );
+        assert!(matches!(
+            c.exchanges[4].items[..],
+            [Item::Reply { .. }, Item::End { .. }]
+        ));
+
+        // the session that was copied keeps its own chat, whole
+        let a = conversation(&conn, "a", None, 10).unwrap();
+        assert_eq!(
+            outline(&a),
+            [
+                (None, None),
+                (None, Some("a1")),
+                (None, Some("a2")),
+                (None, Some("a3, after its copy"))
+            ]
+        );
+
+        // an earlier session the store never had: the seam alone
+        let d = conversation(&conn, "d", None, 10).unwrap();
+        assert!(matches!(
+            d.exchanges[0].items[..],
+            [Item::Continued { ref session, title: None, known: false, .. }] if session == "lost"
+        ));
+    }
+
+    #[test]
+    fn a_chain_pages_back_across_its_sessions() {
+        let conn = chain();
+        let newest = conversation(&conn, "c", None, 2).unwrap();
+        assert_eq!(
+            outline(&newest),
+            [
+                (Some("b"), None),
+                (Some("b"), Some("b1")),
+                (None, None),
+                (None, Some("c1"))
+            ]
+        );
+        assert!(newest.more, "the first session's exchanges are left");
+        let older = conversation(&conn, "c", Some(newest.exchanges[0].at), 2).unwrap();
+        assert_eq!(
+            outline(&older),
+            [
+                (Some("a"), None),
+                (Some("a"), Some("a1")),
+                (Some("a"), Some("a2"))
+            ]
+        );
+        assert!(!older.more);
+
+        // a page that ends inside a session
+        let one = conversation(&conn, "c", None, 1).unwrap();
+        assert_eq!(outline(&one), [(None, None), (None, Some("c1"))]);
+        assert!(one.more);
+        let last = conversation(&conn, "b", Some(5), 5).unwrap();
+        assert_eq!(outline(&last), [(Some("a"), None), (Some("a"), Some("a1"))]);
+        assert!(!last.more);
+
+        // the composer's history reaches back the same way
+        let texts: Vec<String> = prompts(&conn, Some("c"), None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.text)
+            .collect();
+        assert_eq!(texts, ["c1", "b1", "a2", "a1"]);
     }
 
     fn event(conn: &Connection, ts: i64, kind: &str, data: Value) {

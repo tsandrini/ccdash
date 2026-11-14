@@ -293,6 +293,14 @@ pub struct Session {
     pub kind: Kind,
     /// Session that started this one (a fork, or `claude --bg` run by Claude).
     pub parent: Option<String>,
+    /// The session whose conversation this one continues: Claude Code
+    /// resumed it as a copy under a new id (other options, or it was still
+    /// running). The chat shows that session's part first.
+    #[serde(default)]
+    pub continues: Option<String>,
+    /// The newest session that continues this one as a copy.
+    #[serde(default)]
+    pub continued_as: Option<String>,
     pub pid: Option<u32>,
     pub cwd: String,
     /// Configured workspace holding `cwd`.
@@ -391,6 +399,8 @@ impl Session {
             short_id: None,
             kind: Kind::Interactive,
             parent: None,
+            continues: None,
+            continued_as: None,
             pid: None,
             cwd: cwd.into(),
             workspace: None,
