@@ -1,4 +1,10 @@
-//! Safe wrappers over the Win32 calls ccdash makes on Windows.
+//! What only Windows has: safe wrappers over the Win32 calls ccdash makes
+//! there, and under them what a Windows workstation is installed and run
+//! with, [`setup`] and [`tray`] (docs/windows.md): the commands of
+//! `ccdash win` ([`Command`]).
+
+pub mod setup;
+pub mod tray;
 
 use std::{
     ffi::c_void,
@@ -17,10 +23,11 @@ use windows_sys::{
     Wdk::System::Threading::ProcessBasicInformation,
     Win32::{
         Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, ERROR_INVALID_FUNCTION, ERROR_IO_PENDING,
-            ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED, ERROR_SUCCESS, FILETIME, GENERIC_READ,
-            GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree, UNICODE_STRING, WAIT_FAILED,
-            WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND,
+            ERROR_INVALID_FUNCTION, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOTIFY_ENUM_DIR,
+            ERROR_OPERATION_ABORTED, ERROR_SUCCESS, FILETIME, GENERIC_READ, GENERIC_WRITE, HANDLE,
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
+            UNICODE_STRING, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         NetworkManagement::IpHelper::GAA_FLAG_SKIP_ANYCAST,
         NetworkManagement::IpHelper::GAA_FLAG_SKIP_DNS_SERVER,
@@ -48,8 +55,8 @@ use windows_sys::{
         Storage::FileSystem::{
             CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
             FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-            FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+            FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
             FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
             FILE_NOTIFY_EXTENDED_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
             GetDiskFreeSpaceExW, GetVolumePathNameW, OPEN_EXISTING, ReadDirectoryChangesExW,
@@ -60,15 +67,16 @@ use windows_sys::{
                 AttachConsole, CONSOLE_MODE, ENABLE_AUTO_POSITION, ENABLE_ECHO_INPUT,
                 ENABLE_EXTENDED_FLAGS, ENABLE_INSERT_MODE, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
                 ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
-                ENABLE_VIRTUAL_TERMINAL_PROCESSING, FreeConsole, GetConsoleMode,
-                GetConsoleProcessList, SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleW,
+                ENABLE_VIRTUAL_TERMINAL_PROCESSING, FreeConsole, GetConsoleCP, GetConsoleMode,
+                GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+                STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleW,
             },
             Diagnostics::ToolHelp::CreateToolhelp32Snapshot,
             Diagnostics::ToolHelp::PROCESSENTRY32W,
             Diagnostics::ToolHelp::Process32FirstW,
             Diagnostics::ToolHelp::Process32NextW,
             Diagnostics::ToolHelp::TH32CS_SNAPPROCESS,
-            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+            IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED},
             JobObjects::AssignProcessToJobObject,
             JobObjects::CreateJobObjectW,
             JobObjects::JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
@@ -77,15 +85,26 @@ use windows_sys::{
             JobObjects::JobObjectExtendedLimitInformation,
             JobObjects::QueryInformationJobObject,
             JobObjects::TerminateJobObject,
+            Pipes::GetNamedPipeServerProcessId,
             Pipes::WaitNamedPipeW,
             Power::GetSystemPowerStatus,
             Power::SYSTEM_POWER_STATUS,
             ProcessStatus::K32GetProcessMemoryInfo,
             ProcessStatus::PROCESS_MEMORY_COUNTERS,
+            Registry::HKEY,
+            Registry::HKEY_CURRENT_USER,
             Registry::HKEY_LOCAL_MACHINE,
+            Registry::REG_DWORD,
+            Registry::REG_EXPAND_SZ,
+            Registry::REG_SZ,
+            Registry::RRF_NOEXPAND,
             Registry::RRF_RT_REG_DWORD,
+            Registry::RRF_RT_REG_EXPAND_SZ,
             Registry::RRF_RT_REG_SZ,
+            Registry::RegDeleteKeyValueW,
+            Registry::RegDeleteKeyW,
             Registry::RegGetValueW,
+            Registry::RegSetKeyValueW,
             RemoteDesktop::WTS_CURRENT_SERVER_HANDLE,
             RemoteDesktop::WTS_CURRENT_SESSION,
             RemoteDesktop::WTS_SESSIONSTATE_LOCK,
@@ -109,10 +128,60 @@ use windows_sys::{
             },
             WindowsProgramming::QueryUnbiasedInterruptTime,
         },
-        UI::Shell::CommandLineToArgvW,
+        UI::Shell::{CommandLineToArgvW, ShellExecuteW},
+        UI::WindowsAndMessaging::{
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, WM_SETTINGCHANGE,
+        },
     },
     core::{BOOL, PWSTR},
 };
+
+/// `ccdash win …`: what only a Windows workstation has.
+#[derive(clap::Subcommand)]
+pub enum Command {
+    /// Install or refresh ccdash for this user: the binary on PATH, the
+    /// plugin for every session, Claude Code's hooks, the tray at logon;
+    /// then start it anew.
+    Setup(setup::Options),
+    /// Run the collector under an icon in the taskbar: how it is doing,
+    /// the panel, the configuration, the log, updates.
+    Tray {
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Take over from the tray with this process id once it has ended.
+        #[arg(long, hide = true)]
+        replace: Option<u32>,
+    },
+    /// Put the build the hub's protocol calls for in place, from this
+    /// build's releases, and start it.
+    Update {
+        /// Only say what the releases hold.
+        #[arg(long)]
+        check: bool,
+        /// Print this build's release manifest (the release job's).
+        #[arg(long, hide = true)]
+        describe: bool,
+    },
+}
+
+/// Runs a command of `ccdash win`.
+///
+/// # Errors
+///
+/// The command's own: [`setup::run`], [`tray::run`], [`tray::update_now`],
+/// or the running executable cannot be read for its manifest.
+pub fn run(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Setup(options) => setup::run(&options),
+        Command::Tray { config, replace } => tray::run(config, replace),
+        Command::Update { describe: true, .. } => {
+            let manifest = tray::update::describe()?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            Ok(())
+        }
+        Command::Update { check, .. } => tray::update_now(check),
+    }
+}
 
 /// The DNS host name, as configured.
 pub fn hostname() -> Option<String> {
@@ -1277,6 +1346,16 @@ fn registry_dword(key: &str, value: &str) -> Option<u32> {
     (rc == 0).then_some(data)
 }
 
+/// A variable of the environment every user of the machine gets, as the
+/// registry holds it: `%NAME%`s unexpanded.
+pub fn machine_environment(name: &str) -> Option<String> {
+    let key = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    registry_text(HKEY_LOCAL_MACHINE, key, name)
+        .ok()
+        .flatten()
+        .map(|(text, _)| text)
+}
+
 const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
 /// `Windows 11 Pro 25H2` and `10.0.26200.7171`, from the registry.
@@ -1713,9 +1792,321 @@ fn token_user() -> io::Result<Vec<u64>> {
     Ok(buf)
 }
 
+/// The id of the process serving a named pipe, from a client's handle.
+pub fn pipe_server(pipe: &impl AsRawHandle) -> Option<u32> {
+    let mut pid = 0u32;
+    // SAFETY: a live handle; one id to fill, and a handle that is no pipe's is refused
+    (unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &raw mut pid) } != 0).then_some(pid)
+}
+
+/// Whether this process is attached to a console, one with a window or not.
+pub fn has_console() -> bool {
+    // SAFETY: plain call; zero without a console
+    unsafe { GetConsoleCP() != 0 }
+}
+
+/// Keeps this process's standard handles to itself. std's `Command` lets a
+/// child inherit every inheritable handle, the ones it does not use too:
+/// a child that outlives this process would hold a caller's pipe open, and
+/// the caller reading it would wait for that child. A child still gets the
+/// handles its `Stdio` names.
+pub fn keep_std_handles() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain calls; a missing handle is skipped, a console's pseudo handle refused
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// A string value under `HKEY_CURRENT_USER` as it is stored, `%NAME%`s
+/// unexpanded, and whether it is one that expands (`REG_EXPAND_SZ`); none
+/// when there is no such value.
+///
+/// # Errors
+///
+/// The value is there and cannot be read as a string (another type, no
+/// access). That is not "none" to a caller that would then write its own
+/// in the value's place.
+pub fn user_registry_string(key: &str, value: &str) -> io::Result<Option<(String, bool)>> {
+    registry_text(HKEY_CURRENT_USER, key, value)
+}
+
+/// A string value under `root`, of any length and of either kind of
+/// string, as [`user_registry_string`] gives it.
+fn registry_text(root: HKEY, key: &str, value: &str) -> io::Result<Option<(String, bool)>> {
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = vec![0u16; 512];
+    loop {
+        let mut kind = 0u32;
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: NUL-terminated names; `len` is the buffer's size in bytes
+        let rc = unsafe {
+            RegGetValueW(
+                root,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                &raw mut kind,
+                buf.as_mut_ptr().cast(),
+                &raw mut len,
+            )
+        };
+        match rc {
+            ERROR_SUCCESS => {
+                let text = &buf[..(len as usize / 2).min(buf.len())];
+                let end = text.iter().position(|c| *c == 0).unwrap_or(text.len());
+                return Ok(Some((
+                    String::from_utf16_lossy(&text[..end]),
+                    kind == REG_EXPAND_SZ,
+                )));
+            }
+            // NOTE: `len` is what the value needs
+            ERROR_MORE_DATA => buf.resize((len as usize).div_ceil(2) + 1, 0),
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            rc => return Err(io::Error::from_raw_os_error(rc as i32)),
+        }
+    }
+}
+
+/// Sets a string value under `HKEY_CURRENT_USER`, making its key.
+pub fn set_user_registry_string(
+    key: &str,
+    value: &str,
+    text: &str,
+    expands: bool,
+) -> io::Result<()> {
+    let (key, value, text) = (wide(key), wide(value), wide(text));
+    let kind = if expands { REG_EXPAND_SZ } else { REG_SZ };
+    // SAFETY: NUL-terminated names; `text` with its terminator, sized in bytes
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            kind,
+            text.as_ptr().cast(),
+            (text.len() * 2) as u32,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(rc as i32));
+    }
+    Ok(())
+}
+
+/// Removes a value under `HKEY_CURRENT_USER`; one that is not there is
+/// removed already.
+pub fn delete_user_registry_value(key: &str, value: &str) -> io::Result<()> {
+    let (key, value) = (wide(key), wide(value));
+    // SAFETY: NUL-terminated names
+    match unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+        rc => Err(io::Error::from_raw_os_error(rc as i32)),
+    }
+}
+
+/// Sets a number (`REG_DWORD`) under `HKEY_CURRENT_USER`, making its key.
+pub fn set_user_registry_number(key: &str, value: &str, number: u32) -> io::Result<()> {
+    let (key, value) = (wide(key), wide(value));
+    // SAFETY: NUL-terminated names; the four bytes of `number`
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            REG_DWORD,
+            (&raw const number).cast(),
+            4,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(rc as i32));
+    }
+    Ok(())
+}
+
+/// Removes a key under `HKEY_CURRENT_USER` with its values (it may hold no
+/// keys of its own); one that is not there is removed already.
+pub fn delete_user_registry_key(key: &str) -> io::Result<()> {
+    let key = wide(key);
+    // SAFETY: a NUL-terminated name
+    match unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, key.as_ptr()) } {
+        ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+        rc => Err(io::Error::from_raw_os_error(rc as i32)),
+    }
+}
+
+/// Tells the running programs that the user's environment changed in the
+/// registry: Explorer then starts programs with the new one.
+pub fn environment_changed() {
+    let what = wide("Environment");
+    // SAFETY: a NUL-terminated string that outlives the call; no result wanted
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            what.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            ptr::null_mut(),
+        );
+    }
+}
+
+/// Opens a file, a folder or an address as Explorer would: in the program
+/// Windows has for it. With `program`, that program opens it instead.
+pub fn shell_open(what: &str, program: Option<&str>) -> io::Result<()> {
+    let verb = wide("open");
+    let (file, argument) = match program {
+        Some(program) => (wide(program), Some(wide(&quote_arg(what)))),
+        None => (wide(what), None),
+    };
+    // SAFETY: NUL-terminated strings that outlive the call; no window, no directory
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            argument.as_ref().map_or(ptr::null(), |a| a.as_ptr()),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // NOTE: not a handle: a number, above 32 when it worked
+    if result as usize <= 32 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `FSCTL_SET_REPARSE_POINT` (winioctl.h).
+const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+/// The two words of `IO_REPARSE_TAG_MOUNT_POINT` (winnt.h), low first.
+const MOUNT_POINT_TAG: [u16; 2] = [0x0003, 0xA000];
+
+/// Makes `link` a junction to the directory `target` (a full path, drive
+/// first): a link to a directory that needs no privilege, where a symbolic
+/// link needs Developer Mode or elevation. `std::fs::read_link` reads it
+/// back, `std::fs::remove_dir` removes it and leaves the target alone.
+pub fn junction(link: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+    if !target.is_absolute() || print.first() == Some(&u16::from(b'\\')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a path on a drive", target.display()),
+        ));
+    }
+    let substitute: Vec<u16> = r"\??\"
+        .encode_utf16()
+        .chain(print.iter().copied())
+        .collect();
+    let length = |units: usize| {
+        u16::try_from(units * 2).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is too long for a junction", target.display()),
+            )
+        })
+    };
+    // NOTE: a REPARSE_DATA_BUFFER in 16-bit words: the tag, the length of what follows this
+    // header, a reserved word; then the mount point's own header (where each name starts and
+    // how long it is, in bytes) and both names, each with a terminator
+    let names = substitute.len() + 1 + print.len() + 1;
+    let mut buf: Vec<u16> = Vec::with_capacity(8 + names);
+    buf.extend(MOUNT_POINT_TAG);
+    buf.extend([length(4 + names)?, 0]);
+    buf.extend([0, length(substitute.len())?]);
+    buf.extend([length(substitute.len() + 1)?, length(print.len())?]);
+    buf.extend(&substitute);
+    buf.push(0);
+    buf.extend(&print);
+    buf.push(0);
+    std::fs::create_dir(link)?;
+    let set = || {
+        let dir = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(link)?;
+        let mut returned = 0u32;
+        // SAFETY: a live handle of an empty directory; `buf` is a whole reparse buffer
+        let ok = unsafe {
+            DeviceIoControl(
+                dir.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr().cast(),
+                (buf.len() * 2) as u32,
+                ptr::null_mut(),
+                0,
+                &raw mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    set().inspect_err(|_| {
+        let _ = std::fs::remove_dir(link);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_junction_leads_to_its_target_and_goes_without_it() {
+        let dir = std::env::temp_dir().join(format!("ccdash-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (target, link) = (dir.join("target dir"), dir.join("link"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("file"), "through").unwrap();
+        junction(&link, &target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(link.join("file")).unwrap(),
+            "through"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            junction(&link, &target).is_err(),
+            "the link is there already"
+        );
+        std::fs::remove_dir(&link).unwrap();
+        assert!(target.join("file").exists(), "the target stays");
+        assert!(junction(&link, std::path::Path::new(r"relative\dir")).is_err());
+        assert!(!link.exists(), "a refused junction leaves nothing");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_user_registry_value_is_set_read_as_stored_and_removed() {
+        let key = format!(r"Software\ccdash-test-{}", std::process::id());
+        let long = format!(r"%USERPROFILE%\{}", "x".repeat(900));
+        let read = || user_registry_string(&key, "path");
+        assert_eq!(read().unwrap(), None);
+        set_user_registry_string(&key, "path", &long, true).unwrap();
+        assert_eq!(read().unwrap(), Some((long.clone(), true)));
+        set_user_registry_string(&key, "path", "plain", false).unwrap();
+        assert_eq!(read().unwrap(), Some(("plain".to_owned(), false)));
+        // NOTE: a value of another kind is there: not "none", or a caller would write over it
+        set_user_registry_number(&key, "path", 7).unwrap();
+        assert!(read().is_err());
+        delete_user_registry_value(&key, "path").unwrap();
+        delete_user_registry_value(&key, "path").unwrap();
+        assert_eq!(read().unwrap(), None);
+        // NOTE: the key goes with the values it still holds, and is gone only once
+        set_user_registry_string(&key, "other", "left", false).unwrap();
+        delete_user_registry_key(&key).unwrap();
+        assert_eq!(user_registry_string(&key, "other").unwrap(), None);
+        delete_user_registry_key(&key).unwrap();
+    }
 
     #[test]
     fn processes_this_user_may_not_open_still_run() {

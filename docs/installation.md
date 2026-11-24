@@ -137,8 +137,8 @@ The machine's host name must be its key in the hub's `collectors`
 (`desk` above). Every option: [Home Manager module
 options](options/home-manager.md), [hub module options](options/hub.md).
 
-A workstation can also run Windows, with a script in the place of Home
-Manager: [a Windows workstation](windows.md).
+A workstation can also run Windows, with `ccdash win setup` in the place of
+Home Manager: [a Windows workstation](windows.md).
 
 ## 5. Tokens
 

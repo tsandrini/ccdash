@@ -1,3 +1,7 @@
 [default]
 # NOTE: base64 keys and test vectors
 extend-ignore-re = ["[A-Za-z0-9_-]{40,}"]
+
+[default.extend-identifiers]
+# NOTE: Win32 (shellapi.h)
+NIN_SELECT = "NIN_SELECT"

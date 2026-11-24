@@ -71,8 +71,13 @@ before pushing new files.
 ([a Windows workstation](windows.md)). The `windows` workflow
 (`.github/workflows/windows.yml`) lints and tests it on GitHub with both
 Windows toolchains, on every push and pull request that touches the crate.
-From the dev shell, a cross `cargo check` type-checks it without a Windows
-machine (it runs nothing):
+Its `package` job then builds the one file a Windows machine installs: the
+run's artifact, and on main the release of the build's protocol
+(`windows-p<N>`), from which the machines
+[update themselves](windows.md#5-updating). A change to the protocol
+number so starts a new release, and the one before keeps its last build
+for the hubs still on it. From the dev shell, a cross `cargo check`
+type-checks the Windows half without a Windows machine (it runs nothing):
 
 ```sh
 nix build --impure -o target/win-toolchain --expr 'let f = builtins.getFlake "github:nix-community/fenix"; p = f.packages.x86_64-linux; in p.combine [ p.stable.cargo p.stable.rustc p.targets.x86_64-pc-windows-gnu.stable.rust-std ]'

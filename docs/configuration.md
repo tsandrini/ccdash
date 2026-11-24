@@ -2,7 +2,7 @@
 
 Both daemons read TOML (`--config`, else `$XDG_CONFIG_HOME/ccdash/config.toml`;
 on Windows `%APPDATA%\ccdash\config.toml`) and reject unknown keys. The Nix
-modules write the files, and on Windows [the script](windows.md) the
+modules write the files, and on Windows [`ccdash win setup`](windows.md) the
 collector's: their options cover the common keys, `settings` takes the rest.
 In paths, `$VAR` and `${VAR}` expand.
 

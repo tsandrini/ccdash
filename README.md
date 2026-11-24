@@ -195,15 +195,17 @@ from it first (nginx, a VPN). Notes from before ccdash come in with
 ### 3.5 A Windows workstation
 
 A workstation can also run Windows, reporting to a hub on Linux (the hub
-runs on Linux only). From the repository:
+runs on Linux only). ccdash for Windows is one file from the releases:
 
 ```powershell
-pwsh -File windows\install.ps1 -Build -Hub wss://ccdash.example.org/collect -Token .\token
+curl.exe -fLO https://github.com/tsandrini/ccdash/releases/latest/download/ccdash-x86_64.exe
+.\ccdash-x86_64.exe win setup --hub wss://ccdash.example.org/collect --token .\token
 ```
 
-It installs the collector, the hooks and the plugin, and starts the
-collector at logon; the channel, Open and Edit are switches, off until
-given. Steps and differences: [Windows](docs/windows.md).
+It installs the collector, the hooks and the plugin, and a tray icon that
+runs the collector from logon on and keeps the build in step with the hub;
+the channel, Open and Edit are switches, off until given. Steps and
+differences: [Windows](docs/windows.md).
 
 ## 4. Everyday use
 

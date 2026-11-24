@@ -259,6 +259,11 @@ mod imp {
             self.write_timeout.set(timeout);
             Ok(())
         }
+
+        /// The id of the process serving the pipe: the collector's.
+        pub fn server_pid(&self) -> Option<u32> {
+            win::pipe_server(&self.file)
+        }
     }
 
     impl Read for &Stream {
@@ -507,6 +512,14 @@ mod imp {
             .unwrap();
             assert_eq!(reply, "ping!\n");
             server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_client_learns_which_process_serves_its_pipe() {
+            let path = socket("server-pid");
+            let _listener = Listener::bind(&path).unwrap();
+            let stream = Stream::connect(&path).unwrap();
+            assert_eq!(stream.server_pid(), Some(std::process::id()));
         }
 
         #[tokio::test]

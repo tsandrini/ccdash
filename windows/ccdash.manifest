@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Linked into the released ccdash.exe (.github/workflows/windows.yml).
+
+  consoleAllocationPolicy "detached": started without a console (Explorer, the Run key at
+  logon), ccdash gets none, so `ccdash win tray` opens no window; started from a shell it uses
+  the shell's, and with CREATE_NO_WINDOW it still gets the console without a window that the
+  collector's programs share. Windows 11 24H2 (build 26100) and later; earlier ones ignore
+  it, and the tray leaves the console it was given (docs/windows.md).
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application>
+    <windowsSettings>
+      <consoleAllocationPolicy xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">detached</consoleAllocationPolicy>
+    </windowsSettings>
+  </application>
+</assembly>

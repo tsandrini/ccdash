@@ -39,7 +39,7 @@ let
   '';
   statusLineCommand = cfg.claudeCode.statusLine.command;
 
-  # NOTE: windows/install.ps1 keeps a copy ($events, $tools)
+  # NOTE: src/win/setup/settings.rs keeps a copy (EVENTS, TOOL_EVENTS)
   hookEvents = [
     "SessionStart"
     "SessionEnd"

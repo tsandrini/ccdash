@@ -1,6 +1,8 @@
 # The Windows workstation side (docs/windows.md). ccdash is developed on
 # NixOS, where nothing builds the `cfg(windows)` half: this job is what says
-# a change broke it. Lints and tests the crate with both Windows toolchains.
+# a change broke it. Lints and tests the crate with both Windows toolchains,
+# then builds the executable a Windows machine installs; on main that build
+# is published, and the machines update themselves to it.
 name: windows
 
 on:
@@ -12,6 +14,8 @@ on:
       - "Cargo.lock"
       - "windows/**"
       - "claude-plugin/**"
+      # NOTE: the executable carries it, and a test reads its shapes (src/win/tray/icon.rs)
+      - "dms-plugin/icon.svg"
       - "web/src/lib/api/types.ts"
       - ".github/workflows/windows.yml"
   pull_request:
@@ -21,6 +25,8 @@ on:
       - "Cargo.lock"
       - "windows/**"
       - "claude-plugin/**"
+      # NOTE: the executable carries it, and a test reads its shapes (src/win/tray/icon.rs)
+      - "dms-plugin/icon.svg"
       - "web/src/lib/api/types.ts"
       - ".github/workflows/windows.yml"
   workflow_dispatch:
@@ -30,7 +36,9 @@ permissions:
 
 concurrency:
   group: windows-${{ github.ref }}
-  cancel-in-progress: true
+  # NOTE: not on main: a run stopped while it publishes leaves the release
+  # with one file of the new build and one of the old
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # NOTE: the dev shell's rustc (nixpkgs), so clippy knows the same lints here
@@ -64,3 +72,121 @@ jobs:
           key: ${{ matrix.host }}
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # `ccdash.exe` as a machine installs it (`ccdash win setup`): one file, which
+  # carries the plugin, kept as the run's artifact. On main the `publish`
+  # job puts it into the release of its protocol; a build of another branch
+  # or of a pull request updates from nowhere.
+  package:
+    name: package
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      HOST: x86_64-pc-windows-msvc
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rust ${{ env.RUST_VERSION }} for ${{ env.HOST }}
+        run: |
+          rustup toolchain install "$RUST_VERSION-$HOST" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION-$HOST"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - name: Build
+        # NOTE: not Git Bash, which rewrites an argument that starts with a slash into a path
+        shell: pwsh
+        env:
+          # NOTE: read by `option_env!`: the commit `ccdash --version` names, and where the
+          # build looks for its successors (nowhere, unless it is published)
+          CCDASH_REV: ${{ github.sha }}
+          CCDASH_RELEASES: ${{ env.PUBLISH == 'true' && format('{0}/{1}/releases/download', github.server_url, github.repository) || '' }}
+          # NOTE: the C runtime linked in, so a machine needs no Visual C++ redistributable.
+          # With --target, the flags reach the executable alone, not the build scripts
+          RUSTFLAGS: -C target-feature=+crt-static
+        # NOTE: the manifest keeps a console window from opening when Explorer starts the tray
+        run: >
+          cargo rustc --release --target $env:HOST --bin ccdash --
+          -C link-arg=/MANIFEST:EMBED
+          -C link-arg=/MANIFESTINPUT:windows\ccdash.manifest
+      - name: Describe
+        run: |
+          mkdir dist
+          cp "target/$HOST/release/ccdash.exe" dist/ccdash-x86_64.exe
+          # NOTE: the build describes itself: the manifest is what the updater reads
+          dist/ccdash-x86_64.exe win update --describe > dist/ccdash-x86_64.json
+          cat dist/ccdash-x86_64.json
+          dist/ccdash-x86_64.exe --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ccdash-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # The release of the build's protocol, `windows-p<N>`: it holds the newest
+  # build that speaks protocol N and is replaced by every later one, and a
+  # machine's tray takes from there the build its hub's protocol calls for
+  # (src/win/tray/update.rs). A job of its own, which runs nothing of the
+  # repository: the only one that may write to it.
+  publish:
+    name: publish
+    needs: package
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ccdash-windows-x86_64
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          protocol=$(jq -r .protocol dist/ccdash-x86_64.json)
+          tag="windows-p$protocol"
+          # NOTE: the machines take whatever build the release holds, so a run of an older
+          # commit, started again by hand or finishing late, must not put its build over a
+          # newer one: a commit that is behind the one the release holds is not published.
+          # (Not "only main's tip": the tip may be a commit that starts no run of this
+          # workflow, and this build would then never be published.)
+          held=$(gh release download "$tag" --pattern ccdash-x86_64.json --output - 2> /dev/null | jq -r '.rev // empty' || true)
+          if [ -n "$held" ]; then
+            status=$(gh api "repos/$GH_REPO/compare/$held...$GITHUB_SHA" --jq .status 2> /dev/null || true)
+            if [ "$status" = "behind" ]; then
+              echo "::notice::Not published: the release $tag holds $held, a later commit than this one."
+              exit 0
+            fi
+          fi
+          # NOTE: "latest" is what a first install downloads: the release of the highest
+          # protocol, which a later build of an older protocol does not take over
+          newest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2> /dev/null || true)
+          newest=${newest#windows-p}
+          latest=--latest
+          if [[ "$newest" =~ ^[0-9]+$ ]] && [ "$protocol" -lt "$newest" ]; then
+            latest=--latest=false
+          fi
+          title="ccdash for Windows, protocol $protocol"
+          notes="The newest Windows build that speaks protocol $protocol with its hub: commit $GITHUB_SHA.
+          Every later build of this protocol replaces it; a machine's tray updates to it by itself.
+
+          To install: download \`ccdash-x86_64.exe\` and run \`ccdash-x86_64.exe win setup --hub wss://<hub>/collect --token <token file>\` (docs/windows.md)."
+          if gh release view "$tag" > /dev/null 2>&1; then
+            # NOTE: the executable, then the manifest that describes it: a machine that looks
+            # between the two finds a file its manifest does not describe, and keeps what it has
+            gh release upload "$tag" dist/ccdash-x86_64.exe --clobber
+            gh release upload "$tag" dist/ccdash-x86_64.json --clobber
+            # NOTE: the tag stays at the commit the release was made at, the first that
+            # spoke this protocol; the manifest and these notes name the build's commit
+            gh release edit "$tag" --title "$title" --notes "$notes" "$latest"
+          else
+            gh release create "$tag" dist/ccdash-x86_64.exe dist/ccdash-x86_64.json \
+              --target "$GITHUB_SHA" --title "$title" --notes "$notes" "$latest"
+          fi

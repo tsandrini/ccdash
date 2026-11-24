@@ -289,6 +289,8 @@ pub fn background(config: Option<PathBuf>) -> Result<()> {
     if let Some(config) = config {
         command.arg("--config").arg(config);
     }
+    // NOTE: or the collector holds the pipe of whoever reads this start's output, for good
+    crate::win::keep_std_handles();
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)

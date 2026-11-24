@@ -1,7 +1,8 @@
 # Troubleshooting
 
 Where to look: the collector's log with `journalctl --user -u ccdash` on the
-workstation (on Windows `%LOCALAPPDATA%\ccdash\state\collector.log`), the
+workstation (on Windows `%LOCALAPPDATA%\ccdash\state\collector.log`, which
+Show the log in [the tray](windows.md#3-the-tray)'s menu opens), the
 hub's with `journalctl -u ccdash-hub` on the hub, and `ccdash status` for
 what the hub knows of this machine.
 
@@ -63,7 +64,7 @@ The panel offers only what the machine does.
 | Lock, Suspend                     | `power.lock`, `power.suspend`                                                                     |
 | The Claude state, Workspace pages | `sync.enable`; the hub's and the collectors' `workspace.enable`                                   |
 
-On Windows the script's switches turn these on
+On Windows the switches of `ccdash win setup` turn these on
 ([Windows](windows.md#2-optional-features)).
 
 Without the allowlist Claude Code does not load the channel, so Reply stays

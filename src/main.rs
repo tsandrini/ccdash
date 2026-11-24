@@ -63,8 +63,25 @@ use crate::{
     wire::Source,
 };
 
+/// `0.1.0`; with the commit and the protocol when the build names its
+/// commit (`CCDASH_REV`, as the Windows release job does).
+fn version() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let version = env!("CARGO_PKG_VERSION");
+        match option_env!("CCDASH_REV").filter(|rev| !rev.is_empty()) {
+            Some(rev) => format!(
+                "{version} ({}, protocol {})",
+                rev.get(..7).unwrap_or(rev),
+                protocol::VERSION
+            ),
+            None => version.to_owned(),
+        }
+    })
+}
+
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = version(), about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -190,6 +207,12 @@ enum Command {
     #[cfg(windows)]
     #[command(hide = true)]
     EndTree { pid: u32 },
+    /// What only a Windows workstation has: `setup` installs ccdash for
+    /// this user, `tray` runs the collector under an icon in the taskbar,
+    /// `update` puts the build the hub's protocol calls for in place.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Win(win::Command),
     /// Write every note of the hub's database as markdown with frontmatter:
     /// `<dir>/<workspace>/<kind>/<slug>.md`. Reads the database directly,
     /// so it works on a backup copy too.
@@ -483,6 +506,8 @@ fn main() -> ExitCode {
         Command::PreReceive => return exit(workspace::hub::pre_receive()),
         #[cfg(windows)]
         Command::EndTree { pid } => actions::end_tree_in_console(pid),
+        #[cfg(windows)]
+        Command::Win(command) => win::run(command),
         Command::Export { config, db, dir } => export(config, db, &dir),
         Command::Demo { dir, listen } => {
             logging();
